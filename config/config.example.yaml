@@ -140,7 +140,9 @@ litellm_settings:
   # (xhigh->high->...) e policy fallback per-modello via
   # litellm_params.fallbacks per-request (vedi reasoning_clamp.py)
   callbacks: reasoning_clamp.rclamp
-  max_request_size: 500
+  # 50MB (default litellm 500MB): ogni body viene bufferizzato in RAM; su
+  # host con poca RAM (es. RPi5) il limite basso evita picchi in OOM.
+  max_request_size: 50
   num_retries: 0
   cache: false
   drop_params: false
@@ -164,3 +166,6 @@ router_settings:
 
 general_settings:
   master_key: sk-YOUR_LITELLM_MASTER_KEY
+  # Senza DB postgres gli spend log si accumulano in RAM per ogni richiesta:
+  # disattivali se non usi spend/budget tracking.
+  disable_spend_logs: true

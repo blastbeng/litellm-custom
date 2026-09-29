@@ -13,6 +13,19 @@ services:
       NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate"
       # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync)
       SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
+      # RAM ottimizzazione (RPi5 8GB):
+      # - MALLOC_ARENA_MAX: glibc crea un'arena per thread e l'RSS di Python
+      #   cresce per frammentazione; con 2 arene la crescita e' molto piu' lenta
+      # - LITELLM_LOG WARNING: meno stringhe di log retenute/stampate
+      MALLOC_ARENA_MAX: "2"
+      LITELLM_LOG: WARNING
+    # Hard-limit: se litellm supera questi confini viene OOM-killed LUI (e
+    # riavviato) invece di spingere tutto l'host in OOM su zram (16GB azzerati).
+    # Base osservata ~600MB (RSS+swap); 1G lascia ampio margine per streaming
+    # lunghi e listing dinamico, memswap_limit = mem_limit -> nessun swap extra.
+    mem_limit: 1g
+    memswap_limit: 1g
+    oom_score_adj: 200
     volumes:
       - ./config/config.yaml:/app/config.yaml
       - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
