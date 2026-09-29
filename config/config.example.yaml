@@ -160,12 +160,12 @@ litellm_settings:
   cache: false
   drop_params: false
 
-  # Fallback: SOLO synthetic/* cade su fully-uncensored (via callback, perche'
-  # le chiavi dei fallback non supportano wildcard). Nessun fallback per
-  # tutti gli altri modelli; fully-uncensored e openrouter/free non fanno
-  # MAI fallback.
+  # Fallback (via callback, perche' le chiavi dei fallback non supportano
+  # wildcard): synthetic/* -> fully-uncensored -> ollama/fully-uncensored;
+  # fully-uncensored (richiesto direttamente) -> ollama/fully-uncensored.
+  # Nessun fallback per tutti gli altri modelli; openrouter/free e ollama/*
+  # non fanno MAI fallback.
   fallbacks:
-    - fully-uncensored: []
     - openrouter/free: []
 
 router_settings:

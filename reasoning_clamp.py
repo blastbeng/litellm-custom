@@ -22,11 +22,12 @@ policy e' applicata QUI per-request tramite litellm_params.fallbacks, che
 OVERRIDE la lista di config (router.py: kwargs.get("fallbacks",
 self.fallbacks)):
 - synthetic/*            -> ["fully-uncensored", "ollama/fully-uncensored"]
-  (fully-uncensored PRIMO, poi il modello Ollama locale omonimo via
-  wildcard dinamica ollama/*: disponibile solo quando il PC Windows e'
+  (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
+  wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
   online)
-- openrouter/free, fully-uncensored, ollama/* -> [] (mai fallback,
-  nemmeno su se stessi)
+- fully-uncensored       -> ["ollama/fully-uncensored"] (il fallback di
+  fully-uncensored E' il modello Ollama omonimo, anche su richiesta diretta)
+- openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
   deepseek4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
   lista di config.yaml, che AL MOMENTO non ha catch-all (richiesta utente:
@@ -45,8 +46,10 @@ from litellm.integrations.custom_logger import CustomLogger
 GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
 # "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
-# mai fallback); "ollama-cloud" e' un provider cloud separato
-NO_FALLBACK_MODELS = ("fully-uncensored", "openrouter/free", "ollama")
+# mai fallback); "ollama-cloud" e' un provider cloud separato.
+# fully-uncensored NON e' qui: ora ha il suo fallback (ollama/omonimo),
+# gestito dal ramo dedicato in _apply.
+NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
 
 
 class ReasoningClamp(CustomLogger):
@@ -54,7 +57,12 @@ class ReasoningClamp(CustomLogger):
     def _apply(self, data):
         model = str(data.get("model") or "")
         # --- policy fallback per-modello (override per-request) ---
-        if any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
+        if model == "fully-uncensored":
+            # stack (richiesta utente): fully-uncensored cade a sua volta su
+            # ollama/fully-uncensored (PC spento -> llama-gate 503 in ~2s ->
+            # fallback immediato; il gruppo esiste solo col PC online)
+            data["fallbacks"] = ["ollama/fully-uncensored"]
+        elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):
             # catena fallback (richiesta utente): fully-uncensored PRIMO,
