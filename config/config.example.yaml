@@ -1,0 +1,166 @@
+# Esempio di configurazione litellm — copiare in config/config.yaml e
+# sostituire TUTTI i placeholder con le proprie chiavi. NON COMMITTARE
+# config/config.yaml (già in .gitignore: contiene chiavi reali).
+
+model_list:
+
+  # --- Modello locale (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
+  # Unico modello locale. Nessun fallback: se e' occupo/spento restituisce
+  # l'errore (comportamento voluto).
+  - model_name: fully-uncensored
+    litellm_params:
+      model: openai/local-model
+      # gate locale: se blastpc non risponde al TCP entro ~2s risponde 503
+      # subito (PC spento), altrimenti fa da tubo trasparente - vedi
+      # llama-gate/gate.py. Serve perche' litellm ha un SOLO timeout per
+      # l'intera richiesta (httpx, connect incluso): senza gate, un timeout
+      # lungo validerebbe anche il caso "PC spento" (appendersi per mezz'ora),
+      # e un timeout corto troncherebbe i modelli enormi.
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      # NIENTE max_parallel_requests: in v1.104.0 lo slot non viene rilasciato
+      # dopo la prima richiesta (bug upstream) e il modello morirebbe dopo il
+      # primo uso. La serializzazione la fa gia' llama-swap (una richiesta
+      # alla volta, in coda).
+      # PC acceso: modelli enormi (caricamento + inferenza) possono impiegare
+      # 10-20 minuti -> 30 min di tetto. PC spento: la gate 503 in ~2s.
+      timeout: 1800
+    model_info:
+      id: local-qwen-backend
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      max_tokens: 32768
+
+  # --- Modelli synthetic.new: importati in automatico ---
+  # Wildcard unica "synthetic/*" per runtime + listing. Il capture rimuove
+  # "synthetic/", quindi all'endpoint arrivano gli id nativi ("syn:large:text",
+  # "hf:openai/gpt-oss-120b", ...). /v1/models espande la wildcard con la
+  # lista REALE dell'endpoint (check_provider_endpoint).
+  - model_name: synthetic/*
+    litellm_params:
+      model: openai/*
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: syn_YOUR_SYNTHETIC_API_KEY
+      max_tokens: 262144
+      # reasoning di default per OGNI richiesta su questa wildcard
+      # (sovrascrivibile dal client): synthetic supporta
+      # none/low/medium/high/xhigh/max
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      max_tokens: 262144
+
+  # --- Modelli OpenRouter: importati in automatico ---
+  # Nome pubblico "openrouter/<id-nativo>" (es. openrouter/z-ai/glm-5.3-prime).
+  # Listing tramite openrouter-gw: riscrive /v1/* -> /api/v1/* (l'API
+  # OpenRouter vive su /api/v1) e prefixa gli id con "openrouter/" per evitare
+  # il rename di litellm su id tipo "openai/...", "anthropic/...".
+  - model_name: openrouter/*
+    litellm_params:
+      model: openai/*
+      api_base: http://openrouter-gw/v1
+      api_key: sk-or-v1-YOUR_OPENROUTER_API_KEY
+      max_tokens: 262144
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      max_tokens: 262144
+
+  # --- Modelli Groq: importati in automatico ---
+  # Listing via groq-gw (ID_PREFIX "groq/": il rename di litellm corromperebbe
+  # gli id nativi "openai/gpt-oss-120b", "qwen/..."). NIENTE max_tokens di
+  # default (tetto per-modello su Groq) e NIENTE reasoning_effort di default
+  # (gestito dalla callback reasoning_clamp: default/clamp "high" solo sui
+  # modelli reasoning, parametro rimosso sugli altri).
+  - model_name: groq/*
+    litellm_params:
+      model: openai/*
+      api_base: http://groq-gw/openai/v1
+      api_key: gsk_YOUR_GROQ_API_KEY
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 262144
+
+  # --- Modelli Google Gemini: importati in automatico ---
+  # Endpoint OpenAI-compatible (generativelanguage.googleapis.com/v1beta/
+  # openai) via gemini-gw (PATH_PRE "/v1beta/openai": litellm chiama sempre
+  # {origin}/v1). reasoning gestito dalla callback reasoning_clamp (default
+  # "high"; "xhigh" non e' un valore valido su Gemini).
+  - model_name: gemini/*
+    litellm_params:
+      model: openai/*
+      api_base: http://gemini-gw/v1beta/openai
+      api_key: YOUR_GEMINI_API_KEY
+      max_tokens: 262144
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 262144
+
+  # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
+  # Nome pubblico "ollama-cloud/<model>" per NON collidere col provider
+  # nativo "ollama/" di litellm.
+  - model_name: ollama-cloud/*
+    litellm_params:
+      model: openai/*
+      api_base: https://ollama.com/v1
+      api_key: YOUR_OLLAMA_API_KEY
+      max_tokens: 262144
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      max_tokens: 262144
+
+  # --- deepseek4free (192.168.1.13:18010): TUTTI i modelli, dinamici ---
+  # Endpoint OpenAI-compatible senza auth (progetto in sviluppo, instabile):
+  # via deepseek4free-gw con ID_PREFIX "deepseek4free/" e cache last-good del
+  # listing (MODELS_CACHE=1) -> i modelli restano visibili anche quando
+  # l'endpoint e' giu'. NIENTE reasoning_effort di default (non validabile
+  # per-modello).
+  - model_name: deepseek4free/*
+    litellm_params:
+      model: openai/*
+      api_base: http://deepseek4free-gw/v1
+      api_key: dummy
+      max_tokens: 32768
+    model_info:
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+
+litellm_settings:
+  # espansione delle wildcard in /model/info e /v1/models: usa la lista
+  # modelli REALE dell'endpoint invece di quella statica
+  check_provider_endpoint: true
+  # Callback reasoning_clamp: cascata/clamp reasoning per provider
+  # (xhigh->high->...) e policy fallback per-modello via
+  # litellm_params.fallbacks per-request (vedi reasoning_clamp.py)
+  callbacks: reasoning_clamp.rclamp
+  max_request_size: 500
+  num_retries: 0
+  cache: false
+  drop_params: false
+
+  # Fallback: SOLO synthetic/* cade su fully-uncensored (via callback, perche'
+  # le chiavi dei fallback non supportano wildcard). Nessun fallback per
+  # tutti gli altri modelli; fully-uncensored e openrouter/free non fanno
+  # MAI fallback.
+  fallbacks:
+    - fully-uncensored: []
+    - openrouter/free: []
+
+router_settings:
+  # enable_pre_call_checks DISATTIVO: con le wildcard i nomi espansi non
+  # esistono nel registry statico di litellm e i pre-call checks sollevano
+  # ModelNotMappedError PRIMA della chiamata, deviando tutto silenziosamente
+  # sul fallback catch-all.
+  enable_pre_call_checks: false
+  num_retries: 1
+  retry_after: 1
+
+general_settings:
+  master_key: sk-YOUR_LITELLM_MASTER_KEY

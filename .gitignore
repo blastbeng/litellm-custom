@@ -1,0 +1,4 @@
+.aider*
+config/config.yaml
+provider-gw/cache/
+*.sub

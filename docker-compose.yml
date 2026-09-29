@@ -1,0 +1,155 @@
+services:
+
+  litellm:
+    container_name: litellm
+    image: ghcr.io/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    environment:
+      # Route litellm's OUTBOUND provider calls (synthetic.new, openrouter.ai, ...)
+      # through llmtrim (HTTPS MITM on host) so fallbacks get tracked/compressed.
+      # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
+      HTTPS_PROXY: http://host.docker.internal:43117
+      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate"
+      # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync)
+      SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
+    volumes:
+      - ./config/config.yaml:/app/config.yaml
+      - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/.llmtrim/ca-bundle.pem:ro
+    command:
+      - "--config"
+      - "/app/config.yaml"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - openrouter-gw
+      - groq-gw
+      - gemini-gw
+      - deepseek4free-gw
+    restart: no
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',4000),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Gateway OpenRouter per litellm (vedi openrouter-gw/gw.py):
+  # - riscrive /v1/* -> /api/v1/* (litellm si aspetta /v1 sull'host)
+  # - /v1/models: prefixa gli id con "openrouter/" cosi' la wildcard
+  #   openrouter/* di litellm li mostra tutti e li instrada 1:1 senza che la
+  #   sua logica di rename corrompa gli id (openai/..., anthropic/...)
+  # - l'upstream verso openrouter.ai esce ATTRAVERSO llmtrim (GW_PROXY), cosi'
+  #   il traffico openrouter di litellm e' intercettato/tracciato/compresso
+  #   come quello di AiderDesk diretto
+  openrouter-gw:
+    container_name: openrouter-gw
+    image: python:3.13-slim
+    command: ["sh", "-c", "pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      GW_PROXY: http://host.docker.internal:43117
+      GW_CA: /data/ca-bundle.pem
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./openrouter-gw/gw.py:/app/gw.py:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+    restart: no
+
+  # Gateway listing per Groq (vedi provider-gw/gw.py, stessa meccanica di
+  # openrouter-gw): riscrive /v1/* -> /openai/v1/* (litellm chiama sempre
+  # {origin}/v1 ignorando il path dell'api_base) e prefixa gli id di /models
+  # con "groq/" cosi' la logica di rename di litellm non corrompe gli id
+  # nativi (openai/gpt-oss-120b, ...).
+  # Upstream verso api.groq.com ATTRAVERSO llmtrim (GW_PROXY).
+  groq-gw:
+    container_name: groq-gw
+    image: python:3.13-slim
+    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      GW_PROXY: http://host.docker.internal:43117
+      GW_CA: /data/ca-bundle.pem
+      UPSTREAM: https://api.groq.com
+      PATH_PRE: /openai
+      ID_PREFIX: groq/
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./provider-gw/gw.py:/app/gw.py:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+    restart: no
+
+  # Gateway listing per Gemini (provider-gw/gw.py): riscrive /v1/* ->
+  # /v1beta/openai/* (l'endpoint OpenAI-compatible di Gemini vive li', ma
+  # litellm chiama sempre {origin}/v1). Nessun ID_PREFIX: gli id nativi
+  # "models/gemini-2.5-flash" non collidono con provider noti di litellm e
+  # sono accettati cosi' come sono dall'endpoint. Upstream ATTRAVERSO llmtrim.
+  gemini-gw:
+    container_name: gemini-gw
+    image: python:3.13-slim
+    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      GW_PROXY: http://host.docker.internal:43117
+      GW_CA: /data/ca-bundle.pem
+      UPSTREAM: https://generativelanguage.googleapis.com
+      PATH_PRE: /v1beta/openai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./provider-gw/gw.py:/app/gw.py:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+    restart: no
+
+  # Gateway per deepseek4free (provider-gw/gw.py). ID_PREFIX=deepseek4free/
+  # per il listing: il rename di litellm corromperebbe gli id nativi tipo
+  # "deepseek/deepseek-chat" ("deepseek" e' un provider noto). Nessuna
+  # riscrittura path (l'endpoint vive gia' su /v1). NOTA: l'upstream e'
+  # plain-HTTP su LAN; llmtrim inoltra il traffico ma NON lo traccia (la sua
+  # pipeline MITM/tracking e' solo-TLS, LLMTRIM_EXTRA_HOSTS estende i domini
+  # HTTPS). L'hop resta per uniformita' architetturale e filtri futuri.
+  deepseek4free-gw:
+    container_name: deepseek4free-gw
+    image: python:3.13-slim
+    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      GW_PROXY: http://host.docker.internal:43117
+      GW_CA: /data/ca-bundle.pem
+      # hostname (non IP!): llmtrim riconosce SOLO host esatti in
+      # LLMTRIM_EXTRA_HOSTS e scarta gli IP -> l'Host header del gateway
+      # deve essere "deepseek4free"
+      UPSTREAM: http://deepseek4free:18010
+      ID_PREFIX: deepseek4free/
+      # cache last-good del listing: l'endpoint e' instabile (progetto in
+      # sviluppo); se /models fallisce, il gateway serve l'ultima lista
+      # valida cosi' i modelli restano SEMPRE visibili su litellm
+      MODELS_CACHE: "1"
+      MODELS_CACHE_FILE: /cache/models.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "deepseek4free:192.168.1.13"
+    volumes:
+      - ./provider-gw/gw.py:/app/gw.py:ro
+      - ./provider-gw/cache:/cache
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+    restart: no
+
+  # Gate TCP verso llama-swap (blastpc) - vedi llama-gate/gate.py:
+  # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
+  # cosi' litellm puo' avere un timeout LUNGO (modelli enormi: 10-20 min)
+  # senza restare appeso quando il PC e' spento.
+  llama-gate:
+    container_name: llama-gate
+    image: python:3.13-slim
+    command: ["python", "/app/gate.py"]
+    extra_hosts:
+      - "blastpc:192.168.1.29"
+    volumes:
+      - ./llama-gate/gate.py:/app/gate.py:ro
+    restart: no
