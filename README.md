@@ -31,6 +31,8 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 |---|---|---|
 | `litellm` | `config/config.yaml` | LiteLLM proxy/router (port 4000) |
 | `llama-gate` | `llama-gate/gate.py` | TCP gate to llama-swap (PC off → 503 in ~2s) |
+| `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama OpenAI-compat API (`blastpc:11434`) |
+| `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama listing with `ID_PREFIX=ollama/`, no cache (models visible only while the PC is online) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
 | `groq-gw`, `gemini-gw`, `deepseek4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
@@ -79,11 +81,14 @@ litellm even when the endpoint is down.
 
 ## Fallback policy
 
-- **`synthetic/*`** → `fully-uncensored` (local model), only on provider
-  errors (busy/offline/rate-limit).
+- **`synthetic/*`** → `fully-uncensored` first (llama-swap local model),
+  then **`ollama/ornith-1.5:35b`** (Ollama on the Windows PC) — only on
+  provider errors (busy/offline/rate-limit). The `ollama/ornith-1.5:35b`
+  group exists only while the Windows PC is online (dynamic listing via
+  `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
 - **Everything else** → no fallback: the error goes straight to the client.
-- **`fully-uncensored`** and **`openrouter/free`** never fall back
-  (not even to themselves).
+- **`fully-uncensored`**, **`ollama/*`** (any local Ollama model) and
+  **`openrouter/free`** never fall back (not even to themselves).
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
 (`get_fallback_model_group`: exact match / provider-stripped / `"*"` only),

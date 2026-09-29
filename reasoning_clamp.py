@@ -21,8 +21,11 @@ get_fallback_model_group: solo esatto/stripped-provider/"*"), quindi la
 policy e' applicata QUI per-request tramite litellm_params.fallbacks, che
 OVERRIDE la lista di config (router.py: kwargs.get("fallbacks",
 self.fallbacks)):
-- synthetic/*            -> ["fully-uncensored"] (unico con fallback locale)
-- openrouter/free, fully-uncensored -> [] (mai fallback, nemmeno su se stessi)
+- synthetic/*            -> ["fully-uncensored", "ollama/ornith-1.5:35b"]
+  (fully-uncensored PRIMO, poi il modello Ollama locale via wildcard
+  dinamica ollama/*: disponibile solo quando il PC Windows e' online)
+- openrouter/free, fully-uncensored, ollama/* -> [] (mai fallback,
+  nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
   deepseek4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
   lista di config.yaml, che AL MOMENTO non ha catch-all (richiesta utente:
@@ -40,7 +43,9 @@ from litellm.integrations.custom_logger import CustomLogger
 
 GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
-NO_FALLBACK_MODELS = ("fully-uncensored", "openrouter/free")
+# "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
+# mai fallback); "ollama-cloud" e' un provider cloud separato
+NO_FALLBACK_MODELS = ("fully-uncensored", "openrouter/free", "ollama")
 
 
 class ReasoningClamp(CustomLogger):
@@ -51,7 +56,11 @@ class ReasoningClamp(CustomLogger):
         if any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):
-            data["fallbacks"] = ["fully-uncensored"]
+            # catena fallback (richiesta utente): fully-uncensored PRIMO,
+            # poi il modello Ollama locale (dinamico via wildcard ollama/*,
+            # presente solo quando il PC Windows e' online: se spento la
+            # ollama-gate risponde 503 in ~2s e litellm prosegue/termina)
+            data["fallbacks"] = ["fully-uncensored", "ollama/ornith-1.5:35b"]
         else:
             # tutti gli altri: nessun override, vale la lista di config.yaml
             # (senza catch-all = NESSUN fallback; openrouter/free = modello

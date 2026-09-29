@@ -10,7 +10,7 @@ services:
       # through llmtrim (HTTPS MITM on host) so fallbacks get tracked/compressed.
       # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
       HTTPS_PROXY: http://host.docker.internal:43117
-      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate"
+      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw"
       # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync)
       SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
       # RAM ottimizzazione (RPi5 8GB):
@@ -40,6 +40,7 @@ services:
       - groq-gw
       - gemini-gw
       - deepseek4free-gw
+      - ollama-gw
     restart: no
     healthcheck:
       test:
@@ -165,4 +166,46 @@ services:
       - "blastpc:192.168.1.29"
     volumes:
       - ./llama-gate/gate.py:/app/gate.py:ro
+    restart: no
+
+  # Stessa gate di llama-gate (stesso gate.py, env-driven) ma verso Ollama
+  # (OpenAI-compatible su :11434, stessa macchina blastpc): PC spento ->
+  # 503 in ~2s e litellm prosegue la catena di fallback; PC acceso ->
+  # tubo trasparente con timeout lungo.
+  ollama-gate:
+    container_name: ollama-gate
+    image: python:3.13-slim
+    command: ["python", "/app/gate.py"]
+    environment:
+      GATE_UP_HOST: blastpc
+      GATE_UP_PORT: "11434"
+    extra_hosts:
+      - "blastpc:192.168.1.29"
+    volumes:
+      - ./llama-gate/gate.py:/app/gate.py:ro
+    restart: no
+
+  # Gateway listing per Ollama (provider-gw/gw.py): nessuna riscrittura path
+  # (l'endpoint OpenAI-compatible vive gia' su /v1, come deepseek4free).
+  # ID_PREFIX=ollama/: litellm corromperebbe gli id nativi che iniziano con
+  # nomi provider noti (es. "deepseek-r1:14b" -> "deepseek/..."); con il
+  # prefisso la wildcard ollama/* li cattura e li instrada 1:1. Nessun
+  # MODELS_CACHE su richiesta: i modelli devono apparire SOLO quando il PC
+  # Windows e' online (listing dinamico reale).
+  ollama-gw:
+    container_name: ollama-gw
+    image: python:3.13-slim
+    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      # upstream = ollama-gate (tubo TCP trasparente verso blastpc:11434)
+      UPSTREAM: http://ollama-gate
+      ID_PREFIX: ollama/
+    volumes:
+      - ./provider-gw/gw.py:/app/gw.py:ro
+      # gw.py setta SEMPRE verify=GW_CA (default /data/ca-bundle.pem): il
+      # bundle va montato anche se l'upstream e' plain-HTTP (non usato, ma
+      # senza il file httpx crasha all'avvio)
+      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+    depends_on:
+      - ollama-gate
     restart: no
