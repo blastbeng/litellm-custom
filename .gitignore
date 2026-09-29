@@ -2,3 +2,4 @@
 config/config.yaml
 provider-gw/cache/
 *.sub
+__pycache__/
