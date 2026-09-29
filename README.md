@@ -130,6 +130,15 @@ in `NO_PROXY` (LAN traffic).
 The context reported by `llama-server` is **`--ctx-size / -np`**: with
 `-np 2` and `--ctx-size 262144` each slot exposes 131072 tokens and litellm
 rejects large requests with `ContextWindowExceededError`. With `-np 1` the
+
+**Note on 5-minute client timeouts (AiderDesk and similar AI-SDK clients).**
+`Headers Timeout Error` after exactly 5 minutes is **not litellm**: litellm's
+per-model timeout for the local model is 1800s. It is the client's HTTP stack
+(undici, used by the Vercel AI SDK) whose `headersTimeout` defaults to
+300s — the local model can easily take longer than that before the first
+response bytes when it is busy or prefilling a huge context. Fix it in the
+client (AiderDesk provider settings: set timeout to `false` or > 300000 ms),
+not in the proxy.
 full context is available (262144), consistent with `model_info` in config.
 
 ## Files
