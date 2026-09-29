@@ -82,8 +82,9 @@ litellm even when the endpoint is down.
 ## Fallback policy
 
 - **`synthetic/*`** → `fully-uncensored` first (llama-swap local model),
-  then **`ollama/ornith-1.5:35b`** (Ollama on the Windows PC) — only on
-  provider errors (busy/offline/rate-limit). The `ollama/ornith-1.5:35b`
+  then **`ollama/fully-uncensored`** (the Ollama model with the same name on
+  the Windows PC) — only on
+  provider errors (busy/offline/rate-limit). The `ollama/fully-uncensored`
   group exists only while the Windows PC is online (dynamic listing via
   `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
 - **Everything else** → no fallback: the error goes straight to the client.

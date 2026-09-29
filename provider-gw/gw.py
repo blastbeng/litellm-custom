@@ -46,6 +46,7 @@ ID_PREFIX = os.environ.get("ID_PREFIX", "")
 PORT = int(os.environ.get("PORT", "80"))
 PROXY = os.environ.get("GW_PROXY")
 CA = os.environ.get("GW_CA", "/data/ca-bundle.pem")
+STRIP_LATEST = os.environ.get("STRIP_LATEST", "") == "1"
 MODELS_CACHE = os.environ.get("MODELS_CACHE", "") == "1"
 CACHE_FILE = os.environ.get("MODELS_CACHE_FILE", "/cache/models.json")
 
@@ -113,12 +114,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _rewrite_models(self, data: bytes) -> bytes:
-        """Prefixa gli id con ID_PREFIX (solo data[].id)."""
+        """Prefixa gli id con ID_PREFIX (solo data[].id).
+        Con STRIP_LATEST=1 rimuove prima il suffisso ":latest" (Ollama lo
+        aggiunge ai modelli senza tag esplicito): il nome pubblico diventa
+        "<PREFIX><model>" invece di "<PREFIX><model>:latest" (Ollama risolve
+        comunque il nome senza tag). ATTENZIONE: se esistessero sia "x" che
+        "x:latest" gli id colliderebbero."""
         try:
             j = json.loads(data)
             for m in j.get("data", []):
-                if "id" in m and not str(m["id"]).startswith(ID_PREFIX):
-                    m["id"] = ID_PREFIX + str(m["id"])
+                if "id" not in m:
+                    continue
+                mid = str(m["id"])
+                if STRIP_LATEST and mid.endswith(":latest"):
+                    mid = mid[: -len(":latest")]
+                if not mid.startswith(ID_PREFIX):
+                    mid = ID_PREFIX + mid
+                m["id"] = mid
             return json.dumps(j).encode()
         except Exception as e:
             print(f"gw: models rewrite skip: {e}", flush=True)

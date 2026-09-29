@@ -200,6 +200,10 @@ services:
       # upstream = ollama-gate (tubo TCP trasparente verso blastpc:11434)
       UPSTREAM: http://ollama-gate
       ID_PREFIX: ollama/
+      # Ollama lista i modelli senza tag esplicito come "x:latest": strip
+      # del suffisso -> nome pubblico "ollama/x" (il fallback di synthetic/*
+      # in reasoning_clamp punta a "ollama/fully-uncensored", non ":latest")
+      STRIP_LATEST: "1"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
       # gw.py setta SEMPRE verify=GW_CA (default /data/ca-bundle.pem): il

@@ -21,9 +21,10 @@ get_fallback_model_group: solo esatto/stripped-provider/"*"), quindi la
 policy e' applicata QUI per-request tramite litellm_params.fallbacks, che
 OVERRIDE la lista di config (router.py: kwargs.get("fallbacks",
 self.fallbacks)):
-- synthetic/*            -> ["fully-uncensored", "ollama/ornith-1.5:35b"]
-  (fully-uncensored PRIMO, poi il modello Ollama locale via wildcard
-  dinamica ollama/*: disponibile solo quando il PC Windows e' online)
+- synthetic/*            -> ["fully-uncensored", "ollama/fully-uncensored"]
+  (fully-uncensored PRIMO, poi il modello Ollama locale omonimo via
+  wildcard dinamica ollama/*: disponibile solo quando il PC Windows e'
+  online)
 - openrouter/free, fully-uncensored, ollama/* -> [] (mai fallback,
   nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
@@ -57,10 +58,11 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):
             # catena fallback (richiesta utente): fully-uncensored PRIMO,
-            # poi il modello Ollama locale (dinamico via wildcard ollama/*,
-            # presente solo quando il PC Windows e' online: se spento la
-            # ollama-gate risponde 503 in ~2s e litellm prosegue/termina)
-            data["fallbacks"] = ["fully-uncensored", "ollama/ornith-1.5:35b"]
+            # poi il modello Ollama locale omonimo "ollama/fully-uncensored"
+            # (dinamico via wildcard ollama/*, presente solo quando il PC
+            # Windows e' online: se spento la ollama-gate risponde 503 in
+            # ~2s e litellm prosegue/termina)
+            data["fallbacks"] = ["fully-uncensored", "ollama/fully-uncensored"]
         else:
             # tutti gli altri: nessun override, vale la lista di config.yaml
             # (senza catch-all = NESSUN fallback; openrouter/free = modello

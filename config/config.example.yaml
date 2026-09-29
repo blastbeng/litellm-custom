@@ -35,7 +35,7 @@ model_list:
   # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
   # docker-compose.yml. NESSUN model_info/max_tokens: i modelli Ollama
   # variano. NESSUN fallback per ollama/* (in reasoning_clamp-like callback).
-  # synthetic/* fa fallback a ollama/ornith-1.5:35b (2o dopo fully-uncensored,
+  # synthetic/* fa fallback a ollama/fully-uncensored (2o dopo fully-uncensored,
   # il gruppo esiste solo quando il PC e' online).
   - model_name: ollama/*
     litellm_params:
