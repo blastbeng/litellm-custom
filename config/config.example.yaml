@@ -27,17 +27,14 @@ model_list:
       timeout: 1800
     model_info:
       id: local-qwen-backend
-      # contesto ridotto lato llama-server (era 262144) per risparmiare
-      # RAM/VRAM: litellm deve dichiararlo ai client
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 32768
       max_tokens: 32768
 
   # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
   # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
-  # docker-compose.yml. model_info unico per la wildcard (si applica a tutti
-  # i modelli ollama/*). NESSUN fallback per ollama/* (in reasoning_clamp-like
-  # callback).
+  # docker-compose.yml. NESSUN model_info/max_tokens: i modelli Ollama
+  # variano. NESSUN fallback per ollama/* (in reasoning_clamp-like callback).
   # synthetic/* fa fallback a ollama/fully-uncensored (2o dopo fully-uncensored,
   # il gruppo esiste solo quando il PC e' online).
   - model_name: ollama/*
@@ -46,12 +43,6 @@ model_list:
       api_base: http://ollama-gw/v1
       api_key: dummy
       timeout: 1800
-    model_info:
-      # contesto dei modelli Ollama attuali; si applica a TUTTI i modelli
-      # ollama/* (wildcard unica) - aggiornare se contesti diversi
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      max_tokens: 32768
 
   # --- Modelli synthetic.new: importati in automatico ---
   # Wildcard unica "synthetic/*" per runtime + listing. Il capture rimuove
@@ -63,15 +54,15 @@ model_list:
       model: openai/*
       api_base: https://api.synthetic.new/openai/v1
       api_key: syn_YOUR_SYNTHETIC_API_KEY
-      max_tokens: 131072
+      max_tokens: 262144
       # reasoning di default per OGNI richiesta su questa wildcard
       # (sovrascrivibile dal client): synthetic supporta
       # none/low/medium/high/xhigh/max
       reasoning_effort: xhigh
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 32768
-      max_tokens: 131072
+      max_tokens: 262144
 
   # --- Modelli OpenRouter: importati in automatico ---
   # Nome pubblico "openrouter/<id-nativo>" (es. openrouter/z-ai/glm-5.3-prime).
@@ -83,12 +74,12 @@ model_list:
       model: openai/*
       api_base: http://openrouter-gw/v1
       api_key: sk-or-v1-YOUR_OPENROUTER_API_KEY
-      max_tokens: 131072
+      max_tokens: 262144
       reasoning_effort: xhigh
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 32768
-      max_tokens: 131072
+      max_tokens: 262144
 
   # --- Modelli Groq: importati in automatico ---
   # Listing via groq-gw (ID_PREFIX "groq/": il rename di litellm corromperebbe
@@ -102,9 +93,9 @@ model_list:
       api_base: http://groq-gw/openai/v1
       api_key: gsk_YOUR_GROQ_API_KEY
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 65536
-      max_tokens: 131072
+      max_tokens: 262144
 
   # --- Modelli Google Gemini: importati in automatico ---
   # Endpoint OpenAI-compatible (generativelanguage.googleapis.com/v1beta/
@@ -116,11 +107,11 @@ model_list:
       model: openai/*
       api_base: http://gemini-gw/v1beta/openai
       api_key: YOUR_GEMINI_API_KEY
-      max_tokens: 131072
+      max_tokens: 262144
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 65536
-      max_tokens: 131072
+      max_tokens: 262144
 
   # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
   # Nome pubblico "ollama-cloud/<model>" per NON collidere col provider
@@ -130,12 +121,12 @@ model_list:
       model: openai/*
       api_base: https://ollama.com/v1
       api_key: YOUR_OLLAMA_API_KEY
-      max_tokens: 131072
+      max_tokens: 262144
       reasoning_effort: xhigh
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 262144
       max_output_tokens: 32768
-      max_tokens: 131072
+      max_tokens: 262144
 
   # --- deepseek4free (192.168.1.13:18010): TUTTI i modelli, dinamici ---
   # Endpoint OpenAI-compatible senza auth (progetto in sviluppo, instabile):
