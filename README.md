@@ -87,8 +87,9 @@ litellm even when the endpoint is down.
   provider errors (busy/offline/rate-limit). The `ollama/local-model`
   group exists only while the Windows PC is online (dynamic listing via
   `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
-- **`local-model`** itself (requested directly) → **`small-model`**
-  (llama-swap, same PC) first, then **`ollama/local-model`**.
+- **`local-model`** itself (requested directly) → **`ollama/local-model`**
+  only. **`small-model`** is a standalone model (invoke it directly): it is
+  **not** a fallback of any model.
 - **Everything else** → no fallback: the error goes straight to the client.
 - **`ollama/*`** (any local Ollama model) and **`openrouter/free`** never
   fall back (not even to themselves).

@@ -25,9 +25,9 @@ self.fallbacks)):
   (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
   wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
   online)
-- local-model       -> ["small-model", "ollama/local-model"] (small-model
-  e' il fallback principale su llama-swap, poi il modello Ollama omonimo;
-  entrambi sul PC, cadono insieme se spento)
+- local-model       -> ["ollama/local-model"] (SOLO il modello Ollama
+  omonimo: small-model NON e' piu' fallback di nessuno - richiesta utente
+  2026-10-01; resta un modello autonomo invocabile direttamente)
 - openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
   inference4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
@@ -48,8 +48,10 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
 # "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
 # mai fallback); "ollama-cloud" e' un provider cloud separato.
-# local-model NON e' qui: ora ha il suo fallback (small-model + ollama
-# omonimo), gestito dal ramo dedicato in _apply.
+# local-model NON e' qui: ha il suo fallback (solo l'ollama omonimo),
+# gestito dal ramo dedicato in _apply.
+# small-model NON e' qui e non compare in nessuna catena di fallback: e'
+# un modello autonomo, invocabile solo direttamente (richiesta utente).
 NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
 
 
@@ -59,11 +61,12 @@ class ReasoningClamp(CustomLogger):
         model = str(data.get("model") or "")
         # --- policy fallback per-modello (override per-request) ---
         if model == "local-model":
-            # stack (richiesta utente): small-model (llama-swap, stesso PC)
-            # PRIMO, poi ollama/local-model (PC spento -> le gate 503 in
-            # ~2s -> fallback immediato; il gruppo ollama/* esiste solo col
-            # PC online)
-            data["fallbacks"] = ["small-model", "ollama/local-model"]
+            # fallback (richiesta utente 2026-10-01): SOLO ollama/local-model,
+            # il modello Ollama omonimo. small-model e' stato RIMOSSO da ogni
+            # catena di fallback (resta modello autonomo, solo su richiesta
+            # diretta). PC spento -> la gate 503 in ~2s; il gruppo ollama/*
+            # esiste solo col PC online
+            data["fallbacks"] = ["ollama/local-model"]
         elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):

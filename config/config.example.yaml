@@ -5,9 +5,9 @@
 model_list:
 
   # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
-  # local-model e' il modello principale, small-model il suo fallback (via
-  # reasoning_clamp). Se tutti sono occupi/spenti restituiscono l'errore
-  # (comportamento voluto).
+  # local-model e' il modello principale; small-model e' un modello autonomo
+  # invocabile direttamente e NON e' fallback di nessuno (reasoning_clamp).
+  # Se tutti sono occupi/spenti restituiscono l'errore (comportamento voluto).
   - model_name: local-model
     litellm_params:
       model: openai/local-model
@@ -34,8 +34,9 @@ model_list:
       max_output_tokens: 32768
       max_tokens: 32768
 
-  # --- Secondo modello locale (PC 192.168.1.29, llama-swap): fallback di
-  # local-model (via reasoning_clamp). Stessa gate di local-model.
+  # --- Secondo modello locale (PC 192.168.1.29, llama-swap): modello autonomo,
+  # invocabile direttamente; NON e' fallback di nessun modello (reasoning_clamp).
+  # Stessa gate di local-model.
   - model_name: small-model
     litellm_params:
       model: openai/small-model
@@ -193,7 +194,8 @@ litellm_settings:
 
   # Fallback (via callback, perche' le chiavi dei fallback non supportano
   # wildcard): synthetic/* -> local-model -> ollama/local-model;
-  # local-model (richiesto direttamente) -> small-model -> ollama/local-model.
+  # local-model (richiesto direttamente) -> ollama/local-model.
+  # small-model NON e' fallback di nessuno: modello autonomo (richiesta utente).
   # Nessun fallback per tutti gli altri modelli; openrouter/free e ollama/*
   # non fanno MAI fallback.
   fallbacks:
