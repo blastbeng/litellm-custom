@@ -4,9 +4,10 @@
 
 model_list:
 
-  # --- Modello locale (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
-  # Unico modello locale. Nessun fallback: se e' occupo/spento restituisce
-  # l'errore (comportamento voluto).
+  # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
+  # local-model e' il modello principale, small-model il suo fallback (via
+  # reasoning_clamp). Se tutti sono occupi/spenti restituiscono l'errore
+  # (comportamento voluto).
   - model_name: local-model
     litellm_params:
       model: openai/local-model
@@ -29,6 +30,22 @@ model_list:
       id: local-qwen-backend
       # contesto ridotto lato llama-server (era 262144) per risparmiare
       # RAM/VRAM: litellm deve dichiararlo ai client
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+
+  # --- Secondo modello locale (PC 192.168.1.29, llama-swap): fallback di
+  # local-model (via reasoning_clamp). Stessa gate di local-model.
+  - model_name: small-model
+    litellm_params:
+      model: openai/small-model
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      id: local-small-backend
+      # assumo lo stesso contesto di local-model (131072): aggiornare se
+      # small-model dichiara un contesto diverso su llama-swap
       max_input_tokens: 131072
       max_output_tokens: 32768
       max_tokens: 32768
@@ -175,7 +192,7 @@ litellm_settings:
 
   # Fallback (via callback, perche' le chiavi dei fallback non supportano
   # wildcard): synthetic/* -> local-model -> ollama/local-model;
-  # local-model (richiesto direttamente) -> ollama/local-model.
+  # local-model (richiesto direttamente) -> small-model -> ollama/local-model.
   # Nessun fallback per tutti gli altri modelli; openrouter/free e ollama/*
   # non fanno MAI fallback.
   fallbacks:

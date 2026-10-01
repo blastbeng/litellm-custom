@@ -25,8 +25,9 @@ self.fallbacks)):
   (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
   wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
   online)
-- local-model       -> ["ollama/local-model"] (il fallback di
-  local-model E' il modello Ollama omonimo, anche su richiesta diretta)
+- local-model       -> ["small-model", "ollama/local-model"] (small-model
+  e' il fallback principale su llama-swap, poi il modello Ollama omonimo;
+  entrambi sul PC, cadono insieme se spento)
 - openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
   deepseek4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
@@ -47,8 +48,8 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
 # "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
 # mai fallback); "ollama-cloud" e' un provider cloud separato.
-# local-model NON e' qui: ora ha il suo fallback (ollama/omonimo),
-# gestito dal ramo dedicato in _apply.
+# local-model NON e' qui: ora ha il suo fallback (small-model + ollama
+# omonimo), gestito dal ramo dedicato in _apply.
 NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
 
 
@@ -58,10 +59,11 @@ class ReasoningClamp(CustomLogger):
         model = str(data.get("model") or "")
         # --- policy fallback per-modello (override per-request) ---
         if model == "local-model":
-            # stack (richiesta utente): local-model cade a sua volta su
-            # ollama/local-model (PC spento -> llama-gate 503 in ~2s ->
-            # fallback immediato; il gruppo esiste solo col PC online)
-            data["fallbacks"] = ["ollama/local-model"]
+            # stack (richiesta utente): small-model (llama-swap, stesso PC)
+            # PRIMO, poi ollama/local-model (PC spento -> le gate 503 in
+            # ~2s -> fallback immediato; il gruppo ollama/* esiste solo col
+            # PC online)
+            data["fallbacks"] = ["small-model", "ollama/local-model"]
         elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):
