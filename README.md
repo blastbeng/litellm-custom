@@ -3,7 +3,7 @@
 A personal LLM router built on **LiteLLM Proxy** with lightweight Python
 gateways: a single OpenAI-compatible endpoint (`:4000`) that aggregates local
 models (llama-swap on a dedicated PC) and cloud providers (synthetic.new,
-OpenRouter, Groq, Gemini, Ollama Cloud, deepseek4free), with **dynamic**
+OpenRouter, Groq, Gemini, Ollama Cloud, inference4free), with **dynamic**
 wildcard model listing, fallback policy and `reasoning_effort` handling.
 
 ```
@@ -20,7 +20,7 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
                      │      │   ├────► openrouter-gw ─┐                           │
                      │      │   ├────► groq-gw ───────┤ (via llmtrim)             │
                      │      │   ├────► gemini-gw ─────┤                           │
-                     │      │   └────► deepseek4free-gw ─┴──► 192.168.1.13:18010   │
+                     │      │   └────► inference4free-gw ─┴──► 192.168.1.13:18010   │
                      │      │                                                      │
                      └────────────────────────────────────────────────────────────────┘
 ```
@@ -34,7 +34,7 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 | `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama OpenAI-compat API (`blastpc:11434`) |
 | `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama listing with `ID_PREFIX=ollama/`, no cache (models visible only while the PC is online) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
-| `groq-gw`, `gemini-gw`, `deepseek4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
+| `groq-gw`, `gemini-gw`, `inference4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
 | `llmtrim` (external) | `/opt/docker/compose/llmtrim` | MITM proxy: tracks/compresses LLM traffic |
 
@@ -53,7 +53,7 @@ Each provider is exposed with **a single wildcard** entry in `model_list`:
   id `openai/gpt-oss-120b` (the capture strips the prefix).
 - With `litellm_settings.check_provider_endpoint: true`, `/v1/models` and
   `/model/info` expose the endpoint's **real** model list: if a provider's
-  models change, litellm stays up to date (essential for `deepseek4free/*`,
+  models change, litellm stays up to date (essential for `inference4free/*`,
   whose list is dynamic).
 
 ### Why the gateways exist
@@ -65,7 +65,7 @@ LiteLLM (v1.104.0) has three behaviors the gateways work around:
    Gemini: `/v1beta/openai`, OpenRouter: `/api`).
 2. **Rename of ids whose first segment matches a known provider**
    (`openai/...`, `deepseek/...`, ...) in the listing → the gateway prefixes
-   ids with `ID_PREFIX` (e.g. `groq/`, `deepseek4free/`): the rename no
+   ids with `ID_PREFIX` (e.g. `groq/`, `inference4free/`): the rename no
    longer fires and the capture restores the native id at runtime.
 3. **Single timeout** (httpx, connect included) → "PC off" cannot be
    distinguished from "PC on with a huge model loading":
@@ -109,7 +109,7 @@ Rule: default `xhigh` where valid, otherwise fall down (`high`, `medium`, ...).
 | `synthetic/*`, `openrouter/*`, `ollama-cloud/*` | `xhigh` (in config) | accepted |
 | `gemini/*` | `high` (callback) | `xhigh` not valid on Gemini; `none/minimal/low/medium` respected; `xhigh/max` → clamped to `high` |
 | `groq/*` | `high` (callback) | only for reasoning models (`openai/gpt-oss-*`, `qwen/*`); for the others (`allam-2-7b`, whisper, ...) the parameter is **removed** (they would 400) |
-| `deepseek4free/*` | none | endpoint not validable per-model |
+| `inference4free/*` | none | endpoint not validable per-model |
 
 The client-provided value always wins (clamped if invalid).
 

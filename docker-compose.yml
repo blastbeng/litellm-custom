@@ -39,7 +39,7 @@ services:
       - openrouter-gw
       - groq-gw
       - gemini-gw
-      - deepseek4free-gw
+      - inference4free-gw
       - ollama-gw
     restart: no
     healthcheck:
@@ -121,15 +121,15 @@ services:
       - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
     restart: no
 
-  # Gateway per deepseek4free (provider-gw/gw.py). ID_PREFIX=deepseek4free/
+  # Gateway per inference4free (provider-gw/gw.py). ID_PREFIX=inference4free/
   # per il listing: il rename di litellm corromperebbe gli id nativi tipo
   # "deepseek/deepseek-chat" ("deepseek" e' un provider noto). Nessuna
   # riscrittura path (l'endpoint vive gia' su /v1). NOTA: l'upstream e'
   # plain-HTTP su LAN; llmtrim inoltra il traffico ma NON lo traccia (la sua
   # pipeline MITM/tracking e' solo-TLS, LLMTRIM_EXTRA_HOSTS estende i domini
   # HTTPS). L'hop resta per uniformita' architetturale e filtri futuri.
-  deepseek4free-gw:
-    container_name: deepseek4free-gw
+  inference4free-gw:
+    container_name: inference4free-gw
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
@@ -137,9 +137,10 @@ services:
       GW_CA: /data/ca-bundle.pem
       # hostname (non IP!): llmtrim riconosce SOLO host esatti in
       # LLMTRIM_EXTRA_HOSTS e scarta gli IP -> l'Host header del gateway
-      # deve essere "deepseek4free"
+      # deve essere "deepseek4free" (nome del PROGETTO upstream, accoppiato
+      # a LLMTRIM_EXTRA_HOSTS di llmtrim: non e' il nome del gateway)
       UPSTREAM: http://deepseek4free:18010
-      ID_PREFIX: deepseek4free/
+      ID_PREFIX: inference4free/
       # cache last-good del listing: l'endpoint e' instabile (progetto in
       # sviluppo); se /models fallisce, il gateway serve l'ultima lista
       # valida cosi' i modelli restano SEMPRE visibili su litellm

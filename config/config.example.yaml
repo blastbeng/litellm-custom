@@ -158,16 +158,17 @@ model_list:
       max_output_tokens: 32768
       max_tokens: 262144
 
-  # --- deepseek4free (192.168.1.13:18010): TUTTI i modelli, dinamici ---
-  # Endpoint OpenAI-compatible senza auth (progetto in sviluppo, instabile):
-  # via deepseek4free-gw con ID_PREFIX "deepseek4free/" e cache last-good del
+  # --- inference4free (upstream deepseek4free, 192.168.1.13:18010) -------
+  # TUTTI i modelli, dinamici. Endpoint OpenAI-compatible senza auth
+  # (progetto in sviluppo, instabile): via inference4free-gw con ID_PREFIX
+  # "inference4free/" e cache last-good del
   # listing (MODELS_CACHE=1) -> i modelli restano visibili anche quando
   # l'endpoint e' giu'. NIENTE reasoning_effort di default (non validabile
   # per-modello).
-  - model_name: deepseek4free/*
+  - model_name: inference4free/*
     litellm_params:
       model: openai/*
-      api_base: http://deepseek4free-gw/v1
+      api_base: http://inference4free-gw/v1
       api_key: dummy
       max_tokens: 32768
     model_info:

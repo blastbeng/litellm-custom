@@ -30,7 +30,7 @@ self.fallbacks)):
   entrambi sul PC, cadono insieme se spento)
 - openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
-  deepseek4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
+  inference4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
   lista di config.yaml, che AL MOMENTO non ha catch-all (richiesta utente:
   nessun modello deve piu' cadere su openrouter/free; la catch-all
   "*": ["openrouter/free"] e' stata rimossa)
