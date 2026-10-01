@@ -21,12 +21,12 @@ get_fallback_model_group: solo esatto/stripped-provider/"*"), quindi la
 policy e' applicata QUI per-request tramite litellm_params.fallbacks, che
 OVERRIDE la lista di config (router.py: kwargs.get("fallbacks",
 self.fallbacks)):
-- synthetic/*            -> ["fully-uncensored", "ollama/fully-uncensored"]
+- synthetic/*            -> ["local-model", "ollama/local-model"]
   (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
   wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
   online)
-- fully-uncensored       -> ["ollama/fully-uncensored"] (il fallback di
-  fully-uncensored E' il modello Ollama omonimo, anche su richiesta diretta)
+- local-model       -> ["ollama/local-model"] (il fallback di
+  local-model E' il modello Ollama omonimo, anche su richiesta diretta)
 - openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
 - tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
   deepseek4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
@@ -47,7 +47,7 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
 # "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
 # mai fallback); "ollama-cloud" e' un provider cloud separato.
-# fully-uncensored NON e' qui: ora ha il suo fallback (ollama/omonimo),
+# local-model NON e' qui: ora ha il suo fallback (ollama/omonimo),
 # gestito dal ramo dedicato in _apply.
 NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
 
@@ -57,20 +57,20 @@ class ReasoningClamp(CustomLogger):
     def _apply(self, data):
         model = str(data.get("model") or "")
         # --- policy fallback per-modello (override per-request) ---
-        if model == "fully-uncensored":
-            # stack (richiesta utente): fully-uncensored cade a sua volta su
-            # ollama/fully-uncensored (PC spento -> llama-gate 503 in ~2s ->
+        if model == "local-model":
+            # stack (richiesta utente): local-model cade a sua volta su
+            # ollama/local-model (PC spento -> llama-gate 503 in ~2s ->
             # fallback immediato; il gruppo esiste solo col PC online)
-            data["fallbacks"] = ["ollama/fully-uncensored"]
+            data["fallbacks"] = ["ollama/local-model"]
         elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
         elif model.startswith("synthetic/"):
-            # catena fallback (richiesta utente): fully-uncensored PRIMO,
-            # poi il modello Ollama locale omonimo "ollama/fully-uncensored"
+            # catena fallback (richiesta utente): local-model PRIMO,
+            # poi il modello Ollama locale omonimo "ollama/local-model"
             # (dinamico via wildcard ollama/*, presente solo quando il PC
             # Windows e' online: se spento la ollama-gate risponde 503 in
             # ~2s e litellm prosegue/termina)
-            data["fallbacks"] = ["fully-uncensored", "ollama/fully-uncensored"]
+            data["fallbacks"] = ["local-model", "ollama/local-model"]
         else:
             # tutti gli altri: nessun override, vale la lista di config.yaml
             # (senza catch-all = NESSUN fallback; openrouter/free = modello

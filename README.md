@@ -81,14 +81,14 @@ litellm even when the endpoint is down.
 
 ## Fallback policy
 
-- **`synthetic/*`** → **`fully-uncensored`** (llama-swap local model) first,
-  then **`ollama/fully-uncensored`** (the Ollama model with the same name on
+- **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
+  then **`ollama/local-model`** (the Ollama model with the same name on
   the Windows PC) — only on
-  provider errors (busy/offline/rate-limit). The `ollama/fully-uncensored`
+  provider errors (busy/offline/rate-limit). The `ollama/local-model`
   group exists only while the Windows PC is online (dynamic listing via
   `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
-- **`fully-uncensored`** itself (requested directly) →
-  **`ollama/fully-uncensored`**.
+- **`local-model`** itself (requested directly) →
+  **`ollama/local-model`**.
 - **Everything else** → no fallback: the error goes straight to the client.
 - **`ollama/*`** (any local Ollama model) and **`openrouter/free`** never
   fall back (not even to themselves).

@@ -7,7 +7,7 @@ model_list:
   # --- Modello locale (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
   # Unico modello locale. Nessun fallback: se e' occupo/spento restituisce
   # l'errore (comportamento voluto).
-  - model_name: fully-uncensored
+  - model_name: local-model
     litellm_params:
       model: openai/local-model
       # gate locale: se blastpc non risponde al TCP entro ~2s risponde 503
@@ -38,7 +38,7 @@ model_list:
   # docker-compose.yml. model_info unico per la wildcard (si applica a tutti
   # i modelli ollama/*). NESSUN fallback per ollama/* (in reasoning_clamp-like
   # callback).
-  # synthetic/* fa fallback a ollama/fully-uncensored (2o dopo fully-uncensored,
+  # synthetic/* fa fallback a ollama/local-model (2o dopo local-model,
   # il gruppo esiste solo quando il PC e' online).
   - model_name: ollama/*
     litellm_params:
@@ -47,7 +47,7 @@ model_list:
       api_key: dummy
       timeout: 1800
     model_info:
-      # contesto dei modelli Ollama attuali (fully-uncensored ora 131072);
+      # contesto dei modelli Ollama attuali (local-model ora 131072);
       # si applica a TUTTI i modelli ollama/* (wildcard unica) - aggiornare
       # se contesti diversi
       max_input_tokens: 131072
@@ -64,7 +64,7 @@ model_list:
       model: openai/*
       api_base: https://api.synthetic.new/openai/v1
       api_key: syn_YOUR_SYNTHETIC_API_KEY
-      # 131072 (era 262144): synthetic/* fa fallback su fully-uncensored
+      # 131072 (era 262144): synthetic/* fa fallback su local-model
       # (131072) - il default max_tokens non deve superare il contesto del
       # target di fallback
       max_tokens: 131072
@@ -174,8 +174,8 @@ litellm_settings:
   drop_params: false
 
   # Fallback (via callback, perche' le chiavi dei fallback non supportano
-  # wildcard): synthetic/* -> fully-uncensored -> ollama/fully-uncensored;
-  # fully-uncensored (richiesto direttamente) -> ollama/fully-uncensored.
+  # wildcard): synthetic/* -> local-model -> ollama/local-model;
+  # local-model (richiesto direttamente) -> ollama/local-model.
   # Nessun fallback per tutti gli altri modelli; openrouter/free e ollama/*
   # non fanno MAI fallback.
   fallbacks:
