@@ -168,15 +168,17 @@ services:
   # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
   # cosi' litellm puo' avere un timeout LUNGO (modelli enormi: 10-20 min)
   # senza restare appeso quando il PC e' spento.
-  # GATE_TLS=1: llama-swap dal 2026-10-02 e' su https self-signed; la gate
-  # termina il TLS verso l'upstream e serve HTTP in chiaro a litellm
-  # (verifica cert disattivata: self-signed LAN, litellm non deve fidarsi).
+  # GATE_TLS=auto: la gate PROVA il TLS e, se l'upstream risponde in HTTP
+  # in chiaro (llama-swap senza ssl, dal 2026-10-02), riparte su TCP pulito:
+  # funziona con https self-signed E con http senza toccare la config quando
+  # lo schema upstream cambia. GATE_TLS=1 forza il TLS (503 se fallisce),
+  # GATE_TLS=0 forza il chiaro. La gate serve a litellm SEMPRE HTTP.
   llama-gate:
     container_name: llama-gate
     image: python:3.13-slim
     command: ["python", "/app/gate.py"]
     environment:
-      GATE_TLS: "1"
+      GATE_TLS: "auto"
     extra_hosts:
       - "blastpc:192.168.1.29"
     volumes:
