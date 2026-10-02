@@ -11,7 +11,8 @@ services:
       # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
       HTTPS_PROXY: http://host.docker.internal:43117
       NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw"
-      # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync)
+      # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync,
+      # pubblicato in trust/ - vedi volume qui sotto: directory, non file)
       SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
       # RAM ottimizzazione (RPi5 8GB):
       # - MALLOC_ARENA_MAX: glibc crea un'arena per thread e l'RSS di Python
@@ -29,7 +30,15 @@ services:
     volumes:
       - ./config/config.yaml:/app/config.yaml
       - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/.llmtrim/ca-bundle.pem:ro
+      # trust/ = SOLO ca-bundle.pem (pubblicato da llmtrim-ca-sync). Montare la
+      # DIRECTORY e non il singolo file e' la fix della CA drift: il sync
+      # sostituisce il bundle con `cat ... > bundle.tmp && mv` (NUOVO inode) e
+      # un bind-mount di SINGOLO FILE resta pinned al vecchio inode per tutta
+      # la vita del container -> CA ruotata = CERTIFICATE_VERIFY_FAILED
+      # ("unable to get local issuer certificate") finche' il container non
+      # viene ricreato. ca.key (0600) resta FUORI dal mount: non finisce nel
+      # container.
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/.llmtrim:ro
     command:
       - "--config"
       - "/app/config.yaml"
@@ -69,12 +78,12 @@ services:
     command: ["sh", "-c", "pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
       GW_PROXY: http://host.docker.internal:43117
-      GW_CA: /data/ca-bundle.pem
+      GW_CA: /data/llmtrim/ca-bundle.pem
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./openrouter-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
 
   # Gateway listing per Groq (vedi provider-gw/gw.py, stessa meccanica di
@@ -89,7 +98,7 @@ services:
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
       GW_PROXY: http://host.docker.internal:43117
-      GW_CA: /data/ca-bundle.pem
+      GW_CA: /data/llmtrim/ca-bundle.pem
       UPSTREAM: https://api.groq.com
       PATH_PRE: /openai
       ID_PREFIX: groq/
@@ -97,7 +106,7 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
 
   # Gateway listing per Gemini (provider-gw/gw.py): riscrive /v1/* ->
@@ -111,14 +120,14 @@ services:
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
       GW_PROXY: http://host.docker.internal:43117
-      GW_CA: /data/ca-bundle.pem
+      GW_CA: /data/llmtrim/ca-bundle.pem
       UPSTREAM: https://generativelanguage.googleapis.com
       PATH_PRE: /v1beta/openai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
 
   # Gateway per inference4free (provider-gw/gw.py). ID_PREFIX=inference4free/
@@ -134,7 +143,7 @@ services:
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
       GW_PROXY: http://host.docker.internal:43117
-      GW_CA: /data/ca-bundle.pem
+      GW_CA: /data/llmtrim/ca-bundle.pem
       # hostname (non IP!): llmtrim riconosce SOLO host esatti in
       # LLMTRIM_EXTRA_HOSTS e scarta gli IP -> l'Host header del gateway
       # deve essere "deepseek4free" (nome del PROGETTO upstream, accoppiato
@@ -152,17 +161,22 @@ services:
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
       - ./provider-gw/cache:/cache
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
 
   # Gate TCP verso llama-swap (blastpc) - vedi llama-gate/gate.py:
   # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
   # cosi' litellm puo' avere un timeout LUNGO (modelli enormi: 10-20 min)
   # senza restare appeso quando il PC e' spento.
+  # GATE_TLS=1: llama-swap dal 2026-10-02 e' su https self-signed; la gate
+  # termina il TLS verso l'upstream e serve HTTP in chiaro a litellm
+  # (verifica cert disattivata: self-signed LAN, litellm non deve fidarsi).
   llama-gate:
     container_name: llama-gate
     image: python:3.13-slim
     command: ["python", "/app/gate.py"]
+    environment:
+      GATE_TLS: "1"
     extra_hosts:
       - "blastpc:192.168.1.29"
     volumes:
@@ -205,12 +219,17 @@ services:
       # del suffisso -> nome pubblico "ollama/x" (il fallback di synthetic/*
       # in reasoning_clamp punta a "ollama/local-model", non ":latest")
       STRIP_LATEST: "1"
+      # gw.py ha GW_CA obbligatoria (default /data/ca-bundle.pem): qui la
+      # punta al bundle dentro il mount di directory (vedi sotto)
+      GW_CA: /data/llmtrim/ca-bundle.pem
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      # gw.py setta SEMPRE verify=GW_CA (default /data/ca-bundle.pem): il
-      # bundle va montato anche se l'upstream e' plain-HTTP (non usato, ma
-      # senza il file httpx crasha all'avvio)
-      - /opt/docker/compose/llmtrim/data/.llmtrim/ca-bundle.pem:/data/ca-bundle.pem:ro
+      # gw.py setta SEMPRE verify=GW_CA: il bundle va montato anche se
+      # l'upstream e' plain-HTTP (non usato, ma senza il file httpx crasha
+      # all'avvio). Montaggio per DIRECTORY: un CA-rotation del bundle e'
+      # visibile subito (un bind-mount di singolo file resta pinned al vecchio
+      # inode finche' il container non e' ricreato).
+      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     depends_on:
       - ollama-gate
     restart: no
