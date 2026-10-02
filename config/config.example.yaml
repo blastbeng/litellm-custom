@@ -4,6 +4,20 @@
 
 model_list:
 
+  # CONTESTI: i valori di max_input_tokens qui sotto DEVO NO stare allineati a
+  # CONTEXT_BY_PREFIX in reasoning_clamp.py, che e' li' che avviene il CLAMP di
+  # max_tokens (contesto - prompt). Il limite lo impone l'upstream: llama-swap
+  # conta col tokenizer reale e risponde 400 "prompt (N) + max tokens (M)
+  # exceeds the context (C); requests are never truncated" - il 400 uccide la
+  # catena di fallback intera. Contesto cambiato qui = cambiato li'.
+  #
+  # Se il PROMPT da solo satura il contesto (prompt + 1024 + margine > C) il
+  # clamp non basta: parte la CASCATA in reasoning_clamp.py - B compattazione
+  # con un modello da 262k disponibile, C compressione BM25
+  # (litellm.compression.compress, lossy), E map/reduce su small-model, poi
+  # 413 strutturato. I modelli con contesto >= 262144 sono anche i compattatori
+  # di B: togliere tutti i 262k dalla config toglie il livello B alla cascata.
+
   # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
   # local-model e' il modello principale; small-model e' un modello autonomo
   # invocabile direttamente e NON e' fallback di nessuno (reasoning_clamp).
@@ -11,9 +25,11 @@ model_list:
   - model_name: local-model
     litellm_params:
       model: openai/local-model
-      # gate locale: se blastpc non risponde al TCP entro ~2s risponde 503
+      # gate locale: se blastpc non risponde al TCP/TLS entro ~2s risponde 503
       # subito (PC spento), altrimenti fa da tubo trasparente - vedi
-      # llama-gate/gate.py. Serve perche' litellm ha un SOLO timeout per
+      # llama-gate/gate.py. llama-swap e' su https self-signed: la gate
+      # termina il TLS (GATE_TLS=1) e qui resta HTTP in chiaro. Serve perche'
+      # litellm ha un SOLO timeout per
       # l'intera richiesta (httpx, connect incluso): senza gate, un timeout
       # lungo validerebbe anche il caso "PC spento" (appendersi per mezz'ora),
       # e un timeout corto troncherebbe i modelli enormi.
