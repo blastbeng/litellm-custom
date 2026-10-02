@@ -25,6 +25,11 @@ self.fallbacks)):
   (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
   wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
   online)
+- synthetic/syn:small:text -> ["small-model", "local-model",
+  "ollama/local-model"] (richiesta utente 2026-10-02: PRIMA small-model,
+  il secondo modello llama-swap, poi lo stack standard di synthetic/*.
+  syn:small:VISION resta sul chain standard: small-model e' text-only su
+  llama-swap, quindi una richiesta vision 400 sul target)
 - local-model       -> ["ollama/local-model"] (SOLO il modello Ollama
   omonimo: small-model NON e' piu' fallback di nessuno - richiesta utente
   2026-10-01; resta un modello autonomo invocabile direttamente)
@@ -102,6 +107,14 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 # small-model NON e' qui e non compare in nessuna catena di fallback: e'
 # un modello autonomo, invocabile solo direttamente (richiesta utente).
 NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
+
+# synthetic/syn:small:text (richiesta utente 2026-10-02): fallback PRIMA su
+# small-model (secondo modello llama-swap, contesto 131072, stessa gate di
+# local-model -> 503 in ~2s col PC spento), poi lo stack standard di
+# synthetic/*. Piccolo->piccolo: e' la coppia di capacita' piu' vicina.
+# syn:small:vision NON usa small-model (text-only: la richiesta 400 li').
+SYN_SMALL_TEXT = "synthetic/syn:small:text"
+SYN_SMALL_TEXT_FALLBACKS = ["small-model", "local-model", "ollama/local-model"]
 
 # --- contesti (model_info.max_input_tokens di config.yaml) ---
 # Serve la mappa QUI perche' i modelli sono wildcard/custom:
@@ -522,12 +535,17 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = ["ollama/local-model"]
         elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
             data["fallbacks"] = []
+        elif model == SYN_SMALL_TEXT:
+            # richiesta utente 2026-10-02: syn:small:text cade PRIMA su
+            # small-model, poi lo stack standard di synthetic/*
+            data["fallbacks"] = list(SYN_SMALL_TEXT_FALLBACKS)
         elif model.startswith("synthetic/"):
             # catena fallback (richiesta utente): local-model PRIMO,
             # poi il modello Ollama locale omonimo "ollama/local-model"
             # (dinamico via wildcard ollama/*, presente solo quando il PC
             # Windows e' online: se spento la ollama-gate risponde 503 in
-            # ~2s e litellm prosegue/termina)
+            # ~2s e litellm prosegue/termina).
+            # ECCEZIONE: syn:small:text, gestita dal ramo esatto qui sopra
             data["fallbacks"] = ["local-model", "ollama/local-model"]
         else:
             # tutti gli altri: nessun override, vale la lista di config.yaml

@@ -20,15 +20,18 @@ model_list:
 
   # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
   # local-model e' il modello principale; small-model e' un modello autonomo
-  # invocabile direttamente e NON e' fallback di nessuno (reasoning_clamp).
+  # invocabile direttamente e come fallback e' solo il PRIMO target di
+  # synthetic/syn:small:text (reasoning_clamp).
   # Se tutti sono occupi/spenti restituiscono l'errore (comportamento voluto).
   - model_name: local-model
     litellm_params:
       model: openai/local-model
       # gate locale: se blastpc non risponde al TCP/TLS entro ~2s risponde 503
       # subito (PC spento), altrimenti fa da tubo trasparente - vedi
-      # llama-gate/gate.py. llama-swap e' su https self-signed: la gate
-      # termina il TLS (GATE_TLS=1) e qui resta HTTP in chiaro. Serve perche'
+      # llama-gate/gate.py. GATE_TLS=auto: llama-swap rispondendo in http
+      # (senza ssl, dal 2026-10-02) la gate fa tubo in chiaro, ma se tornasse
+      # su https self-signed termina lei il TLS - qui resta SEMPRE HTTP in
+      # chiaro comunque vada l'upstream. Serve perche'
       # litellm ha un SOLO timeout per
       # l'intera richiesta (httpx, connect incluso): senza gate, un timeout
       # lungo validerebbe anche il caso "PC spento" (appendersi per mezz'ora),
@@ -51,7 +54,8 @@ model_list:
       max_tokens: 32768
 
   # --- Secondo modello locale (PC 192.168.1.29, llama-swap): modello autonomo,
-  # invocabile direttamente; NON e' fallback di nessun modello (reasoning_clamp).
+  # invocabile direttamente; come fallback e' il PRIMO target di
+  # synthetic/syn:small:text (reasoning_clamp), di nessun altro.
   # Stessa gate di local-model.
   - model_name: small-model
     litellm_params:
@@ -210,8 +214,11 @@ litellm_settings:
 
   # Fallback (via callback, perche' le chiavi dei fallback non supportano
   # wildcard): synthetic/* -> local-model -> ollama/local-model;
+  # synthetic/syn:small:text -> small-model -> local-model -> ollama/local-model
+  # (richiesta utente 2026-10-02: piccolo->piccolo; syn:small:vision resta sul
+  # chain standard perche' small-model e' text-only);
   # local-model (richiesto direttamente) -> ollama/local-model.
-  # small-model NON e' fallback di nessuno: modello autonomo (richiesta utente).
+  # small-model e' modello autonomo: target di fallback solo di syn:small:text.
   # Nessun fallback per tutti gli altri modelli; openrouter/free e ollama/*
   # non fanno MAI fallback.
   fallbacks:

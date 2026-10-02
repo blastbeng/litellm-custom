@@ -14,8 +14,8 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
  localhost:4000      │   │  :4000      │              │  tracks/compresses LLM   │     │   (api.groq.com,
                      │   └──┬───┬───┬──┘              └──────────────────────────┘     │   openrouter.ai,
                      │      │   │   │                                                  │   generativelanguage,
-                     │      │   │   └────────────► llama-gate ──► blastpc:11435 (https) │   api.synthetic.new,
-                     │      │   │                  (TCP+TLS gate, PC off → 503)     │   ollama.com)
+                     │      │   │   └────────────► llama-gate ──► blastpc:11435      │   api.synthetic.new,
+                     │      │   │        (TCP gate, http|https auto, PC off → 503)   │   ollama.com)
                      │      │   │                                                  │
                      │      │   ├────► openrouter-gw ─┐                           │
                      │      │   ├────► groq-gw ───────┤ (via llmtrim)             │
@@ -30,7 +30,7 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 | Service | File | Role |
 |---|---|---|
 | `litellm` | `config/config.yaml` | LiteLLM proxy/router (port 4000) |
-| `llama-gate` | `llama-gate/gate.py` | TCP+TLS gate to llama-swap (`https`, self-signed: gate terminates TLS, litellm stays plain HTTP; PC off → 503 in ~2s) |
+| `llama-gate` | `llama-gate/gate.py` | TCP gate to llama-swap — `GATE_TLS=auto`: tries TLS, falls back to plain HTTP on `WRONG_VERSION_NUMBER` (llama-swap runs **plain HTTP** since 2026-10-02, previously `https` self-signed with gate-side TLS termination; litellm always stays plain HTTP; PC off → 503 in ~2s) |
 | `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama OpenAI-compat API (`blastpc:11434`) |
 | `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama listing with `ID_PREFIX=ollama/`, no cache (models visible only while the PC is online) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
@@ -87,9 +87,14 @@ litellm even when the endpoint is down.
   provider errors (busy/offline/rate-limit). The `ollama/local-model`
   group exists only while the Windows PC is online (dynamic listing via
   `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
+- **`synthetic/syn:small:text`** → **`small-model`** first, then
+  **`local-model`** → **`ollama/local-model`** (capacity-matched: small →
+  small). `synthetic/syn:small:vision` keeps the standard `synthetic/*`
+  chain: `small-model` is text-only on llama-swap, so a vision request
+  would 400 on it.
 - **`local-model`** itself (requested directly) → **`ollama/local-model`**
-  only. **`small-model`** is a standalone model (invoke it directly): it is
-  **not** a fallback of any model.
+  only. **`small-model`** is a standalone model (invoke it directly): the
+  only chain it appears in as a target is `synthetic/syn:small:text` above.
 - **Everything else** → no fallback: the error goes straight to the client.
 - **`ollama/*`** (any local Ollama model) and **`openrouter/free`** never
   fall back (not even to themselves).
@@ -125,9 +130,11 @@ so a big-prompt request kills the **whole fallback chain**
 (`synthetic/*` → `local-model` → `ollama/local-model`, all 131072).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
-`max_completion_tokens`) to `context − prompt` **on every attempt** — the hook
-also runs for each fallback target, so each target gets its own budget. The
-prompt size is **estimated conservatively** (`chars / 2.8` + per-message
+`max_completion_tokens`) to `context − prompt`. The pre-call hook runs **once
+per client request** (`proxy/utils.py`), not once per fallback attempt, so the
+budget computed on the requested model is **inherited by every fallback
+target** — conservative and safe here, since the local chains are all 131072.
+The prompt size is **estimated conservatively** (`chars / 2.8` + per-message
 overhead): overestimating is safe (shorter completion), underestimating
 produces the upstream 400. If the prompt alone saturates the context the clamp
 is useless — there is no room left for the answer — and the
@@ -173,8 +180,10 @@ sudo systemctl restart docker-compose@litellm
 - `llmtrim` listening on `:43117`, publishing its CA bundle at
   `/opt/docker/compose/llmtrim/data/.llmtrim/trust/ca-bundle.pem`
   (system root CA store + the llmtrim CA, kept in sync by `llmtrim-ca-sync`);
-- llama-swap on `blastpc` (192.168.1.29, port 11435, `https` with a self-signed
-  cert — `llama-gate` terminates the TLS, litellm talks plain HTTP to it);
+- llama-swap on `blastpc` (192.168.1.29, port 11435, **plain HTTP** since
+  2026-10-02 — `llama-gate` runs with `GATE_TLS=auto`, so it also works if
+  llama-swap goes back to `https` self-signed: it terminates the TLS itself;
+  litellm always talks plain HTTP to the gate);
 - the `deepseek4free` service on 192.168.1.13:18010 (optional).
 
 All outbound HTTPS traffic from litellm and the gateways goes through
