@@ -81,30 +81,37 @@ litellm even when the endpoint is down.
 
 ## Fallback policy
 
+**`small-model` is the final fallback of every model** (user request
+2026-10-02): it is reached **only after every other fallback in the chain
+has failed**.
+
 - **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
   then **`ollama/local-model`** (the Ollama model with the same name on
-  the Windows PC) — only on
-  provider errors (busy/offline/rate-limit). The `ollama/local-model`
+  the Windows PC), then **`small-model`**. The `ollama/local-model`
   group exists only while the Windows PC is online (dynamic listing via
   `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
 - **`synthetic/syn:small:text`** → **`small-model`** first, then
   **`local-model`** → **`ollama/local-model`** (capacity-matched: small →
-  small). `synthetic/syn:small:vision` keeps the standard `synthetic/*`
+  small; `small-model` heads its own chain, so there is no "final" target
+  left after the others for it).
+  `synthetic/syn:small:vision` keeps the standard `synthetic/*`
   chain: `small-model` is text-only on llama-swap, so a vision request
   would 400 on it.
-- **`local-model`** itself (requested directly) → **`ollama/local-model`**
-  only. **`small-model`** is a standalone model (invoke it directly): the
-  only chain it appears in as a target is `synthetic/syn:small:text` above.
-- **Everything else** → no fallback: the error goes straight to the client.
-- **`ollama/*`** (any local Ollama model) and **`openrouter/free`** never
-  fall back (not even to themselves).
+- **`local-model`** itself (requested directly) →
+  **`ollama/local-model`** → **`small-model`**.
+- **`small-model`** → no fallback at all: it is the last resort of
+  everyone else, retrying it alone would make no sense.
+- **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
+  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
+  and any future prefix) → **`small-model`** directly.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
 (`get_fallback_model_group`: exact match / provider-stripped / `"*"` only),
 so the per-model policy is implemented in the `reasoning_clamp.py` callback
 via **per-request** `litellm_params.fallbacks`, which override the config
 list (`router.py`: `kwargs.get("fallbacks", self.fallbacks)`).
-`config.yaml` only keeps the explicit disable entries.
+`config.yaml` keeps the catch-all `"*": ["small-model"]` entry as a safety
+net for requests that skip the callback.
 
 ## `reasoning_effort` handling (cascade)
 
@@ -127,13 +134,20 @@ counts the prompt with the **real tokenizer** and answers **400** —
 never truncated` — and litellm wraps that 400 as `BadRequestError`. With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model` → `ollama/local-model`, all 131072).
+(`synthetic/*` → `local-model` → `ollama/local-model` → `small-model`,
+all 131072).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
-`max_completion_tokens`) to `context − prompt`. The pre-call hook runs **once
+`max_completion_tokens`) to `context − prompt`, and — when the request
+carries a fallback chain — to the **smallest context in the chain**: the
+budget must fit every target, including `small-model` (131072), the final
+fallback of every model. The pre-call hook runs **once
 per client request** (`proxy/utils.py`), not once per fallback attempt, so the
 budget computed on the requested model is **inherited by every fallback
-target** — conservative and safe here, since the local chains are all 131072.
+target**. The `litellm_params` defaults (`max_tokens`) are merged into every
+attempt **after** the hook (invisible to it): this is why the cloud
+wildcards carry **no** `max_tokens` default and `synthetic/*` is capped at
+32768.
 The prompt size is **estimated conservatively** (`chars / 2.8` + per-message
 overhead): overestimating is safe (shorter completion), underestimating
 produces the upstream 400. If the prompt alone saturates the context the clamp

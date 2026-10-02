@@ -15,30 +15,39 @@ xhigh/max vengono ridotti al massimo valore supportato dal provider.
 - Gli altri modelli (synthetic/*, openrouter/*, ollama-cloud/*, locale)
   non vengono toccati: il loro default xhigh sta gia' in config.yaml.
 
-POLICY FALLBACK per-modello (richiesta utente, wildcard-safe):
+POLICY FALLBACK per-modello (richiesta utente 2026-10-02, wildcard-safe):
 le chiavi dei fallback in config.yaml NON supportano wildcard (litellm
 get_fallback_model_group: solo esatto/stripped-provider/"*"), quindi la
 policy e' applicata QUI per-request tramite litellm_params.fallbacks, che
 OVERRIDE la lista di config (router.py: kwargs.get("fallbacks",
 self.fallbacks)):
-- synthetic/*            -> ["local-model", "ollama/local-model"]
+
+  REGOLA: small-model e' l'ULTIMO fallback di TUTTI i modelli, raggiunto
+  SOLO dopo che tutti gli altri fallback sono miseramente falliti
+  (run_async_fallback walka la catena in ordine e attempted_targets
+  impedisce ripetizioni e loop).
+
+- synthetic/*            -> ["local-model", "ollama/local-model", "small-model"]
   (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
   wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
-  online)
+  online, e in FINALE small-model, il secondo modello llama-swap)
 - synthetic/syn:small:text -> ["small-model", "local-model",
   "ollama/local-model"] (richiesta utente 2026-10-02: PRIMA small-model,
   il secondo modello llama-swap, poi lo stack standard di synthetic/*.
+  small-model e' gia' il PRIMO della sua catena: se fallisce, rimetterlo
+  in coda e' inutile - litellm skippa i target gia' tentati.
   syn:small:VISION resta sul chain standard: small-model e' text-only su
   llama-swap, quindi una richiesta vision 400 sul target)
-- local-model       -> ["ollama/local-model"] (SOLO il modello Ollama
-  omonimo: small-model NON e' piu' fallback di nessuno - richiesta utente
-  2026-10-01; resta un modello autonomo invocabile direttamente)
-- openrouter/free, ollama/* -> [] (mai fallback, nemmeno su se stessi)
-- tutto il resto (groq/*, gemini/*, ollama-cloud/*, openrouter/*,
-  inference4free/* e QUALSIASI prefisso futuro) -> nessun override: vale la
-  lista di config.yaml, che AL MOMENTO non ha catch-all (richiesta utente:
-  nessun modello deve piu' cadere su openrouter/free; la catch-all
-  "*": ["openrouter/free"] e' stata rimossa)
+- local-model       -> ["ollama/local-model", "small-model"] (prima il
+  modello Ollama omonimo, poi small-model come ultima spiaggia)
+- small-model       -> [] (nessun auto-fallback: e' lui l'ultimo ricorso
+  di tutti gli altri, riprovarlo da solo non avrebbe senso)
+- TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
+  ollama/*, ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
+  -> ["small-model"]: nessun gradino intermedio, small-model e' l'ultimo
+  ricorso diretto. La lista di config.yaml mantiene la catch-all
+  "*": ["small-model"] come rete di sicurezza (ombreggiata da questo
+  override per-request su ogni modello).
 
 Il provider e' dedotto dal nome pubblico del modello (prefisso "groq/",
 "gemini/"); si copre anche la forma nativa ("models/gemini-...") per
@@ -50,11 +59,15 @@ llama-swap conta i token del prompt col tokenizer REALE e risponde 400
 never truncated" - il testo NON e' di litellm, che con
 enable_pre_call_checks: false non fa alcun controllo), e litellm incapsula il
 400 come BadRequestError: cosi' una richiesta con prompt grande uccide la
-CATENA DI FALLBACK intera (synthetic/* -> local-model -> ollama/local-model,
-tutti 131072). Qui max_tokens viene ridotto a "contesto - prompt" su
-OGNI tentativo (l'hook gira anche per ogni target di fallback), con stima
-CONSERVATIVA dei token del prompt (caratteri/2.8: sovrastimare e' sicuro,
-sottostimare produce il 400 dell'upstream).
+CATENA DI FALLBACK intera (synthetic/* -> local-model -> ollama/local-model
+-> small-model). Qui max_tokens viene ridotto a "contesto - prompt" usando
+il CONTESTO MINIMO dell'intera catena di fallback: l'hook del proxy gira
+UNA sola volta per richiesta client (litellm unisce i litellm_params del
+deployment a ogni tentativo, fallback inclusi, SENZA ripassare dall'hook -
+verificato su router.py/fallback_event_handlers.py v1.104.0), quindi il
+tetto deve valere per ogni hop della catena. Stima CONSERVATIVA dei token
+del prompt (caratteri/2.8: sovrastimare e' sicuro, sottostimare produce il
+400 dell'upstream).
 
 CASCATA OVERFLOW (richiesta utente 2026-10-02): quando il prompt da solo
 satura il contesto (prompt + MIN_OUTPUT_TOKENS + margine > contesto) il
@@ -100,13 +113,10 @@ from litellm.integrations.custom_logger import CustomLogger
 
 GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
-# "ollama" copre la wildcard dinamica ollama/* (modelli Ollama locali:
-# mai fallback); "ollama-cloud" e' un provider cloud separato.
-# local-model NON e' qui: ha il suo fallback (solo l'ollama omonimo),
-# gestito dal ramo dedicato in _apply.
-# small-model NON e' qui e non compare in nessuna catena di fallback: e'
-# un modello autonomo, invocabile solo direttamente (richiesta utente).
-NO_FALLBACK_MODELS = ("openrouter/free", "ollama")
+# Ultimo ricorso di TUTTI i modelli (richiesta utente 2026-10-02): piccolo,
+# locale, 503 in ~2s col PC spento. small-model non cade MAI su se stesso
+# (ramo esatto in _apply): riprovarlo da solo non avrebbe senso.
+FINAL_FALLBACK = "small-model"
 
 # synthetic/syn:small:text (richiesta utente 2026-10-02): fallback PRIMA su
 # small-model (secondo modello llama-swap, contesto 131072, stessa gate di
@@ -269,14 +279,24 @@ class ReasoningClamp(CustomLogger):
         return isinstance(md, dict) and md.get(INTERNAL_CALL_ORIGIN_KEY)
 
     def _clamp_output(self, data, model, est=None):
-        """max_tokens <= contesto - prompt, per OGNI tentativo (hook gira anche
-        sui target di fallback). Nessun clamp se il client non passa un tetto:
-        in quel caso llama-swap/Ollama auto-limitano il completamento."""
+        """max_tokens <= contesto - prompt. Il contesto e' il MINIMO della
+        catena di fallback (l'hook del proxy NON viene rieseguito sui target
+        di fallback: litellm riusa gli stessi kwargs a ogni hop, quindi il
+        tetto scelto qui deve starci dentro ovunque). Nessun clamp se il
+        client non passa un tetto: in quel caso llama-swap/Ollama
+        auto-limitano il completamento."""
         keys = [k for k in MAX_TOKEN_KEYS
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
         if not keys:
             return
         ctx = self._context_for(model)
+        chain = data.get("fallbacks")
+        if isinstance(chain, list) and chain:
+            # la richiesta deve starci ANCHE se cade sull'ultimo target
+            # (small-model, 131072): limita al contesto piu' piccolo della
+            # catena (i default litellm_params.max_tokens sono uniti da
+            # litellm DOPO l'hook e non sono visibili qui - vedi config)
+            ctx = min([ctx] + [self._context_for(str(t)) for t in chain])
         if est is None:
             est = self._estimate_prompt_tokens(data)
         budget = ctx - est - SAFETY_MARGIN
@@ -526,33 +546,40 @@ class ReasoningClamp(CustomLogger):
     def _apply(self, data):
         model = str(data.get("model") or "")
         # --- policy fallback per-modello (override per-request) ---
-        if model == "local-model":
-            # fallback (richiesta utente 2026-10-01): SOLO ollama/local-model,
-            # il modello Ollama omonimo. small-model e' stato RIMOSSO da ogni
-            # catena di fallback (resta modello autonomo, solo su richiesta
-            # diretta). PC spento -> la gate 503 in ~2s; il gruppo ollama/*
-            # esiste solo col PC online
-            data["fallbacks"] = ["ollama/local-model"]
-        elif any(model == m or model.startswith(m + "/") for m in NO_FALLBACK_MODELS):
+        # Regola (richiesta utente 2026-10-02): small-model e' l'ULTIMO
+        # fallback di tutti i modelli, dopo che tutti gli altri sono falliti.
+        if model == "small-model":
+            # niente auto-fallback: e' lui l'ultimo ricorso di tutti gli
+            # altri; litellm skipperebbe comunque un target gia' tentato
             data["fallbacks"] = []
+        elif model == "local-model":
+            # prima il modello Ollama omonimo (PC online: la wildcard
+            # ollama/* esiste solo li'), poi small-model in ultima spiaggia.
+            # PC spento -> le gate 503 in ~2s a gradino
+            data["fallbacks"] = ["ollama/local-model", FINAL_FALLBACK]
         elif model == SYN_SMALL_TEXT:
             # richiesta utente 2026-10-02: syn:small:text cade PRIMA su
-            # small-model, poi lo stack standard di synthetic/*
+            # small-model, poi lo stack standard di synthetic/* (small-model
+            # e' gia' primo della catena: e' anche il suo "ultimo ricorso")
             data["fallbacks"] = list(SYN_SMALL_TEXT_FALLBACKS)
         elif model.startswith("synthetic/"):
             # catena fallback (richiesta utente): local-model PRIMO,
             # poi il modello Ollama locale omonimo "ollama/local-model"
             # (dinamico via wildcard ollama/*, presente solo quando il PC
             # Windows e' online: se spento la ollama-gate risponde 503 in
-            # ~2s e litellm prosegue/termina).
+            # ~2s), infine small-model come ultimo ricorso.
             # ECCEZIONE: syn:small:text, gestita dal ramo esatto qui sopra
-            data["fallbacks"] = ["local-model", "ollama/local-model"]
+            data["fallbacks"] = ["local-model", "ollama/local-model",
+                                 FINAL_FALLBACK]
         else:
-            # tutti gli altri: nessun override, vale la lista di config.yaml
-            # (senza catch-all = NESSUN fallback; openrouter/free = modello
-            # NATIVO OpenRouter "Free Models Router", non piu' usato come
-            # fallback su richiesta dell'utente)
-            data.pop("fallbacks", None)
+            # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
+            # openrouter/free, ollama/*, ollama-cloud/*, inference4free/* e
+            # qualunque prefisso futuro): nessun gradino intermedio,
+            # small-model e' l'ultimo ricorso diretto (richiesta utente
+            # 2026-10-02). La catch-all "*": ["small-model"] in config.yaml
+            # resta come rete di sicurezza ma e' ombreggiata da questo
+            # override per-request
+            data["fallbacks"] = [FINAL_FALLBACK]
         # --- reasoning_effort per-provider ---
         eff = data.get("reasoning_effort")
         if model.startswith("groq/"):
