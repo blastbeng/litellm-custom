@@ -27,31 +27,30 @@ self.fallbacks)):
   (run_async_fallback walka la catena in ordine e attempted_targets
   impedisce ripetizioni e loop).
 
-- synthetic/*            -> ["local-model", "ollama/local-model", "small-model"]
-  (stack: llama-swap locale PRIMO, poi il modello Ollama omonimo via
-  wildcard dinamica ollama/*, disponibile solo quando il PC Windows e'
-  online, e in FINALE small-model, il secondo modello llama-swap)
-- synthetic/syn:small:text -> ["small-model", "local-model",
-  "ollama/local-model"] (richiesta utente 2026-10-02: PRIMA small-model,
-  il secondo modello llama-swap, poi lo stack standard di synthetic/*.
-  small-model e' gia' il PRIMO della sua catena: se fallisce, rimetterlo
-  in coda e' inutile - litellm skippa i target gia' tentati.
-  syn:small:VISION resta sul chain standard: small-model e' text-only su
-  llama-swap, quindi una richiesta vision 400 sul target)
+- synthetic/*            -> ["local-model", "small-model"]
+  (stack: llama-swap locale PRIMO, in FINALE small-model, il secondo
+  modello llama-swap)
+- synthetic/syn:small:text e synthetic/syn:small:vision -> ["small-model"]
+  (richiesta utente 2026-10-04: ALLINEATI, UN SOLO target che e'
+  small-model - niente local-model, niente Ollama locale (rimossa
+  dappertutto). Piccolo->piccolo: small-model e' la capacita' piu' vicina
+  a syn:small:*. syn:small:VISION su small-model (text-only su llama-swap)
+  puo' rispondere 400 sull'input vision: scelta esplicita dell'utente,
+  la catena resta questa)
 - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> ["embedding-model"]
   (richiesta utente 2026-10-04: modello EMBEDDING su synthetic.new, endpoint
   /v1/embeddings; quando non disponibile cade sul modello omonimo di
   llama-swap, Qwen3-Embedding-0.6b. UN solo target: gli altri modelli
   llama-swap sono CHAT e su una richiesta embedding risponderebbero 400)
-- local-model       -> ["ollama/local-model", "small-model"] (prima il
-  modello Ollama omonimo, poi small-model come ultima spiaggia)
+- local-model       -> ["small-model"] (small-model come ultima spiaggia;
+  l'Ollama locale e' stata rimossa dappertutto, richiesta utente 2026-10-04)
 - small-model       -> [] (nessun auto-fallback: e' lui l'ultimo ricorso
   di tutti gli altri, riprovarlo da solo non avrebbe senso)
 - embedding-model   -> [] (nessun auto-fallback: e' l'unico modello
   embedding del fallback chain, un target CHAT su una richiesta embedding
   risponderebbe 400 - stesso motivo di small-model)
 - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  ollama/*, ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
+  ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
   -> ["small-model"]: nessun gradino intermedio, small-model e' l'ultimo
   ricorso diretto. La lista di config.yaml mantiene la catch-all
   "*": ["small-model"] come rete di sicurezza (ombreggiata da questo
@@ -67,8 +66,8 @@ llama-swap conta i token del prompt col tokenizer REALE e risponde 400
 never truncated" - il testo NON e' di litellm, che con
 enable_pre_call_checks: false non fa alcun controllo), e litellm incapsula il
 400 come BadRequestError: cosi' una richiesta con prompt grande uccide la
-CATENA DI FALLBACK intera (synthetic/* -> local-model -> ollama/local-model
--> small-model). Qui max_tokens viene ridotto a "contesto - prompt" usando
+CATENA DI FALLBACK intera (synthetic/* -> local-model -> small-model).
+Qui max_tokens viene ridotto a "contesto - prompt" usando
 il CONTESTO MINIMO dell'intera catena di fallback: l'hook del proxy gira
 UNA sola volta per richiesta client (litellm unisce i litellm_params del
 deployment a ogni tentativo, fallback inclusi, SENZA ripassare dall'hook -
@@ -126,13 +125,16 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 # (ramo esatto in _apply): riprovarlo da solo non avrebbe senso.
 FINAL_FALLBACK = "small-model"
 
-# synthetic/syn:small:text (richiesta utente 2026-10-02): fallback PRIMA su
-# small-model (secondo modello llama-swap, contesto 131072, stessa gate di
-# local-model -> 503 in ~2s col PC spento), poi lo stack standard di
-# synthetic/*. Piccolo->piccolo: e' la coppia di capacita' piu' vicina.
-# syn:small:vision NON usa small-model (text-only: la richiesta 400 li').
+# synthetic/syn:small:text e synthetic/syn:small:vision (richiesta utente
+# 2026-10-04: ALLINEATI): UN SOLO fallback, small-model - niente local-model,
+# niente Ollama locale (rimossa dappertutto). Piccolo->piccolo: small-model e'
+# la capacita' piu' vicina a syn:small:* (contesto 131072, stessa gate di
+# local-model -> 503 in ~2s col PC spento). syn:small:VISION su small-model
+# (text-only su llama-swap) puo' rispondere 400 sull'input vision: scelta
+# esplicita dell'utente, la catena resta questa minima.
 SYN_SMALL_TEXT = "synthetic/syn:small:text"
-SYN_SMALL_TEXT_FALLBACKS = ["small-model", "local-model", "ollama/local-model"]
+SYN_SMALL_VISION = "synthetic/syn:small:vision"
+SYN_SMALL_FALLBACKS = ["small-model"]
 
 # synthetic/hf:nomic-ai/nomic-embed-text-v1.5 (richiesta utente 2026-10-04):
 # modello EMBEDDING su synthetic.new, servito dall'endpoint /v1/embeddings
@@ -153,7 +155,6 @@ CONTEXT_BY_PREFIX = (
     ("local-model", 131072),
     ("small-model", 131072),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
-    ("ollama/", 131072),
     ("synthetic/", 131072),
     ("inference4free/", 131072),
     ("ollama-cloud/", 262144),
@@ -164,7 +165,7 @@ CONTEXT_BY_PREFIX = (
 DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
 MIN_OUTPUT_TOKENS = 1024  # sotto questo una risposta reasoning non e' utile
 SAFETY_MARGIN = 1024      # margine per l'errore della stima
-CHARS_PER_TOKEN = 2.8     # conservativo per llama/ollama (codice, CJK, JSON)
+CHARS_PER_TOKEN = 2.8     # conservativo per llama (codice, CJK, JSON)
 PER_MESSAGE_OVERHEAD = 8  # role/framing per messaggio (ChatML)
 MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 
@@ -302,8 +303,8 @@ class ReasoningClamp(CustomLogger):
         catena di fallback (l'hook del proxy NON viene rieseguito sui target
         di fallback: litellm riusa gli stessi kwargs a ogni hop, quindi il
         tetto scelto qui deve starci dentro ovunque). Nessun clamp se il
-        client non passa un tetto: in quel caso llama-swap/Ollama
-        auto-limitano il completamento."""
+        client non passa un tetto: in quel caso llama-swap
+        auto-limita il completamento."""
         keys = [k for k in MAX_TOKEN_KEYS
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
         if not keys:
@@ -577,15 +578,17 @@ class ReasoningClamp(CustomLogger):
             # risponderebbero 400 (stesso motivo di small-model)
             data["fallbacks"] = []
         elif model == "local-model":
-            # prima il modello Ollama omonimo (PC online: la wildcard
-            # ollama/* esiste solo li'), poi small-model in ultima spiaggia.
-            # PC spento -> le gate 503 in ~2s a gradino
-            data["fallbacks"] = ["ollama/local-model", FINAL_FALLBACK]
-        elif model == SYN_SMALL_TEXT:
-            # richiesta utente 2026-10-02: syn:small:text cade PRIMA su
-            # small-model, poi lo stack standard di synthetic/* (small-model
-            # e' gia' primo della catena: e' anche il suo "ultimo ricorso")
-            data["fallbacks"] = list(SYN_SMALL_TEXT_FALLBACKS)
+            # small-model in ultima spiaggia (Ollama locale rimossa
+            # dappertutto, richiesta utente 2026-10-04)
+            data["fallbacks"] = [FINAL_FALLBACK]
+        elif model in (SYN_SMALL_TEXT, SYN_SMALL_VISION):
+            # richiesta utente 2026-10-04: syn:small:TEXT e syn:small:VISION
+            # ALLINEATI - UN SOLO fallback, small-model (piccolo->piccolo).
+            # syn:small:VISION puo' rispondere 400 su small-model (text-only
+            # su llama-swap): scelta esplicita dell'utente, catena minima.
+            # Ramo esatto PRIMA del ramo generico synthetic/*: la callback
+            # sovrascrive i fallback di OGNI richiesta synthetic/*.
+            data["fallbacks"] = list(SYN_SMALL_FALLBACKS)
         elif model == SYN_EMBED:
             # richiesta utente 2026-10-04: il modello EMBEDDING di synthetic
             # cade su llama-swap "embedding-model" (richiesta embedding ->
@@ -597,18 +600,14 @@ class ReasoningClamp(CustomLogger):
             # catena embedding.
             data["fallbacks"] = list(SYN_EMBED_FALLBACKS)
         elif model.startswith("synthetic/"):
-            # catena fallback (richiesta utente): local-model PRIMO,
-            # poi il modello Ollama locale omonimo "ollama/local-model"
-            # (dinamico via wildcard ollama/*, presente solo quando il PC
-            # Windows e' online: se spento la ollama-gate risponde 503 in
-            # ~2s), infine small-model come ultimo ricorso.
-            # ECCEZIONI: syn:small:text e l'embedding nomic, gestiti dai
-            # rami esatti qui sopra
-            data["fallbacks"] = ["local-model", "ollama/local-model",
-                                 FINAL_FALLBACK]
+            # catena fallback (richiesta utente): local-model PRIMO, poi
+            # small-model come ultimo ricorso.
+            # ECCEZIONI: syn:small:text, syn:small:vision e l'embedding
+            # nomic, gestiti dai rami esatti qui sopra
+            data["fallbacks"] = ["local-model", FINAL_FALLBACK]
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
-            # openrouter/free, ollama/*, ollama-cloud/*, inference4free/* e
+            # openrouter/free, ollama-cloud/*, inference4free/* e
             # qualunque prefisso futuro): nessun gradino intermedio,
             # small-model e' l'ultimo ricorso diretto (richiesta utente
             # 2026-10-02). La catch-all "*": ["small-model"] in config.yaml

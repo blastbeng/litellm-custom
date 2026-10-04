@@ -10,7 +10,7 @@ services:
       # through llmtrim (HTTPS MITM on host) so fallbacks get tracked/compressed.
       # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
       HTTPS_PROXY: http://host.docker.internal:43117
-      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw"
+      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate"
       # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync,
       # pubblicato in trust/ - vedi volume qui sotto: directory, non file)
       SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
@@ -49,7 +49,6 @@ services:
       - groq-gw
       - gemini-gw
       - inference4free-gw
-      - ollama-gw
     restart: no
     healthcheck:
       test:
@@ -85,6 +84,25 @@ services:
       - ./openrouter-gw/gw.py:/app/gw.py:ro
       - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
+    # Healthcheck a livello TCP: il gateway e' "vivo" quando il suo server
+    # HTTP ascolta. NON si fa una richiesta HTTP sul listing perche'
+    # dipenderebbe da proxy + upstream + auth (flapping: il provider puo'
+    # essere down/senza chiavi mentre il gateway e' perfetto).
+    # python:3.13-slim non ha curl, quindi socket in python (stessa
+    # meccanica dell'healthcheck di litellm). start_period lungo: il
+    # comando fa "pip install httpx" prima di avviare gw.py.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # Gateway listing per Groq (vedi provider-gw/gw.py, stessa meccanica di
   # openrouter-gw): riscrive /v1/* -> /openai/v1/* (litellm chiama sempre
@@ -108,6 +126,21 @@ services:
       - ./provider-gw/gw.py:/app/gw.py:ro
       - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
+    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
+    # l'upstream groq.com no - un check HTTP sul listing dipenderebbe da
+    # proxy + upstream + auth. start_period: "pip install httpx" prima di gw.py.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # Gateway listing per Gemini (provider-gw/gw.py): riscrive /v1/* ->
   # /v1beta/openai/* (l'endpoint OpenAI-compatible di Gemini vive li', ma
@@ -129,6 +162,22 @@ services:
       - ./provider-gw/gw.py:/app/gw.py:ro
       - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
+    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
+    # l'upstream generativelanguage no - un check HTTP sul listing dipenderebbe
+    # da proxy + upstream + auth. start_period: "pip install httpx" prima di
+    # gw.py.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # Gateway per inference4free (provider-gw/gw.py). ID_PREFIX=inference4free/
   # per il listing: il rename di litellm corromperebbe gli id nativi tipo
@@ -163,6 +212,22 @@ services:
       - ./provider-gw/cache:/cache
       - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
+    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria;
+    # deepseek4free e' instabile di proposito e la cache last-good serve
+    # proprio a questo - un check HTTP sull'upstream marcarebbe "unhealthy"
+    # un gateway che sta servendo bene. start_period: "pip install httpx".
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # Gate TCP verso llama-swap (blastpc) - vedi llama-gate/gate.py:
   # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
@@ -184,54 +249,20 @@ services:
     volumes:
       - ./llama-gate/gate.py:/app/gate.py:ro
     restart: no
-
-  # Stessa gate di llama-gate (stesso gate.py, env-driven) ma verso Ollama
-  # (OpenAI-compatible su :11434, stessa macchina blastpc): PC spento ->
-  # 503 in ~2s e litellm prosegue la catena di fallback; PC acceso ->
-  # tubo trasparente con timeout lungo.
-  ollama-gate:
-    container_name: ollama-gate
-    image: python:3.13-slim
-    command: ["python", "/app/gate.py"]
-    environment:
-      GATE_UP_HOST: blastpc
-      GATE_UP_PORT: "11434"
-    extra_hosts:
-      - "blastpc:192.168.1.29"
-    volumes:
-      - ./llama-gate/gate.py:/app/gate.py:ro
-    restart: no
-
-  # Gateway listing per Ollama (provider-gw/gw.py): nessuna riscrittura path
-  # (l'endpoint OpenAI-compatible vive gia' su /v1, come deepseek4free).
-  # ID_PREFIX=ollama/: litellm corromperebbe gli id nativi che iniziano con
-  # nomi provider noti (es. "deepseek-r1:14b" -> "deepseek/..."); con il
-  # prefisso la wildcard ollama/* li cattura e li instrada 1:1. Nessun
-  # MODELS_CACHE su richiesta: i modelli devono apparire SOLO quando il PC
-  # Windows e' online (listing dinamico reale).
-  ollama-gw:
-    container_name: ollama-gw
-    image: python:3.13-slim
-    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
-    environment:
-      # upstream = ollama-gate (tubo TCP trasparente verso blastpc:11434)
-      UPSTREAM: http://ollama-gate
-      ID_PREFIX: ollama/
-      # Ollama lista i modelli senza tag esplicito come "x:latest": strip
-      # del suffisso -> nome pubblico "ollama/x" (il fallback di synthetic/*
-      # in reasoning_clamp punta a "ollama/local-model", non ":latest")
-      STRIP_LATEST: "1"
-      # gw.py ha GW_CA obbligatoria (default /data/ca-bundle.pem): qui la
-      # punta al bundle dentro il mount di directory (vedi sotto)
-      GW_CA: /data/llmtrim/ca-bundle.pem
-    volumes:
-      - ./provider-gw/gw.py:/app/gw.py:ro
-      # gw.py setta SEMPRE verify=GW_CA: il bundle va montato anche se
-      # l'upstream e' plain-HTTP (non usato, ma senza il file httpx crasha
-      # all'avvio). Montaggio per DIRECTORY: un CA-rotation del bundle e'
-      # visibile subito (un bind-mount di singolo file resta pinned al vecchio
-      # inode finche' il container non e' ricreato).
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
-    depends_on:
-      - ollama-gate
-    restart: no
+    # Healthcheck TCP sulla porta di ascolto della gate: misura LA GATE, non
+    # il PC. Con il PC spento la gate e' sana per definizione (accetta e
+    # risponde 503 in ~2s), quindi il check resta verde: marcare unhealthy
+    # il PC spento sarebbe un falso allarme e, con --abort-on-container-exit,
+    # un check che fa morire il container sarebbe un guasto inventato.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

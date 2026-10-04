@@ -55,8 +55,9 @@ model_list:
 
   # --- Secondo modello locale (PC 192.168.1.29, llama-swap): modello autonomo,
   # invocabile direttamente; e' l'ULTIMO ricorso di fallback di TUTTI i
-  # modelli (richiesta utente 2026-10-02, vedi reasoning_clamp) e il PRIMO
-  # target di synthetic/syn:small:text. Non cade mai su se stesso.
+  # modelli (richiesta utente 2026-10-02, vedi reasoning_clamp) e l'UNICO
+  # target di synthetic/syn:small:text e synthetic/syn:small:vision
+  # (richiesta utente 2026-10-04: ALLINEATI). Non cade mai su se stesso.
   # Stessa gate di local-model.
   - model_name: small-model
     litellm_params:
@@ -91,26 +92,6 @@ model_list:
       # contesto dichiarato da llama-swap per l'embedding model
       max_input_tokens: 16384
 
-  # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
-  # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
-  # docker-compose.yml. model_info unico per la wildcard (si applica a tutti
-  # i modelli ollama/*). fallback finale per ollama/*: small-model (policy
-  # 2026-10-02, vedi fallbacks in litellm_settings).
-  # synthetic/* fa fallback a ollama/local-model (2o dopo local-model,
-  # il gruppo esiste solo quando il PC e' online).
-  - model_name: ollama/*
-    litellm_params:
-      model: openai/*
-      api_base: http://ollama-gw/v1
-      api_key: dummy
-      timeout: 1800
-    model_info:
-      # contesto dei modelli Ollama attuali (local-model ora 131072);
-      # si applica a TUTTI i modelli ollama/* (wildcard unica) - aggiornare
-      # se contesti diversi
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      max_tokens: 32768
 
   # --- Modelli synthetic.new: importati in automatico ---
   # Wildcard unica "synthetic/*" per runtime + listing. Il capture rimuove
@@ -125,7 +106,7 @@ model_list:
       # 32768 (era 131072): i litellm_params default vengono uniti da litellm
       # a OGNI tentativo, fallback inclusi, DOPO l'hook (che non li vede):
       # prompt + default deve stare nel contesto di OGNI target della catena
-      # (local-model, ollama/local-model, small-model - tutti 131072)
+      # (local-model, small-model - tutti 131072)
       max_tokens: 32768
       # reasoning di default per OGNI richiesta su questa wildcard
       # (sovrascrivibile dal client): synthetic supporta
@@ -193,8 +174,9 @@ model_list:
       max_tokens: 262144
 
   # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
-  # Nome pubblico "ollama-cloud/<model>" per NON collidere col provider
-  # nativo "ollama/" di litellm.
+  # Nome pubblico "ollama-cloud/<model>": il prefisso "-cloud" marca che sono
+  # i modelli di ollama.com (cloud), NON locali - l'Ollama locale e' stata
+  # rimossa il 2026-10-04, il prefisso resta per chiarezza.
   - model_name: ollama-cloud/*
     litellm_params:
       model: openai/*
@@ -247,23 +229,23 @@ litellm_settings:
   # di TUTTI i modelli, raggiunto SOLO dopo che tutti gli altri fallback sono
   # miseramente falliti. Catene per-modello (via callback reasoning_clamp,
   # wildcard-safe):
-  # - synthetic/*  -> local-model -> ollama/local-model -> small-model
-  #   (il gruppo ollama/* esiste solo col PC online)
-  # - synthetic/syn:small:text -> small-model -> local-model ->
-  #   ollama/local-model (piccolo->piccolo: small-model e' gia' il primo
-  #   della sua catena, per lui non c'e' un "ultimo" dopo tutti gli altri.
-  #   syn:small:VISION resta sul chain standard: small-model e' text-only
-  #   su llama-swap, una vision richiesta 400 li')
+  # (Ollama LOCALE rimossa il 2026-10-04: niente ollama/*, ollama-gate,
+  #  ollama-gw - resta ollama-cloud/*, che e' ollama.com)
+  # - synthetic/*  -> local-model -> small-model
+  # - synthetic/syn:small:text e synthetic/syn:small:vision -> small-model
+  #   (richiesta utente 2026-10-04: ALLINEATI, UN SOLO fallback,
+  #   piccolo->piccolo. syn:small:VISION su small-model (text-only su
+  #   llama-swap) puo' rispondere 400 sull'input vision: scelta esplicita)
   # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
   #   (embeddings: quando synthetic non e' disponibile la richiesta cade sul
   #   modello embedding di llama-swap; vedi reasoning_clamp)
-  # - local-model -> ollama/local-model -> small-model
+  # - local-model -> small-model
   # - small-model -> NESSUN fallback (e' lui l'ultimo ricorso di tutti gli
   #   altri; riprovarlo da solo non avrebbe senso)
   # - embedding-model -> NESSUN fallback (unico modello embedding della
   #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama/*, ollama-cloud/*, inference4free/*) -> small-model direttamente
+  #   ollama-cloud/*, inference4free/*) -> small-model direttamente
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via

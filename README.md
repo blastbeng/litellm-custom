@@ -31,8 +31,6 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 |---|---|---|
 | `litellm` | `config/config.yaml` | LiteLLM proxy/router (port 4000) |
 | `llama-gate` | `llama-gate/gate.py` | TCP gate to llama-swap — `GATE_TLS=auto`: tries TLS, falls back to plain HTTP on `WRONG_VERSION_NUMBER` (llama-swap runs **plain HTTP** since 2026-10-02, previously `https` self-signed with gate-side TLS termination; litellm always stays plain HTTP; PC off → 503 in ~2s) |
-| `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama OpenAI-compat API (`blastpc:11434`) |
-| `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama listing with `ID_PREFIX=ollama/`, no cache (models visible only while the PC is online) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
 | `groq-gw`, `gemini-gw`, `inference4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
@@ -85,33 +83,31 @@ litellm even when the endpoint is down.
 2026-10-02): it is reached **only after every other fallback in the chain
 has failed**.
 
+**Local Ollama was removed on 2026-10-04** (`ollama/*`, `ollama-gate`,
+`ollama-gw`): the only local stack left is llama-swap behind `llama-gate`.
+**`ollama-cloud/*` (ollama.com) is untouched** — it is a cloud provider.
+
 - **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
-  then **`ollama/local-model`** (the Ollama model with the same name on
-  the Windows PC), then **`small-model`**. The `ollama/local-model`
-  group exists only while the Windows PC is online (dynamic listing via
-  `ollama-gw` + TCP gate): when the PC is off the gate 503s in ~2s.
-- **`synthetic/syn:small:text`** → **`small-model`** first, then
-  **`local-model`** → **`ollama/local-model`** (capacity-matched: small →
-  small; `small-model` heads its own chain, so there is no "final" target
-  left after the others for it).
-  `synthetic/syn:small:vision` keeps the standard `synthetic/*`
-  chain: `small-model` is text-only on llama-swap, so a vision request
-  would 400 on it.
+  then **`small-model`** as the final resort.
+- **`synthetic/syn:small:text`** and **`synthetic/syn:small:vision`** →
+  **`small-model`** only (user request 2026-10-04: **aligned**, a single
+  fallback, capacity-matched small → small).
+  `small-model` is text-only on llama-swap, so a vision request may 400 on
+  it: that is the explicit choice behind aligning both to one target.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
   **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
   16384, same `llama-gate` as the other local models). Single target: the
   other llama-swap models are chat models and would 400 on an embeddings
   request, so there is no further step.
-- **`local-model`** itself (requested directly) →
-  **`ollama/local-model`** → **`small-model`**.
+- **`local-model`** itself (requested directly) → **`small-model`**.
 - **`small-model`** → no fallback at all: it is the last resort of
   everyone else, retrying it alone would make no sense.
 - **`embedding-model`** (requested directly) → no fallback: it is the only
   embedding-capable model in the chain, any other target would 400 on an
   embeddings request.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
-  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
+  `openrouter/free`, `ollama-cloud/*`, `inference4free/*`,
   and any future prefix) → **`small-model`** directly.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
@@ -143,8 +139,7 @@ counts the prompt with the **real tokenizer** and answers **400** —
 never truncated` — and litellm wraps that 400 as `BadRequestError`. With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model` → `ollama/local-model` → `small-model`,
-all 131072).
+(`synthetic/*` → `local-model` → `small-model`, all 131072).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
 `max_completion_tokens`) to `context − prompt`, and — when the request
@@ -165,7 +160,7 @@ is useless — there is no room left for the answer — and the
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (131072 for
-`local-model`, `small-model`, `ollama/*`, `synthetic/*`, `inference4free/*`;
+`local-model`, `small-model`, `synthetic/*`, `inference4free/*`;
 16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`, `gemini/*`,
 `ollama-cloud/*`).
 
