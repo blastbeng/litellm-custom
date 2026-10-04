@@ -72,6 +72,25 @@ model_list:
       max_output_tokens: 32768
       max_tokens: 32768
 
+  # --- Modello embedding locale (PC 192.168.1.29, llama-swap) ---
+  # Invocabile direttamente; e' il FALLBACK di
+  # synthetic/hf:nomic-ai/nomic-embed-text-v1.5 (richiesta utente 2026-10-04,
+  # vedi reasoning_clamp): il modello embedding e' servito dall'endpoint
+  # /v1/embeddings di synthetic.new (non compare nel listing chat) e quando
+  # non disponibile la richiesta cade qui (llama-swap: Qwen3-Embedding-0.6b
+  # su CPU, contesto 16384 dichiarato da llama-server). Stessa gate di
+  # local-model/small-model: PC spento = 503 in ~2s.
+  - model_name: embedding-model
+    litellm_params:
+      model: openai/embedding-model
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      id: local-embedding-backend
+      # contesto dichiarato da llama-swap per l'embedding model
+      max_input_tokens: 16384
+
   # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
   # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
   # docker-compose.yml. model_info unico per la wildcard (si applica a tutti
@@ -235,9 +254,14 @@ litellm_settings:
   #   della sua catena, per lui non c'e' un "ultimo" dopo tutti gli altri.
   #   syn:small:VISION resta sul chain standard: small-model e' text-only
   #   su llama-swap, una vision richiesta 400 li')
+  # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
+  #   (embeddings: quando synthetic non e' disponibile la richiesta cade sul
+  #   modello embedding di llama-swap; vedi reasoning_clamp)
   # - local-model -> ollama/local-model -> small-model
   # - small-model -> NESSUN fallback (e' lui l'ultimo ricorso di tutti gli
   #   altri; riprovarlo da solo non avrebbe senso)
+  # - embedding-model -> NESSUN fallback (unico modello embedding della
+  #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
   #   ollama/*, ollama-cloud/*, inference4free/*) -> small-model direttamente
   # Le chiavi dei fallback in litellm NON supportano wildcard

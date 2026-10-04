@@ -97,10 +97,19 @@ has failed**.
   `synthetic/syn:small:vision` keeps the standard `synthetic/*`
   chain: `small-model` is text-only on llama-swap, so a vision request
   would 400 on it.
+- **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
+  synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
+  **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
+  16384, same `llama-gate` as the other local models). Single target: the
+  other llama-swap models are chat models and would 400 on an embeddings
+  request, so there is no further step.
 - **`local-model`** itself (requested directly) →
   **`ollama/local-model`** → **`small-model`**.
 - **`small-model`** → no fallback at all: it is the last resort of
   everyone else, retrying it alone would make no sense.
+- **`embedding-model`** (requested directly) → no fallback: it is the only
+  embedding-capable model in the chain, any other target would 400 on an
+  embeddings request.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
   `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
   and any future prefix) → **`small-model`** directly.
@@ -157,7 +166,8 @@ is useless — there is no room left for the answer — and the
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (131072 for
 `local-model`, `small-model`, `ollama/*`, `synthetic/*`, `inference4free/*`;
-262144 for `openrouter/*`, `groq/*`, `gemini/*`, `ollama-cloud/*`).
+16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`, `gemini/*`,
+`ollama-cloud/*`).
 
 ## Context overflow cascade (`B → C → E → 413`)
 

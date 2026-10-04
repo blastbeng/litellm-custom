@@ -38,10 +38,18 @@ self.fallbacks)):
   in coda e' inutile - litellm skippa i target gia' tentati.
   syn:small:VISION resta sul chain standard: small-model e' text-only su
   llama-swap, quindi una richiesta vision 400 sul target)
+- synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> ["embedding-model"]
+  (richiesta utente 2026-10-04: modello EMBEDDING su synthetic.new, endpoint
+  /v1/embeddings; quando non disponibile cade sul modello omonimo di
+  llama-swap, Qwen3-Embedding-0.6b. UN solo target: gli altri modelli
+  llama-swap sono CHAT e su una richiesta embedding risponderebbero 400)
 - local-model       -> ["ollama/local-model", "small-model"] (prima il
   modello Ollama omonimo, poi small-model come ultima spiaggia)
 - small-model       -> [] (nessun auto-fallback: e' lui l'ultimo ricorso
   di tutti gli altri, riprovarlo da solo non avrebbe senso)
+- embedding-model   -> [] (nessun auto-fallback: e' l'unico modello
+  embedding del fallback chain, un target CHAT su una richiesta embedding
+  risponderebbe 400 - stesso motivo di small-model)
 - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
   ollama/*, ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
   -> ["small-model"]: nessun gradino intermedio, small-model e' l'ultimo
@@ -126,6 +134,16 @@ FINAL_FALLBACK = "small-model"
 SYN_SMALL_TEXT = "synthetic/syn:small:text"
 SYN_SMALL_TEXT_FALLBACKS = ["small-model", "local-model", "ollama/local-model"]
 
+# synthetic/hf:nomic-ai/nomic-embed-text-v1.5 (richiesta utente 2026-10-04):
+# modello EMBEDDING su synthetic.new, servito dall'endpoint /v1/embeddings
+# ("api.synthetic.new/openai/v1/embeddings", non compare nel listing chat
+# di synthetic). Quando non disponibile cade su llama-swap: "embedding-model"
+# (Qwen3-Embedding-0.6b su CPU, contesto 16384). Catena a UN solo target:
+# gli altri modelli llama-swap sono CHAT e su una richiesta embedding
+# risponderebbero 400 - nessun gradino dopo.
+SYN_EMBED = "synthetic/hf:nomic-ai/nomic-embed-text-v1.5"
+SYN_EMBED_FALLBACKS = ["embedding-model"]
+
 # --- contesti (model_info.max_input_tokens di config.yaml) ---
 # Serve la mappa QUI perche' i modelli sono wildcard/custom:
 # litellm.get_max_tokens("local-model") fallisce ("isn't mapped yet") e il
@@ -134,6 +152,7 @@ SYN_SMALL_TEXT_FALLBACKS = ["small-model", "local-model", "ollama/local-model"]
 CONTEXT_BY_PREFIX = (
     ("local-model", 131072),
     ("small-model", 131072),
+    ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     ("ollama/", 131072),
     ("synthetic/", 131072),
     ("inference4free/", 131072),
@@ -552,6 +571,11 @@ class ReasoningClamp(CustomLogger):
             # niente auto-fallback: e' lui l'ultimo ricorso di tutti gli
             # altri; litellm skipperebbe comunque un target gia' tentato
             data["fallbacks"] = []
+        elif model == "embedding-model":
+            # niente auto-fallback: l'unico modello che potrebbe servire una
+            # richiesta embedding e' lui stesso, gli altri target (CHAT)
+            # risponderebbero 400 (stesso motivo di small-model)
+            data["fallbacks"] = []
         elif model == "local-model":
             # prima il modello Ollama omonimo (PC online: la wildcard
             # ollama/* esiste solo li'), poi small-model in ultima spiaggia.
@@ -562,13 +586,24 @@ class ReasoningClamp(CustomLogger):
             # small-model, poi lo stack standard di synthetic/* (small-model
             # e' gia' primo della catena: e' anche il suo "ultimo ricorso")
             data["fallbacks"] = list(SYN_SMALL_TEXT_FALLBACKS)
+        elif model == SYN_EMBED:
+            # richiesta utente 2026-10-04: il modello EMBEDDING di synthetic
+            # cade su llama-swap "embedding-model" (richiesta embedding ->
+            # /v1/embeddings; i modelli CHAT di llama-swap risponderebbero
+            # 400 su input embedding, quindi nessun altro gradino).
+            # Ramo esatto PRIMA del ramo generico synthetic/* (come
+            # syn:small:text): la callback sovrascrive i fallback di OGNI
+            # richiesta synthetic/*, un ramo generico renderebbe morta la
+            # catena embedding.
+            data["fallbacks"] = list(SYN_EMBED_FALLBACKS)
         elif model.startswith("synthetic/"):
             # catena fallback (richiesta utente): local-model PRIMO,
             # poi il modello Ollama locale omonimo "ollama/local-model"
             # (dinamico via wildcard ollama/*, presente solo quando il PC
             # Windows e' online: se spento la ollama-gate risponde 503 in
             # ~2s), infine small-model come ultimo ricorso.
-            # ECCEZIONE: syn:small:text, gestita dal ramo esatto qui sopra
+            # ECCEZIONI: syn:small:text e l'embedding nomic, gestiti dai
+            # rami esatti qui sopra
             data["fallbacks"] = ["local-model", "ollama/local-model",
                                  FINAL_FALLBACK]
         else:
