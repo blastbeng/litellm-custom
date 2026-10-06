@@ -142,8 +142,11 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 import asyncio
 import hashlib
 import json
+import os
 import re
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -359,6 +362,119 @@ WILDCARD_LIST_TIMEOUT_S = 8
 WILDCARD_CACHE_TTL_S = 600
 WILDCARD_MAX_MODELS = 40       # tetto per-pattern (listing da centinaia)
 _WILDCARD_CACHE = {}           # "groq/*" -> (monotonic, [nomi concreti])
+
+# ------------- INTERROGAZIONE DINAMICA del listing /v1/models -------------
+# Richiesta utente 2026-10-06: "Have you correctly interrogated litellm
+# models list (http://...:4000/v1/models)? adapt the code to our model
+# list DINAMICALLY. that interrogation must be DINAMIC".
+# Fino ad oggi NO: il pool leggeva solo llm_router.model_list (+ i listing
+# dei gateway per espandere i wildcard). ORA il listing del PROXY STESSO
+# (/v1/models, la stessa fonte interrogata da fuori su 192.168.1.13:4000)
+# viene interrogato e usato per: (a) l'universo dei modelli del pool di
+# operari, (b) i contesti REALI (max_input_tokens/max_output_tokens) al
+# posto delle stime statiche. DINAMICO: un thread daemon di fondo rilegge
+# il listing ogni PROXY_MODELS_TTL_S -> un modello aggiunto/tolto in
+# config.yaml (o via /model/new) viene visto senza toccare il codice ne'
+# riavviare il proxy. Il tier di costo resta deciso da _model_tier (prezzi
+# sui listing dei GATEWAY: /v1/models non espone prezzi, verificato).
+# DEADLOCK: una GET bloccante a se stessi DENTRO l'event loop del proxy
+# blocca tutto (il loop serve proprio quella richiesta) -> la fetch gira
+# SOLO nel thread daemon di fondo; chi legge (event loop o thread C) usa
+# solo la cache gia' pronta. Listing non ancora pronto -> si usa solo
+# model_list: comportamento identico a ieri, mai un blocco.
+PROXY_MODELS_URL = os.environ.get(
+    "REASONING_CLAMP_MODELS_URL", "http://127.0.0.1:4000/v1/models")
+PROXY_MODELS_TIMEOUT_S = 5
+PROXY_MODELS_TTL_S = 600
+_PROXY_MODELS_CACHE = {"ts": 0.0, "models": {}}  # id -> (max_in|None, max_out|None)
+_PROXY_MODELS_LOCK = threading.Lock()
+_PROXY_MODELS_STARTED = [False]
+
+
+def _fetch_proxy_models():
+    """GET PROXY_MODELS_URL (BLOCCANTE: chiamare SOLO dal thread daemon).
+    Ritorna {id: (max_input_tokens, max_output_tokens)} con None sui campi
+    assenti; {} su qualsiasi errore (chi legge resta sull'ultima lista).
+    Auth: master_key gia' caricato nel processo proxy (il listing e' 401
+    senza) - MAI loggata; 401 -> riprova senza header. Bypass SEMPRE dei
+    proxy env: HTTPS_PROXY=llmtrim non deve intercettare 127.0.0.1."""
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(PROXY_MODELS_URL)
+        try:
+            from litellm.proxy import proxy_server
+            mk = getattr(proxy_server, "master_key", None)
+            if mk:
+                req.add_header("Authorization", "Bearer " + str(mk))
+        except Exception:
+            pass
+        try:
+            with opener.open(req, timeout=PROXY_MODELS_TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            # master_key non (ancora) caricato: il listing locale senza auth
+            req = urllib.request.Request(PROXY_MODELS_URL)
+            with opener.open(req, timeout=PROXY_MODELS_TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+
+        def _int(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        models = {}
+        for m in (data.get("data") or []):
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "").strip()
+            if not mid:
+                continue
+            models[mid] = (_int(m.get("max_input_tokens")),
+                           _int(m.get("max_output_tokens")))
+        return models
+    except Exception:
+        return {}
+
+
+def _refresher_proxy_models():
+    """Thread daemon: rilegge /v1/models ogni PROXY_MODELS_TTL_S (dinamico:
+    config.yaml cambiata o /model/new vengono visti senza riavviare)."""
+    fails = 0
+    while True:
+        got = _fetch_proxy_models()
+        with _PROXY_MODELS_LOCK:
+            if got:
+                if fails or not _PROXY_MODELS_CACHE["models"]:
+                    print(f"[reasoning_clamp] listing /v1/models: "
+                          f"{len(got)} modelli (contesti reali; i PREZZI/"
+                          f"tier restano sui listing dei gateway)", flush=True)
+                _PROXY_MODELS_CACHE["models"] = got
+                _PROXY_MODELS_CACHE["ts"] = time.monotonic()
+                fails = 0
+            else:
+                fails += 1
+                if fails == 1 or fails % 10 == 0:
+                    print(f"[reasoning_clamp] /v1/models non disponibile "
+                          f"(tentativo {fails}); tengo l'ultima lista",
+                          flush=True)
+        # primo aggancio mancato (proxy in avvio): ritento presto, non tra 10'
+        time.sleep(PROXY_MODELS_TTL_S
+                   if (got or _PROXY_MODELS_CACHE["models"]) else 30)
+
+
+def _ensure_proxy_models_refresher():
+    """Avvia lazy il thread daemon (una sola volta per processo)."""
+    if _PROXY_MODELS_STARTED[0]:
+        return
+    with _PROXY_MODELS_LOCK:
+        if _PROXY_MODELS_STARTED[0]:
+            return
+        _PROXY_MODELS_STARTED[0] = True
+    threading.Thread(target=_refresher_proxy_models, daemon=True,
+                     name="reasoning-clamp-models").start()
 
 
 def _fetch_pattern_models(name):
@@ -951,7 +1067,12 @@ class ReasoningClamp(CustomLogger):
         chiamare acompletion col nome letterale "groq/*" manderebbe
         model="*" all'upstream -> 400/404 garantiti (visto in produzione).
         Se il listing non risponde resta il nome wildcard: i gateway
-        tolleranti (inference4free, synthetic) lo accettano comunque."""
+        tolleranti (inference4free, synthetic) lo accettano comunque.
+        L'INTERROGAZIONE DINAMICA di /v1/models (thread daemon, cache) unisce
+        al pool i modelli presenti nel listing ma non in model_list e usa i
+        contesti REALI (max_input_tokens/max_output_tokens) invece della
+        stima statica: aggiungere/togliere un modello da litellm viene visto
+        senza toccare il codice (richiesta utente 2026-10-06)."""
         names = []
         try:
             from litellm.proxy.proxy_server import llm_router
@@ -964,6 +1085,17 @@ class ReasoningClamp(CustomLogger):
             names = []
         names = _expand_wildcards(names)
 
+        # listing dinamico /v1/models (cache del thread daemon): gli id non
+        # in model_list entrano nel pool; i contesti reali sostituiscono la
+        # stima. Listing non ancora pronto -> dyn vuoto: solo model_list.
+        _ensure_proxy_models_refresher()
+        dyn = {}
+        with _PROXY_MODELS_LOCK:
+            dyn.update(_PROXY_MODELS_CACHE["models"])
+        for mid in dyn:
+            if mid not in names:
+                names.append(mid)
+
         def rank(n):
             for i, p in enumerate(preferred):
                 if n == p or n.startswith(p):
@@ -971,12 +1103,33 @@ class ReasoningClamp(CustomLogger):
             return len(preferred)
 
         budget = needed_tokens + output_tokens + self._margin(needed_tokens)
+
+        def fits(n):
+            # non-chat esclusi ANCHE se arrivano solo dal listing
+            if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
+                return False
+            static = self._context_for(n)
+            mit, mot = dyn.get(n, (None, None))
+            # finestra: mit+mot quando il listing li da' entrambi; con solo
+            # mit: mit e' per definizione <= finestra reale, quindi
+            # max(static, mit) non e' MAI peggiore della stima statica
+            window = (mit + mot) if (mit is not None and mot) else (
+                static if mit is None else max(static, mit))
+            if window < budget:
+                return False
+            # il PROMPT deve stare nel cap di INPUT reale (mit): e' la regola
+            # con cui l'upstream rifiuta; il margine (>= output) copre la
+            # risposta nella finestra
+            if mit is not None and needed_tokens + self._margin(
+                    needed_tokens) > mit:
+                return False
+            return True
+
         # tier di costo PRIMARIO, preferenza del livello secondaria: il pool
         # e' gratis -> economico -> costoso a prescindere dalle liste preferred
         return [n for n in sorted(
                     names, key=lambda n: (_model_tier(n), rank(n)))
-                if not any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS)
-                and self._context_for(n) >= budget]
+                if fits(n)]
 
     async def _summarize_chunks(self, chunks, origin, model):
         """Riassume i chunk con FAILOVER sull'INTERO pool dinamico entro il
