@@ -124,7 +124,9 @@ del router: wildcard inclusi, es. inference4free/*), ordina per preferenza
 non-chat (embedding/whisper/guard/rerank: risponderebbero 400) e quelli il
 cui contesto non contiene il chunk. Failover per-chunk: il primo operario
 che riesce resta "appiccicoso" per i chunk successivi, ogni fallimento/
-risposta vuota avanza al successivo (max MAX_WORKERS_TRIED operari provati).
+risposta vuota avanza al successivo, finche' non si esaurisce il budget di
+tempo WORKER_TIME_BUDGET_S (niente piu' tetto fisso di operari: si prova
+TUTTO il pool, richiesta utente 2026-10-06).
 
 La cascata gira SOLO nell'async hook (B, T ed E fanno chiamate LLM); il
 pre_call_hook sync applica solo policy/clamp, senza rete. Le chiamate
@@ -264,7 +266,17 @@ SUMMARIZER_PREFERRED = (
 # non-chat: a una richiesta di riassunto questi modelli risponderebbero
 # 400 (embedding/whisper/guard/rerank non sono completations testuali)
 NON_CHAT_WORKER_SUBSTRINGS = ("embed", "whisper", "guard", "rerank")
-MAX_WORKERS_TRIED = 4          # operari distinti provati prima di arrendersi
+# BUDGET DI TEMPO (richiesta utente 2026-10-06: "provare TUTTI i modelli
+# possibili con un limite di tempo, cosi' lo user non aspetta troppo; errore
+# o livello successivo SOLO quando proprio non riusciamo a fare nulla"): non
+# esiste piu' un tetto fisso di operari - ogni livello che chiama LLM prova
+# l'intero pool (gratis -> economici -> costosi) finche' c'e' budget. I
+# fallimenti rapidi (connessione rifiutata, 400) consumano pochi secondi; il
+# budget taglia solo i worker APPESI. B senza sintesi e T/E con ALMENO un
+# chunk riassunto non buttano il lavoro fatto: si tengono i parziali.
+WORKER_TIME_BUDGET_S = 420     # secondi TOTALI per livello di cascata
+CHEAP_PRICE_USD_PER_TOKEN = 5e-7  # soglia "economico" dal listing (~$0.50/M
+                               # di prompt): sotto = TIER_CHEAP, sopra = paid
 
 # TIER DI COSTO per l'ordine del pool (richiesta utente 2026-10-06: prima i
 # GRATIS, poi gli ECONOMICI, per ultimi i costosi). Classificazione DINAMICA:
@@ -273,30 +285,47 @@ MAX_WORKERS_TRIED = 4          # operari distinti provati prima di arrendersi
 # c'e' (hint), dalla convenzione ':free' e dal brand del provider, e dal nome
 # per gli economici noti. _worker_pool ordina per (tier, preferenza): le
 # liste preferred di B e T/E decidono solo l'ordine DENTRO ogni tier.
-TIER_FREE = 0    # inference4free/*, openrouter/free, id ":free", listing a
-                 # prezzo zero, modelli locali (propria hardware = costo zero)
-TIER_CHEAP = 1   # gpt-oss, flash-lite, gemma, syn:small:text, qwen, mini...
-TIER_PAID = 2    # tutto il resto (gemini-flash, deepseek, claude, gpt-5...)
+TIER_FREE = 0    # gratis: provider con "free" nel brand (inference4free/*),
+                 # openrouter/free, id ":free", listing a prezzo zero,
+                 # ollama-cloud (quota gratuita), hardware locale
+TIER_CHEAP = 1   # economici: gpt-oss, flash/flash-lite, gemma, qwen, llama,
+                 # deepseek, haiku, glm, kimi, small/mini/nano, phi...
+TIER_PAID = 2    # tutto il resto (gemini-pro, claude sonnet/opus, gpt-5...)
 # NB "-mini" col trattino: "gemini" CONTIENE "mini" e classificherebbe
 # tutti i Gemini come economici
-CHEAP_PATTERNS = ("gpt-oss", "flash-lite", "gemma", "syn:small",
-                  "qwen", "nano", "-mini")
-_TIER_HINTS = {}  # id dal listing -> TIER_FREE, scritto da
-                  # _fetch_pattern_models quando il listing dichiara prezzo 0
+CHEAP_PATTERNS = (
+    "gpt-oss", "flash-lite", "flash", "lite", "gemma", "syn:small", "small",
+    "qwen", "qwq", "nano", "-mini", "haiku", "deepseek", "glm", "kimi",
+    "moonshot", "llama", "mistral-small", "ministral", "pixtral", "minimax",
+    "phi-", "phi3", "phi4", "nemotron", "falcon", "tiny",
+    "grok-3-mini", "grok-4-fast",
+)
+_TIER_HINTS = {}  # id dal listing -> prezzo USD/token del PROMPT (scritto da
+                  # _fetch_pattern_models): 0 = gratis, sotto la soglia
+                  # CHEAP_PRICE_USD_PER_TOKEN = economico, sopra = costoso
 
 
 def _model_tier(n):
     """Tier di costo di un modello: 0 gratis, 1 economico, 2 costoso.
-    Segnali in ordine: hint di prezzo dal listing del gateway (dinamico,
-    copre i modelli nuovi gratis), convenzione ':free' di OpenRouter,
-    brand del provider (inference4free), hardware locale, pattern di nome
-    per gli economici noti. Tutto il resto finisce nel tier costoso."""
+    Segnali in ordine: PREZZO dal listing del gateway (dinamico: 0 = gratis,
+    sotto CHEAP_PRICE_USD_PER_TOKEN = economico, sopra = costoso - un modello
+    nuovo listato dal provider viene classificato senza toccare il codice),
+    convenzione ':free' di OpenRouter, brand del provider ("free" nel nome,
+    ollama-cloud a quota gratuita), hardware locale, pattern di nome per gli
+    economici noti. Tutto il resto finisce nel tier costoso."""
     s = str(n)
-    if _TIER_HINTS.get(s) == TIER_FREE:
-        return TIER_FREE
+    hint = _TIER_HINTS.get(s)
+    if hint is not None and hint >= 0:   # prezzo negativo = nascosto: ignora
+        if hint == 0:
+            return TIER_FREE
+        if hint <= CHEAP_PRICE_USD_PER_TOKEN:
+            return TIER_CHEAP
+        return TIER_PAID
     if ":free" in s:
         return TIER_FREE
-    if s.startswith("inference4free/") or s == "openrouter/free":
+    brand = s.split("/", 1)[0].lower()
+    if ("free" in brand or brand == "ollama-cloud"
+            or s == "openrouter/free"):
         return TIER_FREE
     if s in ("small-model", "local-model"):
         return TIER_FREE
@@ -364,18 +393,19 @@ def _fetch_pattern_models(name):
             full = mid if mid.startswith(prefix) else prefix + mid
             out.append(full)
             # hint di tier dal PREZZO del listing (formato OpenRouter:
-            # pricing.prompt/completion "0" = gratis, "-1"/assente = ignoro):
-            # un nuovo modello gratuito listato dal provider entra nel tier
-            # FREE senza toccare il codice (classificazione dinamica)
+            # pricing.prompt in USD/token, "0" = gratis, "-1"/assente =
+            # prezzo nascosto -> ignorato): il prezzo DEL PROMPT decide il
+            # tier (0 = gratis, sotto CHEAP_PRICE_USD_PER_TOKEN = economico):
+            # un modello nuovo listato dal provider viene classificato senza
+            # toccare il codice (classificazione dinamica)
             pr = m.get("pricing") if isinstance(m, dict) else None
-            if isinstance(pr, dict):
+            if isinstance(pr, dict) and pr.get("prompt") is not None:
                 try:
-                    cost = (float(pr.get("prompt") or 0)
-                            + float(pr.get("completion") or 0))
+                    p = float(pr.get("prompt"))
                 except (TypeError, ValueError):
-                    cost = None
-                if cost == 0:
-                    _TIER_HINTS[full] = TIER_FREE
+                    p = -1.0
+                if p >= 0:
+                    _TIER_HINTS[full] = p
             if len(out) >= WILDCARD_MAX_MODELS:
                 break
         return out
@@ -738,7 +768,13 @@ class ReasoningClamp(CustomLogger):
         if not pool:
             return None, f"no-compactor-fits:{body_est}tok"
         failures = []
+        # budget di tempo: si prova TUTTO il pool (gratis -> economico ->
+        # costoso) finche' c'e' budget; niente tetto fisso di compattori
+        deadline = time.monotonic() + WORKER_TIME_BUDGET_S
         for comp in pool:
+            if time.monotonic() >= deadline:
+                failures.append(f"time-budget:{WORKER_TIME_BUDGET_S}s")
+                break
             try:
                 resp = await asyncio.wait_for(
                     llm_router.acompletion(
@@ -843,11 +879,16 @@ class ReasoningClamp(CustomLogger):
                 and self._context_for(n) >= budget]
 
     async def _summarize_chunks(self, chunks, origin, model):
-        """Riassume i chunk con FAILOVER sul pool dinamico: operario
+        """Riassume i chunk con FAILOVER sull'INTERO pool dinamico entro il
+        budget di tempo WORKER_TIME_BUDGET_S (richiesta utente 2026-10-06:
+        "provare tutti i possibili modelli, con un limite di tempo; errore
+        solo quando proprio non riusciamo a fare nulla"): operario
         "appiccicoso" (il primo che riesce resta per i chunk successivi),
-        ogni fallimento/risposta vuota avanza al successivo, max
-        MAX_WORKERS_TRIED operari distinti. Ritorna (brief, info) con
-        brief=None su fallimento totale."""
+        ogni fallimento/risposta vuota avanza al successivo finche' c'e'
+        budget. Se il budget (o il pool) finisce a meta', si tengono i
+        PARZIALI: almeno un chunk riassunto = compressione utile, il livello
+        successivo della cascata completa se serve. Ritorna (brief, info)
+        con brief=None solo su fallimento TOTALE."""
         from litellm.proxy.proxy_server import llm_router
         if llm_router is None:
             return None, "no-router"
@@ -858,13 +899,17 @@ class ReasoningClamp(CustomLogger):
         pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED)
         if not pool:
             return None, f"no-worker-fits:{chunk_est}tok"
+        deadline = time.monotonic() + WORKER_TIME_BUDGET_S
         failures = []
         wi = 0
         used = None
         summaries = []
         for i, chunk in enumerate(chunks):
             s = None
-            while wi < len(pool) and wi < MAX_WORKERS_TRIED:
+            while wi < len(pool):
+                if time.monotonic() >= deadline:
+                    failures.append(f"time-budget:{WORKER_TIME_BUDGET_S}s")
+                    break
                 w = pool[wi]
                 try:
                     resp = await asyncio.wait_for(
@@ -893,11 +938,19 @@ class ReasoningClamp(CustomLogger):
                 used = w
                 break
             if not s:
-                return None, "|".join(failures[-4:]) or "no-worker"
+                break   # budget esaurito o pool esaurito: usa i parziali
             summaries.append(f"--- parte {i + 1}/{len(chunks)} ---\n{s}")
-        print(f"[reasoning_clamp] riassunti {len(chunks)} chunk su '{used}' "
-              f"(pool provato: {', '.join(pool[:MAX_WORKERS_TRIED])})",
-              flush=True)
+        if not summaries:
+            return None, "|".join(failures[-4:]) or "no-worker"
+        if len(summaries) < len(chunks):
+            print(f"[reasoning_clamp] riassunti PARZIALI {len(summaries)}/"
+                  f"{len(chunks)} chunk su '{used}' (budget/pool esauriti; "
+                  f"falliti: {'; '.join(failures[-6:])})", flush=True)
+        else:
+            print(f"[reasoning_clamp] riassunti {len(chunks)} chunk su "
+                  f"'{used}' (falliti prima: "
+                  f"{'; '.join(failures[-4:]) if failures else 'nessuno'})",
+                  flush=True)
         return "\n\n".join(summaries), used or "?"
 
     # ---------------- T: split+compress della coda --------------------------

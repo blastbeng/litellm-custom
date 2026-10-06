@@ -205,9 +205,13 @@ fallback (tolerant gateways accept it). The fixed lists only set the
 `chunk + output + margin` are filtered out (so a 240k body is never handed to
 a 131k model — note `groq/openai/gpt-oss-120b`/`-20b` are 131072 for real),
 non-chat models (`embed`, `whisper`, `guard`, `rerank` substrings) are
-excluded, and up to `MAX_WORKERS_TRIED = 4` distinct workers are attempted
-with **sticky failover** (the first worker that answers keeps the remaining
-chunks; an error or empty answer advances to the next). B sizes its compaction
+excluded, and **every fitting worker** is attempted within a per-level **time
+budget** (`WORKER_TIME_BUDGET_S = 420`, checked before each attempt) with
+**sticky failover** (the first worker that answers keeps the remaining chunks;
+an error or empty answer advances to the next — failures are fast, so the
+budget only cuts hung workers). Partial results are kept: some chunks
+summarised ⇒ the level succeeds; the level fails — and the cascade moves on —
+only when *nothing* was produced. B sizes its compaction
 body with the **tiktoken** estimate (not the conservative dense ratio): a
 marginal compactor that 400s costs one failover round, while over-filtering
 would skip B entirely and drop the request to the lossy C tier.
@@ -215,18 +219,26 @@ would skip B entirely and drop the request to the lossy C tier.
 **Cost-tier ordering** (2026-10-06 request: free models first, then cheap,
 then the rest — dynamically): the pool is sorted by **(cost tier,
 preference)**, so the preference lists decide only the order *inside* a
-tier. **Tier 0 — free**: `inference4free/*`, `openrouter/free`, any id with
-the OpenRouter `:free` suffix, models whose gateway `/models` listing
+tier. **Tier 0 — free**: `inference4free/*`, `openrouter/free`,
+`ollama-cloud/*`, any id with the OpenRouter `:free` suffix, any model whose
+gateway/brand name contains `free`, models whose gateway `/models` listing
 declares a zero price (captured live during wildcard expansion — a provider
 listing a new free model is picked up without code changes), and the local
 hardware models (`small-model`, `local-model` — own GPU, zero cost).
-**Tier 1 — cheap**: name patterns `gpt-oss`, `flash-lite`, `gemma`,
-`syn:small`, `qwen`, `nano`, `-mini` (with the dash: `gemini` *contains* the
-string `mini`, which would classify every Gemini as cheap). **Tier 2 —
-everything else** (gemini-2.5-flash, deepseek, claude, gpt-5, …), ordered by
-the level's preference list. Because the classification is price/brand/
-pattern based rather than a closed id list, delisted models drop out via the
-10-minute listing cache and newly listed ones join automatically.
+**Tier 1 — cheap**: first the **listing price** when known — prompt price ≤
+`CHEAP_PRICE_USD_PER_TOKEN = 5e-7` (≈ $0.50/M prompt tokens; zero ⇒ tier 0,
+hidden/negative prices are ignored) — otherwise **29 name patterns**: `gpt-oss`,
+`flash-lite`, `flash`, `lite`, `gemma`, `syn:small`, `small`, `qwen`, `qwq`,
+`nano`, `-mini`, `haiku`, `deepseek`, `glm`, `kimi`, `moonshot`, `llama`,
+`mistral-small`, `ministral`, `pixtral`, `minimax`, `phi-`, `phi3`, `phi4`,
+`nemotron`, `falcon`, `tiny`, `grok-3-mini`, `grok-4-fast` (`-mini` keeps the
+dash: `gemini` *contains* the string `mini`, which would classify every Gemini
+as cheap; the bare `small` is safe because the local models already matched
+tier 0). **Tier 2 — everything else** (gemini-2.5-flash/pro at real listing
+prices, paid deepseek/claude/gpt-5 tiers, …), ordered by the level's
+preference list. Because the classification is price/brand/pattern based
+rather than a closed id list, delisted models drop out via the 10-minute
+listing cache and newly listed ones join automatically.
 
 | Level | What it does | Lossy? |
 |---|---|---|
