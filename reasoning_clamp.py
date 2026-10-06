@@ -388,7 +388,11 @@ def _model_tier(n):
 # la stessa fonte usata dall'import automatico dei modelli in config.
 WILDCARD_LIST_TIMEOUT_S = 8
 WILDCARD_CACHE_TTL_S = 600
-WILDCARD_MAX_MODELS = 40       # tetto per-pattern (listing da centinaia)
+# tetto per-pattern: 40 TRONCAVA listing da ~50 (inference4free: z.ai ai
+# margini della lista persi il contesto reale 10000 -> floor statico 131072 ->
+# prompt oversize spediti e fallback a monte). 200 copre i gateway piccoli e
+# limita comunque i listing enormi (openrouter: centinaia)
+WILDCARD_MAX_MODELS = 200
 _WILDCARD_CACHE = {}           # "groq/*" -> (monotonic, [nomi concreti])
 
 # ------------- INTERROGAZIONE DINAMICA del listing /v1/models -------------
