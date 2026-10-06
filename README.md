@@ -214,7 +214,21 @@ cap; the window is `in + out` when both are declared); a model added/removed
 in `config.yaml` (or via `/model/new`) is picked up **without code changes or
 restarts**. Until the first successful listing the pool behaves exactly as
 before (`model_list` + static contexts). `/v1/models` carries no prices, so
-cost tiers still come from the gateway listings (below). **Wildcard expansion**: `model_list` holds patterns (`groq/*`,
+cost tiers still come from the gateway listings (below).
+
+**Temporary worker blacklist** (2026-10-06 request: "temp blacklist models
+(incrementally) that fail too often when used for
+compression/summarization/clamping"): failures are counted **directly at the
+worker call sites** (level B compactors, level T/E summarisers — both
+exceptions *and* empty answers), not by parsing logs. 3 failures inside a
+sliding 10-min window ⇒ blacklisted for **15 min**, and every relapse
+**doubles** the ban (capped at 24 h). A clean success consumes a fallover and
+decays one strike; a success *while banned* reinstates the model immediately
+(provider quota recovered). Blacklisted workers are **demoted to the end of
+the pool, never excluded** — if everything else fails they are retried
+anyway (self-healing), and the pool never goes empty because of the
+blacklist. Client traffic never touches these counters: only internal
+compaction/summarisation calls do. **Wildcard expansion**: `model_list` holds patterns (`groq/*`,
 `openrouter/*`, …), but an internal call with the literal pattern would send
 `model="*"` upstream and 400 — so each pattern is expanded into its
 **requestable concrete ids** from the gateway `/models` listing (same source

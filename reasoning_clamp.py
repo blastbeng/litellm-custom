@@ -483,6 +483,82 @@ def _ensure_proxy_models_refresher():
 # proxy non ascolta ancora (fase di avvio) il thread ritenta ogni 30s
 _ensure_proxy_models_refresher()
 
+# ---------------- BLACKLIST TEMPORANEA degli operari ----------------------
+# Richiesta utente 2026-10-06: "system to temp blacklist models
+# (incrementally) that fail too often when used for
+# compression/summarization/clamping". I falli sono contati DIRETTAMENTE nei
+# punti in cui gli operari chiamano l'LLM (B compattori, T/E riassunti:
+# eccezioni E risposte vuote) - niente parsing dei log: stessa informazione,
+# zero ambiguita'. Contatore a finestra scivolante: WORKER_FAIL_THRESHOLD
+# falli entro WORKER_FAIL_WINDOW_S -> blacklist per WORKER_BAN_BASE_S; ogni
+# nuova recidiva RADDOPPIA la durata (incrementale, tetto WORKER_BAN_MAX_S).
+# Un successo pulito consuma un fallo e fa decadere uno strike; un successo
+# MENTRE e' in blacklist lo ricovera subito (la quota del provider e'
+# tornata). I blacklistati NON vengono esclusi dal pool: solo DEMOTI in
+# fondo - se tutto il resto fallisce si riprova comunque (auto-guarigione,
+# mai pool vuoto per colpa del blacklist). Vale SOLO per gli operari interni
+# (compressione/riassunto/clamp): il traffico dei client non tocca questi
+# contatori.
+WORKER_FAIL_WINDOW_S = 600      # finestra dei falli (10 min)
+WORKER_FAIL_THRESHOLD = 3       # falli nella finestra -> blacklist
+WORKER_BAN_BASE_S = 900         # prima blacklist: 15 min
+WORKER_BAN_MAX_S = 86400        # tetto escalation: 24h
+_WORKER_FAILS = {}              # id -> [timestamp dei falli nella finestra]
+_WORKER_BANS = {}               # id -> [ban_until_monotonic, strikes]
+_WORKER_HEALTH_LOCK = threading.Lock()
+
+
+def _worker_note_fail(w, err=""):
+    """Conta un fallo dell'operario `w` (eccezione o risposta vuota); alla
+    soglia applica la blacklist (log incluso, durata raddoppiata a ogni
+    recidiva). Chiamare SOLO per i tentativi operario-interni."""
+    now = time.monotonic()
+    with _WORKER_HEALTH_LOCK:
+        fl = [t for t in _WORKER_FAILS.get(w, [])
+              if now - t < WORKER_FAIL_WINDOW_S]
+        fl.append(now)
+        _WORKER_FAILS[w] = fl
+        if len(fl) < WORKER_FAIL_THRESHOLD:
+            return
+        ban = _WORKER_BANS.get(w)
+        if ban and ban[0] > now:
+            return                      # gia' in blacklist: nessun nuovo log
+        strikes = (ban[1] if ban else 0) + 1
+        dur = min(WORKER_BAN_MAX_S, WORKER_BAN_BASE_S * (2 ** (strikes - 1)))
+        _WORKER_BANS[w] = [now + dur, strikes]
+        _WORKER_FAILS[w] = []
+        print(f"[reasoning_clamp] blacklist {w} per {dur // 60}m "
+              f"(recidiva {strikes}, {len(fl)} falli/"
+              f"{WORKER_FAIL_WINDOW_S // 60}m"
+              f"{': ' + str(err)[:80] if err else ''})", flush=True)
+
+
+def _worker_note_ok(w):
+    """Operario riuscito: azzera i falli e fa decadere uno strike; se era in
+    blacklist lo ricovera subito (l'operario ha risposto di nuovo)."""
+    now = time.monotonic()
+    with _WORKER_HEALTH_LOCK:
+        _WORKER_FAILS.pop(w, None)
+        ban = _WORKER_BANS.get(w)
+        if not ban:
+            return
+        was_banned = ban[0] > now
+        strikes = ban[1] - 1
+        if strikes <= 0:
+            _WORKER_BANS.pop(w, None)
+        else:
+            _WORKER_BANS[w] = [0, strikes]   # strike decaduto, non dimenticato
+        if was_banned:
+            print(f"[reasoning_clamp] blacklist: {w} ricoverato (l'operario "
+                  f"ha risposto di nuovo)", flush=True)
+
+
+def _worker_banned(w):
+    """True se l'operario e' in blacklist ADESSO (lettura lock-free: get
+    atomico sotto GIL; la scadenza e' verificata sul monotonic corrente)."""
+    ban = _WORKER_BANS.get(w)
+    return bool(ban and ban[0] > time.monotonic())
+
 
 def _fetch_pattern_models(name):
     """Listing {api_base}/models per un pattern 'X/*': ritorna i nomi
@@ -1016,10 +1092,13 @@ class ReasoningClamp(CustomLogger):
                 brief = (resp.choices[0].message.content or "").strip()
             except Exception as e:
                 failures.append(f"{comp}:{type(e).__name__}:{str(e)[:120]}")
+                _worker_note_fail(comp, f"{type(e).__name__}: {e}")
                 continue
             if len(brief) < MIN_BRIEF_CHARS:
                 failures.append(f"{comp}:empty-brief")
+                _worker_note_fail(comp, "empty-brief")
                 continue
+            _worker_note_ok(comp)
             print(f"[reasoning_clamp] B {model}: compattato da {comp} "
                   f"({len(body)} char -> {len(brief)} char di sintesi)",
                   flush=True)
@@ -1134,9 +1213,18 @@ class ReasoningClamp(CustomLogger):
 
         # tier di costo PRIMARIO, preferenza del livello secondaria: il pool
         # e' gratis -> economico -> costoso a prescindere dalle liste preferred
-        return [n for n in sorted(
+        ordered = [n for n in sorted(
                     names, key=lambda n: (_model_tier(n), rank(n)))
                 if fits(n)]
+        # BLACKLIST TEMPORANEA (falli ripetuti come operari, 2026-10-06):
+        # i blacklistati non sono esclusi ma solo DEMOTI in fondo (snapshot
+        # unico: nessun duplicato se un ban scade a meta' ordinamento) - se
+        # tutto il resto fallisce si riprova comunque (auto-guarigione)
+        banned = {n for n in ordered if _worker_banned(n)}
+        if not banned:
+            return ordered
+        return [n for n in ordered if n not in banned] + \
+               [n for n in ordered if n in banned]
 
     async def _summarize_chunks(self, chunks, origin, model):
         """Riassume i chunk con FAILOVER sull'INTERO pool dinamico entro il
@@ -1189,12 +1277,15 @@ class ReasoningClamp(CustomLogger):
                     s = (resp.choices[0].message.content or "").strip()
                 except Exception as e:
                     failures.append(f"{w}:{type(e).__name__}")
+                    _worker_note_fail(w, f"{type(e).__name__}: {e}")
                     wi += 1
                     continue
                 if not s:
                     failures.append(f"{w}:empty")
+                    _worker_note_fail(w, "empty")
                     wi += 1
                     continue
+                _worker_note_ok(w)
                 used = w
                 break
             if not s:
