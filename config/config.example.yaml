@@ -6,10 +6,13 @@ model_list:
 
   # CONTESTI: i valori di max_input_tokens qui sotto DEVO NO stare allineati a
   # CONTEXT_BY_PREFIX in reasoning_clamp.py, che e' li' che avviene il CLAMP di
-  # max_tokens (contesto - prompt). Il limite lo impone l'upstream: llama-swap
-  # conta col tokenizer reale e risponde 400 "prompt (N) + max tokens (M)
-  # exceeds the context (C); requests are never truncated" - il 400 uccide la
-  # catena di fallback intera. Contesto cambiato qui = cambiato li'.
+  # max_tokens (contesto - prompt). Il limite lo impone l'upstream: i modelli
+  # grossi girano su Strata (dietro llama-swap) e contano col tokenizer reale,
+  # rispondendo 400 "prompt (N) + max tokens (M) exceeds the context (C);
+  # requests are never truncated" - il 400 uccide la catena di fallback intera.
+  # Sul PC si puo' delegare l'adattamento A Strata stessa: "fit_max_tokens":
+  # true in strata-<model>.json (o About -> Model settings nella sua web UI).
+  # Contesto cambiato qui = cambiato li'.
   #
   # Se il PROMPT da solo satura il contesto (prompt + 1024 + margine > C) il
   # clamp non basta: parte la CASCATA in reasoning_clamp.py - B compattazione

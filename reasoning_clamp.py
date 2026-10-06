@@ -61,12 +61,16 @@ Il provider e' dedotto dal nome pubblico del modello (prefisso "groq/",
 robustezza rispetto all'ordine hook/routing.
 
 CLAMP DI max_tokens (contesto): il limite LO IMPONE L'UPSTREAM, non litellm.
-llama-swap conta i token del prompt col tokenizer REALE e risponde 400
+i modelli grossi locali girano su STRATA (dietro llama-swap), che conta i
+token del prompt col tokenizer REALE e risponde 400
 ("prompt (N tokens) + max tokens (M) exceeds the context (C); requests are
 never truncated" - il testo NON e' di litellm, che con
 enable_pre_call_checks: false non fa alcun controllo), e litellm incapsula il
 400 come BadRequestError: cosi' una richiesta con prompt grande uccide la
 CATENA DI FALLBACK intera (synthetic/* -> local-model -> small-model).
+Strata puo' anche accorciare max_tokens DA SOLO (esatto, senza stima):
+"fit_max_tokens": true in strata-<model>.json sul PC (o About -> Model
+settings nella sua web UI) - restano da clampare i cloud (synthetic/* ecc.).
 Qui max_tokens viene ridotto a "contesto - prompt" usando
 il CONTESTO MINIMO dell'intera catena di fallback: l'hook del proxy gira
 UNA sola volta per richiesta client (litellm unisce i litellm_params del
@@ -114,6 +118,7 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 (montato in /app/reasoning_clamp.py, vedi docker-compose.yml).
 """
 import asyncio
+import json
 
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
@@ -167,6 +172,24 @@ MIN_OUTPUT_TOKENS = 1024  # sotto questo una risposta reasoning non e' utile
 SAFETY_MARGIN = 1024      # margine per l'errore della stima
 CHARS_PER_TOKEN = 2.8     # conservativo per llama (codice, CJK, JSON)
 PER_MESSAGE_OVERHEAD = 8  # role/framing per messaggio (ChatML)
+# SCHEMI TOOL: NON sono nel conteggio characters/dei messaggi e l'upstream li
+# mette nel prompt: misurato su Strata, 18 schemi OpenAI = +1403 token REALI
+# (~80/schema). Un client agentico (AiderDesk) ne manda decine: non contarli
+# e' una sottostima sistematica di migliaia di token -> il clamp lascia un
+# max_tokens che l'upstream rifiuta. Il JSON schema e' denso di simboli:
+# ratio piu' basso della prosa + framing per-tool.
+TOOLS_CHARS_PER_TOKEN = 2.2
+TOOL_FIXED_TOKENS = 32
+# IMMAGINI: content list con image_url/image - costo fisso conservativo
+# (le immagini multi-tile di llama.cpp possono valere piu' di 1000 token)
+IMAGE_TOKEN_COST = 1500
+# ERRORE RESIDUO della stima: PROPORZIONALE, non fisso. Misurato: su
+# trascrizioni reali ~100k token (codice+JSON, chat template) chars/2.8 resta
+# ~1.4-1.8% SOTTO il conteggio reale dell'upstream, quindi il vecchio margine
+# fisso 1024 non bastava e il clamp produceva un max_tokens oltre la stanza
+# rimasta (400 "exceeds the context" + catena fallback morta). 3% copre
+# l'errore osservato con margine 2x.
+PROMPT_ERR_PCT = 0.03
 MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 
 # --- cascata overflow: B -> C -> E -> F ---
@@ -238,9 +261,23 @@ class ReasoningClamp(CustomLogger):
 
     def _estimate_prompt_tokens(self, data):
         """Stima CONSERVATIVA (sovrastima): l'upstream conta col tokenizer
-        reale, quindi sottostimare significa prendere il 400 dall'upstream."""
+        reale, quindi sottostimare significa prendere il 400 dall'upstream.
+
+        Conta ANCHE gli schemi tools/functions (messa nel prompt
+        dall'upstream, prima zero-token: con 18 schemi Strata ne conta 1403
+        REALI) e le immagini."""
         msgs = data.get("messages") or []
         chars = 0
+        # tools/functions: schemi JSON, ratio piu' denso della prosa
+        schemas = data.get("tools") or data.get("functions") or []
+        tool_tokens = 0
+        for t in schemas:
+            try:
+                j = t if isinstance(t, str) else json.dumps(t)
+            except Exception:
+                j = str(t)
+            tool_tokens += int(len(j) / TOOLS_CHARS_PER_TOKEN) + TOOL_FIXED_TOKENS
+        images = 0
         for m in msgs:
             if not isinstance(m, dict):
                 continue
@@ -250,6 +287,9 @@ class ReasoningClamp(CustomLogger):
             elif isinstance(c, list):
                 for part in c:
                     if isinstance(part, dict):
+                        if part.get("type") in ("image_url", "image"):
+                            images += 1
+                            continue
                         for k in ("text", "content"):
                             v = part.get(k)
                             if isinstance(v, str):
@@ -260,12 +300,21 @@ class ReasoningClamp(CustomLogger):
                     chars += len(v)
             if m.get("tool_calls"):
                 chars += len(str(m["tool_calls"]))
-        return int(chars / CHARS_PER_TOKEN) + PER_MESSAGE_OVERHEAD * len(msgs)
+        return (int(chars / CHARS_PER_TOKEN) + PER_MESSAGE_OVERHEAD * len(msgs)
+                + tool_tokens + images * IMAGE_TOKEN_COST)
+
+    def _margin(self, est):
+        """Margine di sicurezza della stima: FISSO + PROPORZIONALE.
+
+        L'errore residuo della stima cresce col prompt (chat template,
+        ratio caratteri/token variabile: ~1.4-1.8% sotto su trascrizioni
+        reali da ~100k token), quindi un margine solo fisso perde lì."""
+        return SAFETY_MARGIN + int(est * PROMPT_ERR_PCT)
 
     def _saturated(self, est, ctx):
         """Il prompt da solo lascia meno di MIN_OUTPUT_TOKENS: il clamp non
         puo' aiutare, serve ridurre il PROMPT (cascata)."""
-        return est + MIN_OUTPUT_TOKENS + SAFETY_MARGIN > ctx
+        return est + MIN_OUTPUT_TOKENS + self._margin(est) > ctx
 
     def _serialize(self, msgs):
         """Trascrizione testuale dei messaggi, per compattazione/riassunto."""
@@ -319,7 +368,7 @@ class ReasoningClamp(CustomLogger):
             ctx = min([ctx] + [self._context_for(str(t)) for t in chain])
         if est is None:
             est = self._estimate_prompt_tokens(data)
-        budget = ctx - est - SAFETY_MARGIN
+        budget = ctx - est - self._margin(est)
         if budget < MIN_OUTPUT_TOKENS:
             # prompt gia' quasi saturo: nessun tetto sensato, lascia fare
             # all'upstream (400 suo, come prima di questo clamp)

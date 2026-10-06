@@ -133,10 +133,15 @@ The client-provided value always wins (clamped if invalid).
 
 ## Context clamp (`max_tokens`)
 
-The context limit is enforced **by the upstream, not by litellm**: `llama-swap`
-counts the prompt with the **real tokenizer** and answers **400** —
+The context limit is enforced **by the upstream, not by litellm**: on the local
+PC the big models are served by **Strata** behind llama-swap, which counts the
+prompt with the **real tokenizer** and answers **400** —
 `prompt (N tokens) + max tokens (M) exceeds the context (C); requests are
-never truncated` — and litellm wraps that 400 as `BadRequestError`. With
+never truncated` — and litellm wraps that 400 as `BadRequestError`. Strata can
+shorten `max_tokens` to the room left **itself** (exact, no estimation):
+add `"fit_max_tokens": true` to `strata-<model>.json` on `blastpc` (or the
+About tab → Model settings in its web page; a prompt that leaves no room at
+all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
 (`synthetic/*` → `local-model` → `small-model`, all 131072).
@@ -153,10 +158,15 @@ attempt **after** the hook (invisible to it): this is why the cloud
 wildcards carry **no** `max_tokens` default and `synthetic/*` is capped at
 32768.
 The prompt size is **estimated conservatively** (`chars / 2.8` + per-message
-overhead): overestimating is safe (shorter completion), underestimating
-produces the upstream 400. If the prompt alone saturates the context the clamp
-is useless — there is no room left for the answer — and the
-**overflow cascade** below takes over.
+overhead + **tool schemas** + images, plus a **fixed + proportional safety
+margin** — 1024 + 3% of the estimate): overestimating is safe (shorter
+completion), underestimating produces the upstream 400. Measured on real
+~100k-token transcripts `chars / 2.8` alone lands **~1.4–1.8% below** the
+upstream count and tool schemas are worth ~80 tokens each — the old fixed
+margin lost there and the clamp handed out a `max_tokens` the upstream
+refused (2026-10-06 incident, issue #545 text). If the prompt alone saturates
+the context the clamp is useless — there is no room left for the answer — and
+the **overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (131072 for
