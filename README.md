@@ -144,7 +144,8 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model` → `small-model`, all 196608).
+(`synthetic/*` → `local-model` → `small-model`; 196608 for the locals, 131072
+floor for the synthetic wildcard — real per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
 `max_completion_tokens`) to `context − prompt`, and — when the request
@@ -184,13 +185,17 @@ left for the answer — and the **overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (196608 since
-2026-10-06 for `local-model`, `small-model`, `synthetic/*`, `inference4free/*`
-— previously 131072, capped by the local hardware; still 131072 for
-`groq/openai/gpt-oss-120b` / `-20b`, whose real Groq context is 131072 even
-though the `groq/*` wildcard declares 262144 as the ceiling for its largest
-model; 16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`,
-`gemini/*`, `ollama-cloud/*`). Specific entries are matched before generic
-prefixes.
+2026-10-06 for `local-model`/`small-model` — previously 131072, capped by the
+local hardware; 131072 for `synthetic/*` and `inference4free/*`, the
+**minimum true for the whole wildcard** — their real per-model contexts
+(`syn:large:text` 524288, `syn:small:text` 196608, `hf:openai/gpt-oss-120b`
+131072; `inference4free/*` 10000–1000000) reach the clamp and the worker pool
+dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
+`reasoning_clamp.py`; still 131072 for `groq/openai/gpt-oss-120b` / `-20b`,
+whose real Groq context is 131072 even though the `groq/*` wildcard declares
+262144 as the ceiling for its largest model; 16384 for `embedding-model`;
+262144 for `openrouter/*`, `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
+entries are matched before generic prefixes.
 
 ## Context overflow cascade (`B → C → T → E → 413`)
 

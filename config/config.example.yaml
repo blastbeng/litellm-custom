@@ -118,16 +118,25 @@ model_list:
       # 32768 (era 131072): i litellm_params default vengono uniti da litellm
       # a OGNI tentativo, fallback inclusi, DOPO l'hook (che non li vede):
       # prompt + default deve stare nel contesto di OGNI target della catena
-      # (local-model, small-model - tutti 196608)
+      # (small-model/local-model 196608, synthetic min 131072: il vincolo e'
+      # il piu' piccolo della catena)
       max_tokens: 32768
       # reasoning di default per OGNI richiesta su questa wildcard
       # (sovrascrivibile dal client): synthetic supporta
       # none/low/medium/high/xhigh/max
       reasoning_effort: xhigh
     model_info:
-      max_input_tokens: 196608
-      max_output_tokens: 32768
-      max_tokens: 196608
+      # contesti REALI per modello (listing synthetic 2026-10-06):
+      # syn:large:text, syn:large:vision, GLM-5.3, GLM-5.3-Flash,
+      # DeepSeek-V4.1-Flash, Kimi-K3 = 524288; syn:small:vision, Qwen3.8-27B,
+      # Nemotron-3-Super = 262144; syn:small:text, GLM-4.7-Flash = 196608;
+      # hf:openai/gpt-oss-120b = 131072. Un WILDCARD dichiara il MINIMO vero
+      # per tutto il gruppo; il contesto REALE per-modello arriva al clamp e
+      # al pool dinamicamente dal listing (reasoning_clamp: _DYN_CTX/
+      # _window_for) - syn:large:text usa davvero 512k
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      max_tokens: 65536
 
   # --- Modelli OpenRouter: importati in automatico ---
   # Nome pubblico "openrouter/<id-nativo>" (es. openrouter/z-ai/glm-5.3-prime).
@@ -218,7 +227,13 @@ model_list:
       api_key: dummy
       max_tokens: 32768
     model_info:
-      max_input_tokens: 196608
+      # contesti REALI (listing upstream 2026-10-06): famiglia auto (auto,
+      # deepseek/auto, google/auto, openai/auto, anthropic/auto, xai/auto)
+      # = 131072; perplexity/* e chatgptauto = 128000; copilot/* = 32000;
+      # z.ai/* = 10000; qwen3.7-plus/3.8-max/3.8-omni-flash = 1000000.
+      # 131072 = valore del nucleo operativo: NON tutti arrivano a 196608;
+      # il REALE per-modello arriva dal listing (reasoning_clamp: _DYN_CTX)
+      max_input_tokens: 131072
       max_output_tokens: 32768
       max_tokens: 32768
 

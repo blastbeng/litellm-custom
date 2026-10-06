@@ -187,13 +187,16 @@ SYN_EMBED_FALLBACKS = ["embedding-model"]
 # limite lo impone l'upstream. Valori ALLINEATI a config(.example).yaml:
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
-    # locali/synthetic/inference4free: 196608 dal 2026-10-06 (prima 131072:
-    # i locali erano cappati a 128k lato llama-server)
+    # locali: 196608 dal 2026-10-06 (prima 131072: cappati a 128k lato
+    # llama-server). synthetic/inference4free: 131072 = MINIMO vero del
+    # gruppo (eterogenei: synthetic 131k..512k, inference4free 10k..1M - un
+    # wildcard non puo' dichiarare un unico contesto vero): il REALE
+    # per-modello arriva dal listing (_DYN_CTX via _window_for)
     ("local-model", 196608),
     ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
-    ("synthetic/", 196608),
-    ("inference4free/", 196608),
+    ("synthetic/", 131072),
+    ("inference4free/", 131072),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
     # NOTA ordine: gli entry specifici PRIMA del prefisso generico "groq/"
@@ -391,6 +394,14 @@ PROXY_MODELS_TTL_S = 600
 _PROXY_MODELS_CACHE = {"ts": 0.0, "models": {}}  # id -> (max_in|None, max_out|None)
 _PROXY_MODELS_LOCK = threading.Lock()
 _PROXY_MODELS_STARTED = [False]
+# contesto REALE per-modello dai listing gateway/upstream (scritto da
+# _fetch_pattern_models: context_length/max_model_len/context_window =
+# finestra TOTALE, max_input_tokens = cap input, conservativo). Serve perche'
+# i gruppi wildcard ETEROGENEI non possono dichiarare un unico contesto vero
+# in config.yaml (synthetic: 131k..512k; inference4free: 10k..1M) e il
+# listing litellm /v1/models NON porta i campi contesto per questi provider
+# (get_valid_models espande solo gli id): il clamp e il pool leggono QUI.
+_DYN_CTX = {}                  # id pubblico -> finestra (int)
 
 
 def _fetch_proxy_models():
@@ -462,6 +473,19 @@ def _refresher_proxy_models():
                     print(f"[reasoning_clamp] /v1/models non disponibile "
                           f"(tentativo {fails}); tengo l'ultima lista",
                           flush=True)
+        # contesti per-modello dai listing gateway/upstream (i WILDCARD del
+        # model_list): alimenta _DYN_CTX per il clamp/pool - anche il modello
+        # MAIN (es. synthetic/syn:large:text, non un wildcard) ha cosi' il
+        # suo contesto REALE dal vivo senza aspettare la prima cascata
+        try:
+            from litellm.proxy.proxy_server import llm_router
+            for dep in (getattr(llm_router, "model_list", None) or []):
+                n = (dep.get("model_name") if isinstance(dep, dict)
+                     else getattr(dep, "model_name", None))
+                if n and str(n).endswith("/*"):
+                    _fetch_pattern_models(str(n))
+        except Exception:
+            pass
         # primo aggancio mancato (proxy in avvio): ritento presto, non tra 10'
         time.sleep(PROXY_MODELS_TTL_S
                    if (got or _PROXY_MODELS_CACHE["models"]) else 30)
@@ -621,6 +645,16 @@ def _fetch_pattern_models(name):
                     p = -1.0
                 if p >= 0:
                     _TIER_HINTS[full] = p
+            # contesto REALE per-modello (vedi _DYN_CTX): campo per provider -
+            # synthetic/inference4free/openrouter "context_length", groq
+            # "context_window", llama.cpp "max_model_len"; "max_input_tokens"
+            # (cap input) solo come ultima scelta, conservativo
+            for f in ("context_length", "max_model_len", "context_window",
+                      "max_input_tokens"):
+                v = m.get(f) if isinstance(m, dict) else None
+                if isinstance(v, (int, float)) and v > 0:
+                    _DYN_CTX[full] = int(v)
+                    break
             if len(out) >= WILDCARD_MAX_MODELS:
                 break
         return out
@@ -819,10 +853,32 @@ def _tools_tiktoken(tool_texts):
 class ReasoningClamp(CustomLogger):
 
     def _context_for(self, model):
+        """STATICo: mappa allineata a config(.example).yaml - valore MINIMO
+        vero per tutto il gruppo wildcard (i gruppi eterogenei non possono
+        dichiarare un unico contesto vero). Per il contesto REALE usare
+        _window_for."""
         for pref, ctx in CONTEXT_BY_PREFIX:
             if model == pref.rstrip("/") or model.startswith(pref):
                 return ctx
         return DEFAULT_CONTEXT
+
+    def _window_for(self, model):
+        """Finestra TOTALE utilizzabile (prompt + output) di `model`,
+        PER-MODELLO quando possibile: 1) listing gateway/upstream (_DYN_CTX:
+        context_length/max_model_len/context_window - synthetic, groq,
+        inference4free...), 2) listing litellm /v1/models (max_input_tokens
+        del registro: openrouter e simili; usato da solo perche' per i
+        locali e' la finestra intera e nel registro e' <= finestra reale),
+        3) mappa statica (minimo vero del gruppo). Cosi' syn:large:text
+        usa davvero 512k e hf:openai/gpt-oss-120b resta a 131k senza 400."""
+        ctx = _DYN_CTX.get(model)
+        if ctx:
+            return ctx
+        with _PROXY_MODELS_LOCK:
+            mit = _PROXY_MODELS_CACHE["models"].get(model, (None, None))[0]
+        if mit is not None:
+            return mit
+        return self._context_for(model)
 
     def _estimate_prompt_tokens(self, data):
         """Stima CONSERVATIVA (mai sottostimare: l'upstream conta col
@@ -956,14 +1012,14 @@ class ReasoningClamp(CustomLogger):
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
         if not keys:
             return
-        ctx = self._context_for(model)
+        ctx = self._window_for(model)
         chain = data.get("fallbacks")
         if isinstance(chain, list) and chain:
             # la richiesta deve starci ANCHE se cade sull'ultimo target
             # (small-model, 131072): limita al contesto piu' piccolo della
             # catena (i default litellm_params.max_tokens sono uniti da
             # litellm DOPO l'hook e non sono visibili qui - vedi config)
-            ctx = min([ctx] + [self._context_for(str(t)) for t in chain])
+            ctx = min([ctx] + [self._window_for(str(t)) for t in chain])
         if est is None:
             est = self._estimate_prompt_tokens(data)
         budget = ctx - est - self._margin(est)
@@ -991,12 +1047,12 @@ class ReasoningClamp(CustomLogger):
         MIN_FORCED_OUTPUT ci sta -> al chiamante il 413 vero."""
         keys = [k for k in MAX_TOKEN_KEYS
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
-        ctx = self._context_for(model)
+        ctx = self._window_for(model)
         chain = data.get("fallbacks")
         if isinstance(chain, list) and chain:
             # stessa regola di _clamp_output: deve starci ANCHE sull'ultimo
             # target della catena di fallback
-            ctx = min([ctx] + [self._context_for(str(t)) for t in chain])
+            ctx = min([ctx] + [self._window_for(str(t)) for t in chain])
         room = ctx - est - SAFETY_MARGIN
         if room < MIN_FORCED_OUTPUT:
             return False
@@ -1119,7 +1175,7 @@ class ReasoningClamp(CustomLogger):
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         if len(msgs) < 3:
             return None, "too-few-messages"
-        ctx = self._context_for(model)
+        ctx = self._window_for(model)
         target = max(MIN_OUTPUT_TOKENS * 2, int(ctx * COMPRESS_TARGET_RATIO))
         res = compress(messages=list(msgs), model=model,
                        call_type=CallTypes.completion,
@@ -1196,18 +1252,14 @@ class ReasoningClamp(CustomLogger):
             # non-chat esclusi ANCHE se arrivano solo dal listing
             if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
                 return False
-            static = self._context_for(n)
-            mit, mot = dyn.get(n, (None, None))
-            # finestra: mit+mot quando il listing li da' entrambi; con solo
-            # mit: mit e' per definizione <= finestra reale, quindi
-            # max(static, mit) non e' MAI peggiore della stima statica
-            window = (mit + mot) if (mit is not None and mot) else (
-                static if mit is None else max(static, mit))
-            if window < budget:
+            # finestra REALE per-modello (gateway _DYN_CTX -> listing
+            # litellm -> statico di gruppo): stessa fonte del clamp
+            if self._window_for(n) < budget:
                 return False
-            # il PROMPT deve stare nel cap di INPUT reale (mit): e' la regola
-            # con cui l'upstream rifiuta; il margine (>= output) copre la
-            # risposta nella finestra
+            # il PROMPT deve stare nel cap di INPUT reale (max_input_tokens
+            # del listing litellm, se noto): e' la regola con cui l'upstream
+            # rifiuta; il margine (>= output) copre la risposta in finestra
+            mit = dyn.get(n, (None, None))[0]
             if mit is not None and needed_tokens + self._margin(
                     needed_tokens) > mit:
                 return False
@@ -1399,7 +1451,7 @@ class ReasoningClamp(CustomLogger):
     # ---------------- F: errore strutturato ---------------------------------
 
     def _overflow(self, data, model, est, tried):
-        ctx = self._context_for(model)
+        ctx = self._window_for(model)
         print(f"[reasoning_clamp] F {model}: prompt ~{est} tok > contesto "
               f"{ctx}; cascata esaurita ({'|'.join(tried)})", flush=True)
         raise HTTPException(
@@ -1429,7 +1481,7 @@ class ReasoningClamp(CustomLogger):
             return data
         if not (data.get("messages") or []):
             return data
-        ctx = self._context_for(model)
+        ctx = self._window_for(model)
         est = self._estimate_prompt_tokens(data)
         if not self._saturated(est, ctx):
             return data
