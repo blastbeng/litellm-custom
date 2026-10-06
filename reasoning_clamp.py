@@ -466,7 +466,7 @@ def _refresher_proxy_models():
 
 
 def _ensure_proxy_models_refresher():
-    """Avvia lazy il thread daemon (una sola volta per processo)."""
+    """Avvia il thread daemon (una sola volta per processo)."""
     if _PROXY_MODELS_STARTED[0]:
         return
     with _PROXY_MODELS_LOCK:
@@ -475,6 +475,13 @@ def _ensure_proxy_models_refresher():
         _PROXY_MODELS_STARTED[0] = True
     threading.Thread(target=_refresher_proxy_models, daemon=True,
                      name="reasoning-clamp-models").start()
+
+
+# avvio EAGER all'import: il listing e' gia' pronto al PRIMO overflow dopo un
+# restart (il lazy partirebbe solo alla prima cascata, che leggerebbe la
+# cache ancora vuota) e i cambi di config vengono seguiti da subito; se il
+# proxy non ascolta ancora (fase di avvio) il thread ritenta ogni 30s
+_ensure_proxy_models_refresher()
 
 
 def _fetch_pattern_models(name):

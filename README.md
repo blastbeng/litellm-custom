@@ -202,7 +202,19 @@ re-estimates the prompt and re-applies the clamp.
 possible litellm configured model, even the ones hosted by inference4free"):
 every level that makes LLM calls builds its worker list **dynamically from
 `llm_router.model_list`** — every configured model is eligible, wildcards
-included. **Wildcard expansion**: `model_list` holds patterns (`groq/*`,
+included. **Dynamic `/v1/models` interrogation** (2026-10-06 request: "adapt
+the code to our model list DINAMICALLY"): a background daemon re-reads the
+proxy's own `http://127.0.0.1:4000/v1/models` every 10 min (Bearer `master_key`
+from the running process, unauth retry on 401, proxy-env bypass — a blocking
+self-call inside the event loop would deadlock, so the fetch only lives in
+that thread). The listing **adds models missing from `model_list`** to the
+worker pool and replaces the static context guesses with the **real
+`max_input_tokens`/`max_output_tokens`** (the prompt must fit the real input
+cap; the window is `in + out` when both are declared); a model added/removed
+in `config.yaml` (or via `/model/new`) is picked up **without code changes or
+restarts**. Until the first successful listing the pool behaves exactly as
+before (`model_list` + static contexts). `/v1/models` carries no prices, so
+cost tiers still come from the gateway listings (below). **Wildcard expansion**: `model_list` holds patterns (`groq/*`,
 `openrouter/*`, …), but an internal call with the literal pattern would send
 `model="*"` upstream and 400 — so each pattern is expanded into its
 **requestable concrete ids** from the gateway `/models` listing (same source
