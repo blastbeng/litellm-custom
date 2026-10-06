@@ -24,7 +24,7 @@ model_list:
   # configured model", wildcard inference4free/* inclusi); COMPACTOR_MODELS e
   # SUMMARIZER_PREFERRED in reasoning_clamp.py decidono SOLO l'ordine di
   # preferenza, e i modelli il cui contesto non contiene chunk+output+margine
-  # vengono filtrati (un corpo da 240k non va mai a un modello da 131k).
+  # vengono filtrati (un corpo da 240k non va mai a un modello da 192k).
   # Togliere modelli dalla config toglie loro operari alla cascata; se non
   # resta NESSUN modello capace, B/T/E falliscono subito e la cascata prosegue
   # (o risponde 413) senza 400 a monte.
@@ -58,9 +58,10 @@ model_list:
       timeout: 1800
     model_info:
       id: local-qwen-backend
-      # contesto ridotto lato llama-server (era 262144) per risparmiare
-      # RAM/VRAM: litellm deve dichiararlo ai client
-      max_input_tokens: 131072
+      # contesto lato llama-server: 196608 dal 2026-10-06 (prima 131072,
+      # prima ancora 262144 ridotto per RAM/VRAM): litellm deve dichiararlo
+      # ai client
+      max_input_tokens: 196608
       max_output_tokens: 32768
       max_tokens: 32768
 
@@ -78,9 +79,9 @@ model_list:
       timeout: 1800
     model_info:
       id: local-small-backend
-      # assumo lo stesso contesto di local-model (131072): aggiornare se
+      # assumo lo stesso contesto di local-model (196608): aggiornare se
       # small-model dichiara un contesto diverso su llama-swap
-      max_input_tokens: 131072
+      max_input_tokens: 196608
       max_output_tokens: 32768
       max_tokens: 32768
 
@@ -117,16 +118,16 @@ model_list:
       # 32768 (era 131072): i litellm_params default vengono uniti da litellm
       # a OGNI tentativo, fallback inclusi, DOPO l'hook (che non li vede):
       # prompt + default deve stare nel contesto di OGNI target della catena
-      # (local-model, small-model - tutti 131072)
+      # (local-model, small-model - tutti 196608)
       max_tokens: 32768
       # reasoning di default per OGNI richiesta su questa wildcard
       # (sovrascrivibile dal client): synthetic supporta
       # none/low/medium/high/xhigh/max
       reasoning_effort: xhigh
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 196608
       max_output_tokens: 32768
-      max_tokens: 131072
+      max_tokens: 196608
 
   # --- Modelli OpenRouter: importati in automatico ---
   # Nome pubblico "openrouter/<id-nativo>" (es. openrouter/z-ai/glm-5.3-prime).
@@ -139,7 +140,7 @@ model_list:
       api_base: http://openrouter-gw/v1
       api_key: sk-or-v1-YOUR_OPENROUTER_API_KEY
       # NIENTE max_tokens di default: verrebbe unito da litellm a OGNI
-      # tentativo (fallback inclusi, dopo l'hook) e su small-model (131072,
+      # tentativo (fallback inclusi, dopo l'hook) e su small-model (196608,
       # ultimo ricorso di tutti) produrrebbe un 400; senza tetto ogni modello
       # OpenRouter usa il proprio output di default
       # reasoning di default per OGNI richiesta (OpenRouter accetta
@@ -194,7 +195,7 @@ model_list:
       api_base: https://ollama.com/v1
       api_key: YOUR_OLLAMA_API_KEY
       # NIENTE max_tokens di default (come openrouter/* e gemini/*): su
-      # small-model (131072, ultimo ricorso di tutti) produrrebbe un 400
+      # small-model (196608, ultimo ricorso di tutti) produrrebbe un 400
       # reasoning di default per OGNI richiesta (sovrascrivibile dal client);
       # i modelli senza reasoning lo ignorano
       reasoning_effort: xhigh
@@ -217,7 +218,7 @@ model_list:
       api_key: dummy
       max_tokens: 32768
     model_info:
-      max_input_tokens: 131072
+      max_input_tokens: 196608
       max_output_tokens: 32768
       max_tokens: 32768
 

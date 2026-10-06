@@ -163,7 +163,7 @@ FINAL_FALLBACK = "small-model"
 # synthetic/syn:small:text e synthetic/syn:small:vision (richiesta utente
 # 2026-10-04: ALLINEATI): UN SOLO fallback, small-model - niente local-model,
 # niente Ollama locale (rimossa dappertutto). Piccolo->piccolo: small-model e'
-# la capacita' piu' vicina a syn:small:* (contesto 131072, stessa gate di
+# la capacita' piu' vicina a syn:small:* (contesto 196608, stessa gate di
 # local-model -> 503 in ~2s col PC spento). syn:small:VISION su small-model
 # (text-only su llama-swap) puo' rispondere 400 sull'input vision: scelta
 # esplicita dell'utente, la catena resta questa minima.
@@ -187,11 +187,13 @@ SYN_EMBED_FALLBACKS = ["embedding-model"]
 # limite lo impone l'upstream. Valori ALLINEATI a config(.example).yaml:
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
-    ("local-model", 131072),
-    ("small-model", 131072),
+    # locali/synthetic/inference4free: 196608 dal 2026-10-06 (prima 131072:
+    # i locali erano cappati a 128k lato llama-server)
+    ("local-model", 196608),
+    ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
-    ("synthetic/", 131072),
-    ("inference4free/", 131072),
+    ("synthetic/", 196608),
+    ("inference4free/", 196608),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
     # NOTA ordine: gli entry specifici PRIMA del prefisso generico "groq/"

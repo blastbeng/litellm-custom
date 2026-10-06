@@ -144,12 +144,12 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model` → `small-model`, all 131072).
+(`synthetic/*` → `local-model` → `small-model`, all 196608).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
 `max_completion_tokens`) to `context − prompt`, and — when the request
 carries a fallback chain — to the **smallest context in the chain**: the
-budget must fit every target, including `small-model` (131072), the final
+budget must fit every target, including `small-model` (196608), the final
 fallback of every model. The pre-call hook runs **once
 per client request** (`proxy/utils.py`), not once per fallback attempt, so the
 budget computed on the requested model is **inherited by every fallback
@@ -183,8 +183,9 @@ prompt alone saturates the context the clamp is useless — there is no room
 left for the answer — and the **overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
-aligned with `model_info.max_input_tokens` in `config.yaml`** (131072 for
-`local-model`, `small-model`, `synthetic/*`, `inference4free/*` — and for
+aligned with `model_info.max_input_tokens` in `config.yaml`** (196608 since
+2026-10-06 for `local-model`, `small-model`, `synthetic/*`, `inference4free/*`
+— previously 131072, capped by the local hardware; still 131072 for
 `groq/openai/gpt-oss-120b` / `-20b`, whose real Groq context is 131072 even
 though the `groq/*` wildcard declares 262144 as the ceiling for its largest
 model; 16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`,
@@ -237,7 +238,7 @@ cached 10 min; if a listing is unreachable the pattern itself is kept as a
 fallback (tolerant gateways accept it). The fixed lists only set the
 *preferred order*; models whose mapped context cannot hold
 `chunk + output + margin` are filtered out (so a 240k body is never handed to
-a 131k model — note `groq/openai/gpt-oss-120b`/`-20b` are 131072 for real),
+a 192k model — note `groq/openai/gpt-oss-120b`/`-20b` are 131072 for real),
 non-chat models (`embed`, `whisper`, `guard`, `rerank` substrings) are
 excluded, and **every fitting worker** is attempted within a per-level **time
 budget** (`WORKER_TIME_BUDGET_S = 420`, checked before each attempt) with
@@ -339,13 +340,14 @@ without restarting anything. `trust/` contains **only** the public bundle —
 
 ### Note on llama-server (local model)
 
-The context reported by `llama-server` is **`--ctx-size / -np`**: with
-`-np 2` and `--ctx-size 262144` each slot exposes 131072 tokens, and the
-upstream rejects oversized requests with its own 400 (see
-**Context clamp** above). With `-np 1` the full context is available (262144),
-consistent with `model_info` in config. A context flip 262144 ↔ 131072 must be
-kept in sync in **three** places: `config.yaml` (`model_info`),
-`config.example.yaml`, and `CONTEXT_BY_PREFIX` in `reasoning_clamp.py`.
+The context reported by `llama-server` is **`--ctx-size / -np`**: each slot
+exposes `--ctx-size / -np` tokens (since 2026-10-06 **196608** per slot, was
+131072 before — the local hardware cap that forced every chain-aligned
+context down), and the upstream rejects oversized requests with its own 400
+(see **Context clamp** above), consistent with `model_info` in config. A
+context flip must be kept in sync in **three** places: `config.yaml`
+(`model_info`), `config.example.yaml`, and `CONTEXT_BY_PREFIX` in
+`reasoning_clamp.py`.
 
 **Note on 5-minute client timeouts (AiderDesk and similar AI-SDK clients).**
 `Headers Timeout Error` after exactly 5 minutes is **not litellm**: litellm's
