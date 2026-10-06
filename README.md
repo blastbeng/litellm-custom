@@ -212,9 +212,25 @@ body with the **tiktoken** estimate (not the conservative dense ratio): a
 marginal compactor that 400s costs one failover round, while over-filtering
 would skip B entirely and drop the request to the lossy C tier.
 
+**Cost-tier ordering** (2026-10-06 request: free models first, then cheap,
+then the rest — dynamically): the pool is sorted by **(cost tier,
+preference)**, so the preference lists decide only the order *inside* a
+tier. **Tier 0 — free**: `inference4free/*`, `openrouter/free`, any id with
+the OpenRouter `:free` suffix, models whose gateway `/models` listing
+declares a zero price (captured live during wildcard expansion — a provider
+listing a new free model is picked up without code changes), and the local
+hardware models (`small-model`, `local-model` — own GPU, zero cost).
+**Tier 1 — cheap**: name patterns `gpt-oss`, `flash-lite`, `gemma`,
+`syn:small`, `qwen`, `nano`, `-mini` (with the dash: `gemini` *contains* the
+string `mini`, which would classify every Gemini as cheap). **Tier 2 —
+everything else** (gemini-2.5-flash, deepseek, claude, gpt-5, …), ordered by
+the level's preference list. Because the classification is price/brand/
+pattern based rather than a closed id list, delisted models drop out via the
+10-minute listing cache and newly listed ones join automatically.
+
 | Level | What it does | Lossy? |
 |---|---|---|
-| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in big-context preference order (`COMPACTOR_MODELS`: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, then the rest), 45 s each, no retries, no fallbacks. | Faithful summary |
+| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in cost-tier order (free → cheap → paid; inside a tier `COMPACTOR_MODELS` first: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, then the rest of the tier), 45 s each, no retries, no fallbacks. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
 | **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
 | **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised through the dynamic worker pool (180 s each), partials re-placed before the current request. | Yes |

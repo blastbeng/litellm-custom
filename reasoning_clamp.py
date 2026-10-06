@@ -245,7 +245,9 @@ COMPRESS_TARGET_RATIO = 0.55   # C: target = 55% del contesto (margine risposta)
 # T/E: ordine PREFERITO degli operari di riassunto (piccoli/veloci prima).
 # Il pool REALE e' dinamico (_worker_pool): OGNI modello configurato su
 # litellm (wildcard inclusi, es. inference4free/*) entra nel pool se il suo
-# contesto contiene il chunk; i preferiti decidono SOLO l'ordine.
+# contesto contiene il chunk; l'ordine PRIMARIO e' il tier di costo
+# (gratis -> economico -> costoso, vedi _model_tier) e i preferiti decidono
+# SOLO l'ordine DENTRO ogni tier.
 SUMMARIZER_PREFERRED = (
     "small-model",
     "groq/openai/gpt-oss-20b",
@@ -263,6 +265,45 @@ SUMMARIZER_PREFERRED = (
 # 400 (embedding/whisper/guard/rerank non sono completations testuali)
 NON_CHAT_WORKER_SUBSTRINGS = ("embed", "whisper", "guard", "rerank")
 MAX_WORKERS_TRIED = 4          # operari distinti provati prima di arrendersi
+
+# TIER DI COSTO per l'ordine del pool (richiesta utente 2026-10-06: prima i
+# GRATIS, poi gli ECONOMICI, per ultimi i costosi). Classificazione DINAMICA:
+# i provider delistano/listano modelli continuamente, quindi niente elenchi
+# chiusi di id - il tier si deduce dal PREZZO del listing del gateway quando
+# c'e' (hint), dalla convenzione ':free' e dal brand del provider, e dal nome
+# per gli economici noti. _worker_pool ordina per (tier, preferenza): le
+# liste preferred di B e T/E decidono solo l'ordine DENTRO ogni tier.
+TIER_FREE = 0    # inference4free/*, openrouter/free, id ":free", listing a
+                 # prezzo zero, modelli locali (propria hardware = costo zero)
+TIER_CHEAP = 1   # gpt-oss, flash-lite, gemma, syn:small:text, qwen, mini...
+TIER_PAID = 2    # tutto il resto (gemini-flash, deepseek, claude, gpt-5...)
+# NB "-mini" col trattino: "gemini" CONTIENE "mini" e classificherebbe
+# tutti i Gemini come economici
+CHEAP_PATTERNS = ("gpt-oss", "flash-lite", "gemma", "syn:small",
+                  "qwen", "nano", "-mini")
+_TIER_HINTS = {}  # id dal listing -> TIER_FREE, scritto da
+                  # _fetch_pattern_models quando il listing dichiara prezzo 0
+
+
+def _model_tier(n):
+    """Tier di costo di un modello: 0 gratis, 1 economico, 2 costoso.
+    Segnali in ordine: hint di prezzo dal listing del gateway (dinamico,
+    copre i modelli nuovi gratis), convenzione ':free' di OpenRouter,
+    brand del provider (inference4free), hardware locale, pattern di nome
+    per gli economici noti. Tutto il resto finisce nel tier costoso."""
+    s = str(n)
+    if _TIER_HINTS.get(s) == TIER_FREE:
+        return TIER_FREE
+    if ":free" in s:
+        return TIER_FREE
+    if s.startswith("inference4free/") or s == "openrouter/free":
+        return TIER_FREE
+    if s in ("small-model", "local-model"):
+        return TIER_FREE
+    low = s.lower()
+    if any(p in low for p in CHEAP_PATTERNS):
+        return TIER_CHEAP
+    return TIER_PAID
 
 # ESPANSIONE WILDCARD -> nomi concreti (listing dei gateway, cache TTL).
 # Il model_list di litellm contiene pattern ("groq/*"): per una chiamata
@@ -320,7 +361,21 @@ def _fetch_pattern_models(name):
             mid = str(m.get("id") or "").strip()
             if not mid:
                 continue
-            out.append(mid if mid.startswith(prefix) else prefix + mid)
+            full = mid if mid.startswith(prefix) else prefix + mid
+            out.append(full)
+            # hint di tier dal PREZZO del listing (formato OpenRouter:
+            # pricing.prompt/completion "0" = gratis, "-1"/assente = ignoro):
+            # un nuovo modello gratuito listato dal provider entra nel tier
+            # FREE senza toccare il codice (classificazione dinamica)
+            pr = m.get("pricing") if isinstance(m, dict) else None
+            if isinstance(pr, dict):
+                try:
+                    cost = (float(pr.get("prompt") or 0)
+                            + float(pr.get("completion") or 0))
+                except (TypeError, ValueError):
+                    cost = None
+                if cost == 0:
+                    _TIER_HINTS[full] = TIER_FREE
             if len(out) >= WILDCARD_MAX_MODELS:
                 break
         return out
@@ -747,9 +802,14 @@ class ReasoningClamp(CustomLogger):
     def _worker_pool(self, needed_tokens, preferred, output_tokens=MAP_OUTPUT_TOKENS):
         """OGNI modello configurato su litellm che puo' contenere
         `needed_tokens` di input (+ output + margine), ordinato per
-        preferenza. Richiesta utente 2026-10-06: "cascade model selection,
-        exploit ANY possible litellm configured model, even the ones hosted
-        by inference4free" - niente piu' liste chiude di operari.
+        (tier di costo, preferenza): prima i modelli GRATIS
+        (inference4free, openrouter/:free, listing a prezzo zero, locali),
+        poi gli ECONOMICI (gpt-oss, flash-lite, gemma, syn:small...),
+        per ultimi i costosi - richiesta utente 2026-10-06. La lista
+        `preferred` ordina solo DENTRO il tier. Richiesta utente
+        2026-10-06: "cascade model selection, exploit ANY possible
+        litellm configured model, even the ones hosted by
+        inference4free" - niente piu' liste chiude di operari.
         I WILDCARD della model_list (groq/*, gemini/*, ...) vengono ESPASI
         nei nomi concreti richiedibili via listing del gateway (cache TTL):
         chiamare acompletion col nome letterale "groq/*" manderebbe
@@ -775,7 +835,10 @@ class ReasoningClamp(CustomLogger):
             return len(preferred)
 
         budget = needed_tokens + output_tokens + self._margin(needed_tokens)
-        return [n for n in sorted(names, key=rank)
+        # tier di costo PRIMARIO, preferenza del livello secondaria: il pool
+        # e' gratis -> economico -> costoso a prescindere dalle liste preferred
+        return [n for n in sorted(
+                    names, key=lambda n: (_model_tier(n), rank(n)))
                 if not any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS)
                 and self._context_for(n) >= budget]
 
