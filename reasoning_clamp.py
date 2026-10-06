@@ -140,6 +140,7 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 (montato in /app/reasoning_clamp.py, vedi docker-compose.yml).
 """
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -204,15 +205,28 @@ CONTEXT_BY_PREFIX = (
 DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
 MIN_OUTPUT_TOKENS = 1024  # sotto questo una risposta reasoning non e' utile
 SAFETY_MARGIN = 1024      # margine per l'errore della stima
+# F-EVIT: ultima spiaggia prima del 413 - se il PROMPT da solo ci sta
+# (est <= ctx) ma la stanza residua e' piccola, si forza un max_tokens
+# ridotto e la richiesta PARTE: l'upstream accorcia (fit_max_tokens su
+# Strata, llama-swap auto-limita). Sotto questa soglia di output non ha
+# senso partire -> 413 vero.
+MIN_FORCED_OUTPUT = 256
 CHARS_PER_TOKEN = 2.8     # conservativo per llama (codice, CJK, JSON)
 PER_MESSAGE_OVERHEAD = 8  # role/framing per messaggio (ChatML)
 # SCHEMI TOOL: NON sono nel conteggio characters/dei messaggi e l'upstream li
 # mette nel prompt: misurato su Strata, 18 schemi OpenAI = +1403 token REALI
 # (~80/schema). Un client agentico (AiderDesk) ne manda decine: non contarli
 # e' una sottostima sistematica di migliaia di token -> il clamp lascia un
-# max_tokens che l'upstream rifiuta. Il JSON schema e' denso di simboli:
-# ratio piu' basso della prosa + framing per-tool.
-TOOLS_CHARS_PER_TOKEN = 2.2
+# max_tokens che l'upstream rifiuta. CONTEGGIO: tiktoken (cl100k, via
+# _tools_tiktoken, CACHE sha1 - gli schemi sono identici a ogni richiesta)
+# SE e SOLO SE viene BASSO del ratio; il ratio resta solo fallback (tiktoken
+# assente) e floor del framing per-tool. INCIDENTE 2026-10-06: ~100 schemi
+# MCP (~250k char) stimati /2.2 = ~110-120k token contro ~70-85k REALI
+# (tokenizer litellm su C: 71796) -> la cascata B/E non muoveva piu' la
+# stima (gli schemi restano verbatim) e il 413 partiva con il prompt che
+# INVECE ci stava (est 126805 <= 131072): i 2.2 erano calibrati su 18
+# piccoli schemi Strata e sovrastimano ~2x sui grandi schemi MCP.
+TOOLS_CHARS_PER_TOKEN = 3.0
 TOOL_FIXED_TOKENS = 32
 # IMMAGINI: content list con image_url/image - costo fisso conservativo
 # (le immagini multi-tile di llama.cpp possono valere piu' di 1000 token)
@@ -562,6 +576,45 @@ def _tiktoken_estimate(texts):
         return None
 
 
+# cache dei conteggi tiktoken degli SCHEMI TOOLS: chiave = sha1 del testo
+# unito. I client agentici rimandano GLI STESSI schemi a ogni richiesta
+# (decine/centinaia di kB rivalutati a ogni chiamata): dopo la prima il
+# conteggio e' O(1). Poche entrate (una per set di schemi), svuotata se
+# cresce troppo.
+_TOOLS_CACHE = {}
+
+
+def _tools_tiktoken(tool_texts):
+    """Conteggio tiktoken dei SOLI schemi tools (cl100k, nessun
+    moltiplicatore: su JSON denso cl100k conta grossomodo quanto il
+    tokenizer llama, spesso MENO - e' il candidato basso del min col
+    ratio, vedi TOOLS_CHARS_PER_TOKEN). CACHE sha1: schemi identici a
+    ogni richiesta -> conteggio O(1) dopo la prima. None se tiktoken non
+    e' disponibile (resta il solo ratio)."""
+    if not tool_texts:
+        return 0
+    global _TIKTOKEN_ENC, _TIKTOKEN_FAILED
+    if _TIKTOKEN_FAILED:
+        return None
+    try:
+        if _TIKTOKEN_ENC is None:
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        key = hashlib.sha1(
+            "\n".join(tool_texts).encode("utf-8", "replace")).hexdigest()
+        n = _TOOLS_CACHE.get(key)
+        if n is None:
+            n = sum(len(_TIKTOKEN_ENC.encode(t, disallowed_special=()))
+                    for t in tool_texts)
+            if len(_TOOLS_CACHE) > 8:
+                _TOOLS_CACHE.clear()
+            _TOOLS_CACHE[key] = n
+        return n
+    except Exception:
+        _TIKTOKEN_FAILED = True
+        return None
+
+
 class ReasoningClamp(CustomLogger):
 
     def _context_for(self, model):
@@ -577,18 +630,28 @@ class ReasoningClamp(CustomLogger):
 
         Ratio adattivo per pezzo (densita', vedi _chars_per_token) e max()
         con tiktoken sui soli prompt grandi. Conta ANCHE gli schemi
-        tools/functions (messi nel prompt dall'upstream: 18 schemi Strata =
-        1403 token REALI) e le immagini."""
+        tools/functions (tiktoken cachato sha1 quando viene piu' BASSO del
+        ratio: il vecchio /2.2 sovrastimava ~2x i ~100 schemi MCP di
+        AiderDesk -> falsi 413, incidente 2026-10-06) e le immagini."""
         msgs = data.get("messages") or []
-        # tools/functions: schemi JSON, ratio piu' denso della prosa
+        # tools/functions: MIN fra tiktoken (cachato sha1, spesso piu'
+        # basso sul JSON denso) e il ratio; mai il contrario - non si
+        # sottostima mai, ma il vecchio ratio /2.2 SOVRASTIMAVA ~2x i
+        # grandi schemi MCP (incidente 2026-10-06, vedi la costante)
         schemas = data.get("tools") or data.get("functions") or []
-        tool_tokens = 0
+        tool_texts = []
         for t in schemas:
             try:
                 j = t if isinstance(t, str) else json.dumps(t)
             except Exception:
                 j = str(t)
-            tool_tokens += int(len(j) / TOOLS_CHARS_PER_TOKEN) + TOOL_FIXED_TOKENS
+            tool_texts.append(j)
+        fixed = TOOL_FIXED_TOKENS * len(tool_texts)
+        tool_tokens = (sum(int(len(j) / TOOLS_CHARS_PER_TOKEN)
+                           for j in tool_texts) + fixed)
+        tk = _tools_tiktoken(tool_texts)
+        if tk is not None and tk + fixed < tool_tokens:
+            tool_tokens = tk + fixed
         texts = []
         images = 0
         for m in msgs:
@@ -614,7 +677,10 @@ class ReasoningClamp(CustomLogger):
                 if isinstance(v, str):
                     texts.append(v)
             if m.get("tool_calls"):
-                texts.append(str(m["tool_calls"]))
+                try:
+                    texts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
+                except Exception:
+                    texts.append(str(m["tool_calls"]))
         est = sum(int(len(t) / _chars_per_token(t)) for t in texts)
         chars = sum(len(t) for t in texts)
         if chars >= TIKTOKEN_MIN_CHARS:
@@ -710,6 +776,40 @@ class ReasoningClamp(CustomLogger):
                 data[k] = int(budget)
                 print(f"[reasoning_clamp] {model}: {k} {cur} -> {int(budget)} "
                       f"(ctx {ctx}, prompt ~{est} tok stimati)", flush=True)
+
+    def _force_output(self, data, model, est):
+        """F-EVIT: max_tokens forzato alla stanza residua. Vale SOLO quando
+        il PROMPT da solo ci sta (est <= ctx, controllo nel chiamante). Il
+        vecchio _clamp_output si rifiutava sotto MIN_OUTPUT_TOKENS e la
+        richiesta restava senza NESSUN percorso (incidente 2026-10-06:
+        est 126805 <= 131072 ma budget 4267 - marginale - < 1024 -> 413
+        assurdo mentre l'upstream Strata con fit_max_tokens avrebbe
+        accettato e accorciato il completamento da solo). Qui NIENTE
+        margine percentuale (e' proprio il caso in cui la stima e' oltre
+        la stanza): solo SAFETY_MARGIN piatto. False se nemmeno
+        MIN_FORCED_OUTPUT ci sta -> al chiamante il 413 vero."""
+        keys = [k for k in MAX_TOKEN_KEYS
+                if isinstance(data.get(k), (int, float)) and data[k] > 0]
+        ctx = self._context_for(model)
+        chain = data.get("fallbacks")
+        if isinstance(chain, list) and chain:
+            # stessa regola di _clamp_output: deve starci ANCHE sull'ultimo
+            # target della catena di fallback
+            ctx = min([ctx] + [self._context_for(str(t)) for t in chain])
+        room = ctx - est - SAFETY_MARGIN
+        if room < MIN_FORCED_OUTPUT:
+            return False
+        if not keys:
+            # niente tetto dal client: l'upstream auto-limita (llama-swap)
+            return True
+        for k in keys:
+            cur = int(data[k])
+            if cur > room:
+                data[k] = int(room)
+                print(f"[reasoning_clamp] {model}: {k} {cur} -> {int(room)} "
+                      f"(FORZATO, ctx {ctx}, prompt ~{est} tok stimati)",
+                      flush=True)
+        return True
 
     # ---------------- B: compattazione con un modello da 262k ----------------
 
@@ -1136,7 +1236,19 @@ class ReasoningClamp(CustomLogger):
                 print(f"[reasoning_clamp] {model}: cascata risolta da {name} "
                       f"(~{est} tok, contesto {ctx})", flush=True)
                 return data
-        # F: nessun livello ha liberato spazio
+        # F: nessun livello ha liberato spazio. Se il PROMPT da solo ci sta
+        # (est <= ctx) NON e' un prompt_too_large: e' solo la stanza residua
+        # che e' piccola. Il 413 e' deterministico e uccide OGNI retry del
+        # client; un 400 dell'upstream invece cade nella catena di fallback
+        # (e Strata ha fit_max_tokens). Si forza un max_tokens ridotto e la
+        # richiesta PARTE (incidente 2026-10-06: est 126805 <= 131072 con
+        # ~72k reali secondo il tokenizer di litellm -> 413 falso, il
+        # prompt c'entrava con ~54k di margine).
+        if est <= ctx and self._force_output(data, model, est):
+            print(f"[reasoning_clamp] {model}: F evitato - prompt ~{est} tok "
+                  f"ci sta nel contesto {ctx}: max_tokens alla stanza "
+                  f"residua, richiesta parte ({'|'.join(tried)})", flush=True)
+            return data
         return self._overflow(data, model, est, tried)
 
     def _apply(self, data):
