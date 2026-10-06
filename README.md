@@ -164,11 +164,19 @@ plus per-message overhead, **tool schemas**, images, and a **fixed +
 proportional safety margin** (1024 + 3% of the estimate). Overestimating is
 safe (shorter completion), underestimating produces the upstream 400.
 Measured on real ~100k-token transcripts `chars / 2.8` alone lands ~1.4–1.8%
-below the upstream count and tool schemas are worth ~80 tokens each — the old
-fixed margin lost there and the clamp handed out a `max_tokens` the upstream
-refused (2026-10-06 incident, issue #545 text). For very large payloads
-(≥ 150k chars) `tiktoken cl100k_base` is consulted as a second opinion and the
-**larger** of the two estimates wins. On the opposite side, the old flat
+below the upstream count and small tool schemas are worth ~80 tokens each —
+the old fixed margin lost there and the clamp handed out a `max_tokens` the
+upstream refused (2026-10-06 incident, issue #545 text). For very large
+payloads (≥ 150k chars) `tiktoken cl100k_base` is consulted as a second
+opinion and the **larger** of the two estimates wins. **Tool schemas** (the
+other 2026-10-06 false 413) are counted with `tiktoken` **when it comes out
+lower** than the ratio — `min(ratio, tiktoken)`: never an underestimate, but
+the old `chars / 2.2` (calibrated on 18 tiny Strata schemas) over-counted the
+~100 big MCP schemas of AiderDesk ~2× (est 126,805 vs 71,796 real), the
+cascade could not shrink the estimate (schemas stay verbatim in every level)
+and F fired although the prompt alone fit. The schema count is **sha1-cached**
+(identical across requests → O(1) after the first) and the ratio fallback is
+now 3.0. On the opposite side, the old flat
 `chars / 2.8` over-counted prose transcripts ~2× (est 171k vs 87.8k real) and
 triggered the cascade spuriously — the density ratio fixes that too. If the
 prompt alone saturates the context the clamp is useless — there is no room
@@ -246,7 +254,7 @@ listing cache and newly listed ones join automatically.
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
 | **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
 | **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised through the dynamic worker pool (180 s each), partials re-placed before the current request. | Yes |
-| **F** | Nothing freed space → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`) instead of firing the request and letting it die on the fallback chain. | — |
+| **F** | Nothing freed space → if the **prompt alone fits** (`est ≤ context`) this is *not* a `prompt_too_large`: `max_tokens` is **forced to the room left** (`context − est − 1024`, flat margin, floor `MIN_FORCED_OUTPUT = 256` — below it the real 413 stands) and the request **is sent**: our 413 was deterministic and killed every client retry, while an upstream 400 is recoverable through the fallback chain and Strata shortens the completion itself (`fit_max_tokens`). Only when the prompt genuinely exceeds the context → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`). | — |
 
 **Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
 verbatim, so if the tail saturates the context *by itself* those levels cannot
