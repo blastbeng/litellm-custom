@@ -292,13 +292,20 @@ listing cache and newly listed ones join automatically.
 | **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in cost-tier order (free → cheap → paid; inside a tier `COMPACTOR_MODELS` first: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, then the rest of the tier), 45 s each, no retries, no fallbacks. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
 | **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
+| **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate fits; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |
 | **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised through the dynamic worker pool (180 s each), partials re-placed before the current request. | Yes |
 | **F** | Nothing freed space → if the **prompt alone fits** (`est ≤ context`) this is *not* a `prompt_too_large`: `max_tokens` is **forced to the room left** (`context − est − 1024`, flat margin, floor `MIN_FORCED_OUTPUT = 256` — below it the real 413 stands) and the request **is sent**: our 413 was deterministic and killed every client retry, while an upstream 400 is recoverable through the fallback chain and Strata shortens the completion itself (`fit_max_tokens`). Only when the prompt genuinely exceeds the context → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`). | — |
 
 **Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
 verbatim, so if the tail saturates the context *by itself* those levels cannot
-help — the cascade tries only T, then goes straight to F, avoiding guaranteed
-useless cloud calls.
+help — the cascade tries only T and T2, then goes straight to F, avoiding
+guaranteed useless cloud calls.
+
+Static per-model contexts: synthetic models are explicit entries in
+`config.yaml`, and `CONTEXT_BY_PREFIX` mirrors their real windows exactly
+(`syn:large:*` 524 288, `syn:small:text` 196 608, `syn:small:vision` 262 144,
+…), matched by exact id before the group floor — the clamp no longer depends
+on a completed listing sweep to know a synthetic model's true context.
 
 What is preserved at every level: the **system** messages verbatim, and the
 **tail from the last `user` message onward** verbatim (cutting there keeps the

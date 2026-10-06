@@ -188,14 +188,37 @@ SYN_EMBED_FALLBACKS = ["embedding-model"]
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
     # locali: 196608 dal 2026-10-06 (prima 131072: cappati a 128k lato
-    # llama-server). synthetic/inference4free: 131072 = MINIMO vero del
-    # gruppo (eterogenei: synthetic 131k..512k, inference4free 10k..1M - un
-    # wildcard non puo' dichiarare un unico contesto vero): il REALE
+    # llama-server). synthetic: i 13 modelli sono entry ESPLICITE in config
+    # dal 2026-10-06 -> qui sotto i contesti REALI per-modello (misurati sui
+    # listing di api.synthetic.new). INCIDENTE 2026-10-06: GLM-5.3-Flash
+    # valeva 131072 (floor di gruppo) mentre il reale e' 524288 -> cascata
+    # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
+    # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
+    # tabella statica ora e' vera per-modello e non dipende dal daemon.
+    # inference4free: 131072 = MINIMO vero del gruppo (eterogeneo 10k..1M -
+    # un wildcard non puo' dichiarare un unico contesto vero): il REALE
     # per-modello arriva dal listing (_DYN_CTX via _window_for)
     ("local-model", 196608),
     ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
-    ("synthetic/", 131072),
+    # --- synthetic, contesti REALI per-modello. Match ESATTO via
+    # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti
+    # "GLM-5.3" catturerebbe anche "-Flash" a prescindere dall'ordine).
+    # Allineati a config(.example).yaml: cambiati li' -> cambiare qui.
+    ("synthetic/syn:large:text", 524288),
+    ("synthetic/syn:large:vision", 524288),
+    ("synthetic/syn:small:text", 196608),
+    ("synthetic/syn:small:vision", 262144),
+    ("synthetic/hf:zai-org/GLM-5.3", 524288),
+    ("synthetic/hf:zai-org/GLM-5.3-Flash", 524288),
+    ("synthetic/hf:zai-org/GLM-4.7-Flash", 196608),
+    ("synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash", 524288),
+    ("synthetic/hf:moonshotai/Kimi-K3", 524288),
+    ("synthetic/hf:Qwen/Qwen3.8-27B", 262144),
+    ("synthetic/hf:openai/gpt-oss-120b", 131072),
+    ("synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 262144),
+    ("synthetic/hf:nomic-ai/nomic-embed-text-v1.5", 8192),
+    ("synthetic/", 131072),  # floor per id synthetic NON in tabella
     ("inference4free/", 131072),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
@@ -402,6 +425,7 @@ _PROXY_MODELS_STARTED = [False]
 # listing litellm /v1/models NON porta i campi contesto per questi provider
 # (get_valid_models espande solo gli id): il clamp e il pool leggono QUI.
 _DYN_CTX = {}                  # id pubblico -> finestra (int)
+_SWEEP_SEEN = [False]          # primo sweep contesti riuscito (log una volta)
 
 
 def _fetch_proxy_models():
@@ -485,7 +509,11 @@ def _fetch_explicit_contexts(deployments):
                           urllib.request.ProxyHandler({})))
             with opener.open(req, timeout=WILDCARD_LIST_TIMEOUT_S) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
-        except Exception:
+        except Exception as exc:
+            # gap osservabilita' incidente 2026-10-06: il fallimento del
+            # listing era MUTO e i contesti restavano sui valori statici
+            print(f"[reasoning_clamp] listing {base} non disponibile "
+                  f"({type(exc).__name__}: {str(exc)[:120]})", flush=True)
             continue
         for m in (data.get("data") or []):
             if not isinstance(m, dict):
@@ -545,6 +573,9 @@ def _refresher_proxy_models():
         # _fetch_explicit_contexts (synthetic dal 2026-10-06). Alimenta
         # _DYN_CTX per clamp/pool: anche il modello MAIN ha cosi' il suo
         # contesto REALE dal vivo senza aspettare la prima cascata
+        # sweep VISIBILE (gap osservabilita' incidente 2026-10-06: il sweep
+        # dei contesti era muto). Si stampa solo al primo successo e quando
+        # il numero di contesti cambia - il daemon gira ogni TTL, niente spam
         try:
             from litellm.proxy.proxy_server import llm_router
             wildcards = []
@@ -557,12 +588,21 @@ def _refresher_proxy_models():
                     wildcards.append(n)
                 elif n:
                     explicit.append(dep)
+            n_ctx = len(_DYN_CTX)
             for w in wildcards:
                 _fetch_pattern_models(w)
             if explicit:
                 _fetch_explicit_contexts(explicit)
-        except Exception:
-            pass
+            if len(_DYN_CTX) != n_ctx or not _SWEEP_SEEN[0]:
+                print(f"[reasoning_clamp] sweep contesti: "
+                      f"{len(_DYN_CTX)} voci in _DYN_CTX "
+                      f"({len(wildcards)} wildcard, {len(explicit)} "
+                      f"deployment espliciti)", flush=True)
+                _SWEEP_SEEN[0] = True
+        except Exception as exc:
+            if not _SWEEP_SEEN[0]:
+                print(f"[reasoning_clamp] sweep contesti non riuscito: "
+                      f"{type(exc).__name__}", flush=True)
         # primo aggancio mancato (proxy in avvio): ritento presto, non tra 10'
         time.sleep(PROXY_MODELS_TTL_S
                    if (got or _PROXY_MODELS_CACHE["models"]) else 30)
@@ -784,6 +824,17 @@ TAIL_HEADER = (
     "compressa: inizio e fine sono VERBATIM, il mezzo e' riassunto qui "
     "sotto in modo fedele]\n"
 )
+# T2: compressione dei messaggi DOPO l'ultimo user (risultati tool,
+# assistant). B/C/E tengono la coda verbatim e T tocca SOLO il mezzo
+# dell'ultimo user: INCIDENTE 2026-10-06 coda 126640 tok ma ultimo user
+# 842 -> T "tail-too-small", B/C/E fermi, 413 assicurato.
+T2_MAX_MESSAGES = 12    # tetto di messaggi compressi in una passata
+T2_TIME_BUDGET_S = 420  # budget TOTALE di wall-time della passata (TTL)
+T2_HEADER = (
+    "[NOTA: questo messaggio (lungo, tipicamente un risultato tool) e' "
+    "stato COMPRESSO dal proxy per rientrare nel contesto: qui sotto un "
+    "riassunto fedele del contenuto originale]\n"
+)
 
 COMPACT_SYSTEM_PROMPT = (
     "You compress conversation context for a coding agent. Rewrite the "
@@ -930,12 +981,18 @@ def _tools_tiktoken(tool_texts):
 class ReasoningClamp(CustomLogger):
 
     def _context_for(self, model):
-        """STATICo: mappa allineata a config(.example).yaml - valore MINIMO
-        vero per tutto il gruppo wildcard (i gruppi eterogenei non possono
-        dichiarare un unico contesto vero). Per il contesto REALE usare
-        _window_for."""
+        """STATICo: mappa allineata a config(.example).yaml - per i gruppi
+        wildcard senza tabella per-modello e' il valore MINIMO vero del
+        gruppo. Per il contesto REALE usare _window_for. DUE passate:
+        prima l'uguaglianza ESATTA (entry per-modello), poi il prefisso -
+        con un matcher singolo "synthetic/hf:zai-org/GLM-5.3" catturerebbe
+        anche "...GLM-5.3-Flash" via startswith, a prescindere dall'ordine
+        della tabella."""
         for pref, ctx in CONTEXT_BY_PREFIX:
-            if model == pref.rstrip("/") or model.startswith(pref):
+            if model == pref.rstrip("/"):
+                return ctx
+        for pref, ctx in CONTEXT_BY_PREFIX:
+            if model.startswith(pref):
                 return ctx
         return DEFAULT_CONTEXT
 
@@ -1480,6 +1537,71 @@ class ReasoningClamp(CustomLogger):
               flush=True)
         return data, f"tail:{len(chunks)}"
 
+    # ---------------- T2: compressione dei messaggi DOPO l'ultimo user -----
+
+    async def _compress_tail_messages(self, data, model, est):
+        """Livello T2 (incidente 2026-10-06: coda 126640 tok ma ultimo user
+        842 - T esce "tail-too-small", B/C/E tengono la coda verbatim, F
+        413). Comprime IN PLACE i messaggi DOPO l'ultimo messaggio user
+        (risultati tool / assistant), il piu' grande prima, finche' la
+        stima rientra nel contesto. Viene sostituito SOLO il 'content'
+        testuale (T2_HEADER + riassunto dal pool dinamico): ruolo,
+        tool_call_id e tool_calls restano - un tool result orfanizzato
+        sarebbe un 400 del provider. TTL: T2_TIME_BUDGET_S totale per la
+        passata + budget per-chunk dentro _summarize_chunks; i guadagni
+        parziali restano (come i riassunti parziali del pool).
+        Ritorna (data, info) o (None, motivo)."""
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return None, "no-user-msg"
+        post = msgs[idx + 1:]
+        if not post:
+            return None, "no-post-user"
+        # candidati: content testuale abbastanza lungo da valere una chiamata
+        cand = []
+        for i, m in enumerate(post):
+            c = m.get("content")
+            if not isinstance(c, str) or len(c) < COMPACT_MIN_CHARS:
+                continue  # content list (vision) / vuoto / solo tool_calls
+            cand.append((self._estimate_subset([m], data), i))
+        if not cand:
+            return None, "nothing-compressible"
+        cand.sort(key=lambda t: (-t[0], t[1]))  # il piu' grande prima
+        ctx = self._window_for(model)
+        cur = self._estimate_prompt_tokens(data)
+        if not self._saturated(cur, ctx):
+            return None, "already-fits"
+        deadline = time.monotonic() + T2_TIME_BUDGET_S
+        new_msgs = list(msgs)
+        base = idx + 1
+        done = 0
+        for _, i in cand:
+            if (not self._saturated(cur, ctx)
+                    or done >= T2_MAX_MESSAGES
+                    or time.monotonic() >= deadline):
+                break
+            m = post[i]
+            chunks = self._chunk_for_map(m["content"])
+            if not chunks:
+                continue
+            brief, info = await self._summarize_chunks(chunks, TAIL_ORIGIN, model)
+            if brief is None:
+                continue
+            new_msgs[base + i] = dict(m, content=T2_HEADER + brief)
+            data["messages"] = new_msgs  # progressivo: i guadagni restano
+            cur = self._estimate_prompt_tokens(data)
+            done += 1
+        if not done:
+            return None, "no-gain"
+        print(f"[reasoning_clamp] T2 {model}: {done} messaggi post-user "
+              f"compressi, stima ~{cur} tok (contesto {ctx})", flush=True)
+        return data, f"t2:{done}"
+
     # ---------------- E: map/reduce sul pool dinamico -----------------------
 
     def _chunk_for_map(self, body):
@@ -1540,8 +1662,9 @@ class ReasoningClamp(CustomLogger):
                 "hint": ("il prompt supera il contesto del modello e la "
                          "cascata di compattazione (B compattori a contesto "
                          "grande -> C compressione BM25 -> T split+compress "
-                         "della coda -> E map/reduce, tutti con failover sul "
-                         "pool dinamico dei modelli configurati) non ha "
+                         "della coda -> T2 compressione dei messaggi dopo "
+                         "l'ultimo user -> E map/reduce, tutti con failover "
+                         "sul pool dinamico dei modelli configurati) non ha "
                          "liberato spazio: riduci il contesto del client o "
                          "usa un modello con contesto maggiore"),
             },
@@ -1561,12 +1684,26 @@ class ReasoningClamp(CustomLogger):
         if not self._saturated(est, ctx):
             return data
         print(f"[reasoning_clamp] overflow {model}: ~{est} tok + "
-              f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata B/C/T/E",
-              flush=True)
+              f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata "
+              f"B/C/T/T2/E", flush=True)
+        if model not in _DYN_CTX:
+            # il contesto NON viene dal listing dinamico: o tabella statica
+            # per-modello (vera, ok) o floor di gruppo. Gap osservabilita'
+            # incidente 2026-10-06 (contesti statici usati senza saperlo)
+            with _PROXY_MODELS_LOCK:
+                mit = _PROXY_MODELS_CACHE["models"].get(model,
+                                                        (None, None))[0]
+            if mit is None:
+                print(f"[reasoning_clamp] ATTENZIONE {model}: contesto "
+                      f"{ctx} dalla TABELLA STATICA (listing dinamico non "
+                      f"ancora disponibile: sweep in corso o gateway "
+                      f"irraggiungibile)", flush=True)
         # La coda (dall'ultimo user in poi) resta verbatim in B/C/E: se
         # satura DA SOLA quei livelli non possono liberare spazio - solo T
-        # (che comprime il mezzo dell'ultimo messaggio user) puo' aiutare.
-        # Cosi' si evitano 3 chiamate cloud prima di un 413 assicurato.
+        # (mezzo dell'ultimo messaggio user) e T2 (messaggi DOPO l'ultimo
+        # user: INCIDENTE 2026-10-06, coda 126640 tok di cui 842 nell'ultimo
+        # user) possono aiutare. Cosi' si evitano 3 chiamate cloud prima di
+        # un 413 assicurato.
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         body_src, tail = self._split_tail(msgs)
         if tail:
@@ -1586,12 +1723,29 @@ class ReasoningClamp(CustomLogger):
                         print(f"[reasoning_clamp] {model}: cascata risolta "
                               f"da T (~{est} tok, contesto {ctx})", flush=True)
                         return data
+                # T non ha bastato (tipico: la massa e' nei tool result DOPO
+                # l'ultimo user, che T non tocca): T2 li comprime in place
+                try:
+                    new, info = await self._compress_tail_messages(
+                        data, model, est)
+                except Exception as e:
+                    new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
+                tried.append(f"T2:{info}")
+                if new is not None:
+                    est = self._estimate_prompt_tokens(data)
+                    self._clamp_output(data, model, est)
+                    if not self._saturated(est, ctx):
+                        print(f"[reasoning_clamp] {model}: cascata risolta "
+                              f"da T2 (~{est} tok, contesto {ctx})",
+                              flush=True)
+                        return data
                 # la coda resta verbatim anche per B/C/E: nessun aiuto
                 return self._overflow(data, model, est, tried)
         tried = []
         for name, fn in (("B", self._compact_with_provider),
                          ("C", self._compress_locally),
                          ("T", self._split_compress_tail),
+                         ("T2", self._compress_tail_messages),
                          ("E", self._map_reduce)):
             try:
                 if name == "C":
