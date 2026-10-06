@@ -16,10 +16,18 @@ model_list:
   #
   # Se il PROMPT da solo satura il contesto (prompt + 1024 + margine > C) il
   # clamp non basta: parte la CASCATA in reasoning_clamp.py - B compattazione
-  # con un modello da 262k disponibile, C compressione BM25
-  # (litellm.compression.compress, lossy), E map/reduce su small-model, poi
-  # 413 strutturato. I modelli con contesto >= 262144 sono anche i compattatori
-  # di B: togliere tutti i 262k dalla config toglie il livello B alla cascata.
+  # della storia, C compressione BM25 (litellm.compression.compress, lossy),
+  # T split+compress del MEZZO dell'ultimo messaggio user (inizio e fine
+  # verbatim), E map/reduce, poi 413 strutturato. B/T/E fanno chiamate LLM
+  # attraverso un POOL DINAMICO: OGNI modello configurato qui sotto entra nel
+  # pool (richiesta utente 2026-10-06: "exploit any possible litellm
+  # configured model", wildcard inference4free/* inclusi); COMPACTOR_MODELS e
+  # SUMMARIZER_PREFERRED in reasoning_clamp.py decidono SOLO l'ordine di
+  # preferenza, e i modelli il cui contesto non contiene chunk+output+margine
+  # vengono filtrati (un corpo da 240k non va mai a un modello da 131k).
+  # Togliere modelli dalla config toglie loro operari alla cascata; se non
+  # resta NESSUN modello capace, B/T/E falliscono subito e la cascata prosegue
+  # (o risponde 413) senza 400 a monte.
 
   # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
   # local-model e' il modello principale; small-model e' un modello autonomo

@@ -157,43 +157,80 @@ target**. The `litellm_params` defaults (`max_tokens`) are merged into every
 attempt **after** the hook (invisible to it): this is why the cloud
 wildcards carry **no** `max_tokens` default and `synthetic/*` is capped at
 32768.
-The prompt size is **estimated conservatively** (`chars / 2.8` + per-message
-overhead + **tool schemas** + images, plus a **fixed + proportional safety
-margin** — 1024 + 3% of the estimate): overestimating is safe (shorter
-completion), underestimating produces the upstream 400. Measured on real
-~100k-token transcripts `chars / 2.8` alone lands **~1.4–1.8% below** the
-upstream count and tool schemas are worth ~80 tokens each — the old fixed
-margin lost there and the clamp handed out a `max_tokens` the upstream
-refused (2026-10-06 incident, issue #545 text). If the prompt alone saturates
-the context the clamp is useless — there is no room left for the answer — and
-the **overflow cascade** below takes over.
+The prompt size is **estimated adaptively**: each message part gets a
+`chars / token` ratio derived from its symbol density — dense code/JSON 2.8,
+prose 4.6, CJK 1.5, mixed-with-base64 3.6 (linear interpolation in between) —
+plus per-message overhead, **tool schemas**, images, and a **fixed +
+proportional safety margin** (1024 + 3% of the estimate). Overestimating is
+safe (shorter completion), underestimating produces the upstream 400.
+Measured on real ~100k-token transcripts `chars / 2.8` alone lands ~1.4–1.8%
+below the upstream count and tool schemas are worth ~80 tokens each — the old
+fixed margin lost there and the clamp handed out a `max_tokens` the upstream
+refused (2026-10-06 incident, issue #545 text). For very large payloads
+(≥ 150k chars) `tiktoken cl100k_base` is consulted as a second opinion and the
+**larger** of the two estimates wins. On the opposite side, the old flat
+`chars / 2.8` over-counted prose transcripts ~2× (est 171k vs 87.8k real) and
+triggered the cascade spuriously — the density ratio fixes that too. If the
+prompt alone saturates the context the clamp is useless — there is no room
+left for the answer — and the **overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (131072 for
-`local-model`, `small-model`, `synthetic/*`, `inference4free/*`;
-16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`, `gemini/*`,
-`ollama-cloud/*`).
+`local-model`, `small-model`, `synthetic/*`, `inference4free/*` — and for
+`groq/openai/gpt-oss-120b` / `-20b`, whose real Groq context is 131072 even
+though the `groq/*` wildcard declares 262144 as the ceiling for its largest
+model; 16384 for `embedding-model`; 262144 for `openrouter/*`, `groq/*`,
+`gemini/*`, `ollama-cloud/*`). Specific entries are matched before generic
+prefixes.
 
-## Context overflow cascade (`B → C → E → 413`)
+## Context overflow cascade (`B → C → T → E → 413`)
 
 When `prompt + 1024 + margin > context` the request cannot fit **any** model in
 the chain, so shrinking `max_tokens` cannot save it: the prompt itself has to
 shrink. `async_pre_call_hook` then runs a cascade and, after each level,
-re-estimates the prompt and re-applies the clamp:
+re-estimates the prompt and re-applies the clamp.
+
+**Dynamic worker pool** (`_worker_pool`, 2026-10-06 request: "exploit any
+possible litellm configured model, even the ones hosted by inference4free"):
+every level that makes LLM calls builds its worker list **dynamically from
+`llm_router.model_list`** — every configured model is eligible, wildcards
+included. **Wildcard expansion**: `model_list` holds patterns (`groq/*`,
+`openrouter/*`, …), but an internal call with the literal pattern would send
+`model="*"` upstream and 400 — so each pattern is expanded into its
+**requestable concrete ids** from the gateway `/models` listing (same source
+as the config auto-import; direct upstreams get the prefix added here),
+cached 10 min; if a listing is unreachable the pattern itself is kept as a
+fallback (tolerant gateways accept it). The fixed lists only set the
+*preferred order*; models whose mapped context cannot hold
+`chunk + output + margin` are filtered out (so a 240k body is never handed to
+a 131k model — note `groq/openai/gpt-oss-120b`/`-20b` are 131072 for real),
+non-chat models (`embed`, `whisper`, `guard`, `rerank` substrings) are
+excluded, and up to `MAX_WORKERS_TRIED = 4` distinct workers are attempted
+with **sticky failover** (the first worker that answers keeps the remaining
+chunks; an error or empty answer advances to the next). B sizes its compaction
+body with the **tiktoken** estimate (not the conservative dense ratio): a
+marginal compactor that 400s costs one failover round, while over-filtering
+would skip B entirely and drop the request to the lossy C tier.
 
 | Level | What it does | Lossy? |
 |---|---|---|
-| **B** | Compact with an **available 262k model** (`groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, tried in order, 45 s each, no retries, no fallbacks). The 131072 local models are not used as compactors: the body barely fits in them. | Faithful summary |
+| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in big-context preference order (`COMPACTOR_MODELS`: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, then the rest), 45 s each, no retries, no fallbacks. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
-| **E** | Map/reduce: the body is cut into ≤ 90k-token chunks (max 8), each summarised by `small-model` (180 s each), the partials are re-placed before the current request. Last resort: lossy **and** it costs N calls on the local stack that is already under pressure. | Yes |
+| **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
+| **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised through the dynamic worker pool (180 s each), partials re-placed before the current request. | Yes |
 | **F** | Nothing freed space → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`) instead of firing the request and letting it die on the fallback chain. | — |
+
+**Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
+verbatim, so if the tail saturates the context *by itself* those levels cannot
+help — the cascade tries only T, then goes straight to F, avoiding guaranteed
+useless cloud calls.
 
 What is preserved at every level: the **system** messages verbatim, and the
 **tail from the last `user` message onward** verbatim (cutting there keeps the
 current tool exchanges intact — an orphaned `tool` result would 400).
 
-The cascade runs **only in the async hook** (B and E make LLM calls); the sync
-`pre_call_hook` applies policy + clamp only. Internal calls are marked with
+The cascade runs **only in the async hook** (B, T and E make LLM calls); the
+sync `pre_call_hook` applies policy + clamp only. Internal calls are marked with
 litellm's own `INTERNAL_CALL_ORIGIN_METADATA_KEY`, which is the recursion
 guard (a compaction call must never be compacted again) and keeps them out of
 spend logs, rate limits and cooldowns.

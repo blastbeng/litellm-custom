@@ -77,8 +77,11 @@ UNA sola volta per richiesta client (litellm unisce i litellm_params del
 deployment a ogni tentativo, fallback inclusi, SENZA ripassare dall'hook -
 verificato su router.py/fallback_event_handlers.py v1.104.0), quindi il
 tetto deve valere per ogni hop della catena. Stima CONSERVATIVA dei token
-del prompt (caratteri/2.8: sovrastimare e' sicuro, sottostimare produce il
-400 dell'upstream).
+del prompt: ratio caratteri/token ADATTIVO alla densita' del testo (2.8 per
+codice/JSON/CJK - sovrastimare e' sicuro, sottostimare produce il 400
+dell'upstream - fino a 4.6 per la prosa, dove il fisso 2.8 sovrastimava ~2x
+e metteva in cascata richieste che stavano nel contesto) con secondo parere
+tiktoken (gia' dentro litellm) sui soli prompt grandi.
 
 CASCATA OVERFLOW (richiesta utente 2026-10-02): quando il prompt da solo
 satura il contesto (prompt + MIN_OUTPUT_TOKENS + margine > contesto) il
@@ -86,11 +89,11 @@ clamp NON puo' aiutare - non c'e' spazio per la risposta - e la catena di
 fallback muore come nel log. In quel caso l'async hook riduce il PROMPT con
 una cascata a livelli, e dopo ogni livello riusa la stima per il clamp:
 
-  B  compattazione con un modello da 262k DISPONIBILE (i 131072 locali non
-     possono fare la compattazione: il corpo da compattare ci sta giusto a
-     malapena). Chiamata interna via llm_router, senza fallback e senza
-     retry; si passa al compattore successivo se uno fallisce/tiempo scaduto
-     o se il suo contesto non contiene il corpo.
+  B  compattazione della STORIA (tutto cio' che precede l'ultimo user, che
+     resta verbatim) con un modello a contesto grande. Chiamata interna
+     via llm_router, senza fallback e senza retry; si passa al compattore
+     successivo se uno fallisce/tiempo scaduto o se il suo contesto non
+     contiene il corpo.
   C  compressione DETERMINISTICA con litellm.compression.compress()
      (BM25: sostituisce i messaggi a bassa rilevanza con stub, protegge
      system/ultimo user/ultimo assistant, 0 chiamate LLM).
@@ -98,15 +101,32 @@ una cascata a livelli, e dopo ogni livello riusa la stima per il clamp:
      iniettato e la cache degli originali NON viene trattenuta: in questo
      stack non c'e' un agentic loop che lo serva, quindi lo stub e'
      PERSO (compressione lossy). E' il motivo per cui C viene DOPO B.
-  E  map/reduce: il corpo viene tagliato in chunk e riassunto da
-     small-model, poi le sintesi vengono ricomposte davanti alla richiesta
-     corrente (che resta fedele). Ultima spiaggia perche' e' lossy e
-     costa N chiamate sul stack locale gia' sotto pressione.
+  T  SPLIT+COMPRESS DELLA CODA (richiesta utente 2026-10-06: "quando il
+     contesto supera, splittalolo e comprimilo con un LLM"): quando la
+     massa sta nell'ULTIMO messaggio user (il prompt compilato
+     dall'agente), B/C/E non possono liberarla perche' la coda resta
+     verbatim. T tiene verbatim solo le ANCORE (inizio ~3000 char, fine
+     ~6000 char, dove sta la richiesta corrente) e riassume il mezzo a
+     chunk. Se la coda satura DA SOLA, B/C/E vengono saltati del tutto.
+  E  map/reduce: l'intera storia viene tagliata in chunk e riassunta, poi
+     le sintesi vengono ricomposte davanti alla richiesta corrente (che
+     resta fedele). Ultima spiaggia perche' e' lossy e costa N chiamate.
   F  se nessun livello libera spazio: 413 con dettaglio strutturato
      (modello, contesto, stima, livelli provati, hint) invece di far
      partire la richiesta e farla morire sulla catena di fallback.
 
-La cascata gira SOLO nell'async hook (B ed E fanno chiamate LLM); il
+POOL OPERARI DINAMICO (richiesta utente 2026-10-06: "cascade model
+selection, exploit ANY possible litellm configured model, even the ones
+hosted by inference4free"): T, E e i compattori di B non usano piu' liste
+chiuse. _worker_pool enumera OGNI modello configurato su litellm (model_list
+del router: wildcard inclusi, es. inference4free/*), ordina per preferenza
+(piccoli/veloci prima per T/E, contesto grande prima per B), esclude i
+non-chat (embedding/whisper/guard/rerank: risponderebbero 400) e quelli il
+cui contesto non contiene il chunk. Failover per-chunk: il primo operario
+che riesce resta "appiccicoso" per i chunk successivi, ogni fallimento/
+risposta vuota avanza al successivo (max MAX_WORKERS_TRIED operari provati).
+
+La cascata gira SOLO nell'async hook (B, T ed E fanno chiamate LLM); il
 pre_call_hook sync applica solo policy/clamp, senza rete. Le chiamate
 interne sono marcate con il metadata interno di litellm
 (INTERNAL_CALL_ORIGIN_METADATA_KEY): serve da guardia anti-ricorsione
@@ -119,6 +139,10 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 """
 import asyncio
 import json
+import re
+import time
+import urllib.parse
+import urllib.request
 
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
@@ -164,6 +188,14 @@ CONTEXT_BY_PREFIX = (
     ("inference4free/", 131072),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
+    # NOTA ordine: gli entry specifici PRIMA del prefisso generico "groq/"
+    # (la ricerca si ferma al primo match). Su Groq i gpt-oss hanno ctx
+    # 131072 (console.groq.com/docs/model), NON 262144 come il tetto del
+    # wildcard (kimi-k2-instruct-0905 e' l'unico 262k): senza l'entry
+    # specifico il pool dei compattori (B) manderebbe un corpo da 240k
+    # token a un modello che lo rifiuterebbe a runtime.
+    ("groq/openai/gpt-oss-120b", 131072),
+    ("groq/openai/gpt-oss-20b", 131072),
     ("groq/", 262144),
     ("gemini/", 262144),
 )
@@ -192,11 +224,12 @@ IMAGE_TOKEN_COST = 1500
 PROMPT_ERR_PCT = 0.03
 MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 
-# --- cascata overflow: B -> C -> E -> F ---
-# Compattatori: modelli con contesto >= 262144 (i 131072 locali non possono
-# contenere corpo + sintesi). Sono modelli di ROUTING (wildcard), quindi
-# possono non essere disponibili: la cascata li prova in ordine e passa
-# oltre su errore/timeout.
+# --- cascata overflow: B -> C -> T -> E -> F ---
+# B: ordine PREFERITO dei compattori (modelli a contesto grande). Da
+# ottobre 2026 la lista non e' piu' chiusa: se nessun preferito e'
+# disponibile/contiene il corpo, _worker_pool apre il pool a OGNI altro
+# modello configurato su litellm che possa contenere il corpo (richiesta
+# utente 2026-10-06: "exploit any possible litellm configured model").
 COMPACTOR_MODELS = (
     "groq/openai/gpt-oss-120b",
     "gemini/models/gemini-2.5-flash-lite",
@@ -209,14 +242,137 @@ MIN_BRIEF_CHARS = 200          # sintesi piu' corta accettata (sotto = fallita)
 COMPACT_ORIGIN = "context_compaction"
 COMPRESS_TARGET_RATIO = 0.55   # C: target = 55% del contesto (margine risposta)
 
-# E: map/reduce sul modello locale autonomo (non e' fallback di nessuno,
-# qui viene usato ESPLICITAMENTE come operaio di compattazione)
-MAP_MODEL = "small-model"
+# T/E: ordine PREFERITO degli operari di riassunto (piccoli/veloci prima).
+# Il pool REALE e' dinamico (_worker_pool): OGNI modello configurato su
+# litellm (wildcard inclusi, es. inference4free/*) entra nel pool se il suo
+# contesto contiene il chunk; i preferiti decidono SOLO l'ordine.
+SUMMARIZER_PREFERRED = (
+    "small-model",
+    "groq/openai/gpt-oss-20b",
+    "gemini/models/gemini-2.5-flash-lite",
+    "synthetic/syn:small:text",
+    "openrouter/free",
+    "inference4free/",
+    "groq/openai/gpt-oss-120b",
+    "gemini/",
+    "synthetic/",
+    "ollama-cloud/",
+    "openrouter/",
+)
+# non-chat: a una richiesta di riassunto questi modelli risponderebbero
+# 400 (embedding/whisper/guard/rerank non sono completations testuali)
+NON_CHAT_WORKER_SUBSTRINGS = ("embed", "whisper", "guard", "rerank")
+MAX_WORKERS_TRIED = 4          # operari distinti provati prima di arrendersi
+
+# ESPANSIONE WILDCARD -> nomi concreti (listing dei gateway, cache TTL).
+# Il model_list di litellm contiene pattern ("groq/*"): per una chiamata
+# interna serve un NOME CONCRETO ("groq/openai/gpt-oss-120b"), altrimenti
+# l'upstream riceve model="*" e risponde 400/404. Il listing di ogni
+# gateway (openrouter-gw, groq-gw, inference4free-gw prefigissano gia' gli
+# id; synthetic/ollama sono upstream diretti -> prefisso aggiunto qui) e'
+# la stessa fonte usata dall'import automatico dei modelli in config.
+WILDCARD_LIST_TIMEOUT_S = 8
+WILDCARD_CACHE_TTL_S = 600
+WILDCARD_MAX_MODELS = 40       # tetto per-pattern (listing da centinaia)
+_WILDCARD_CACHE = {}           # "groq/*" -> (monotonic, [nomi concreti])
+
+
+def _fetch_pattern_models(name):
+    """Listing {api_base}/models per un pattern 'X/*': ritorna i nomi
+    PUBBLICI richiedibili ('groq/openai/gpt-oss-120b', 'gemini/models/
+    gemini-2.5-flash', ...). [] su qualsiasi errore (gateway giu', api_base
+    assente, listing non-JSON): il chiamante tiene allora il wildcard."""
+    prefix = name[:-1]  # "groq/*" -> "groq/"
+    try:
+        from litellm.proxy.proxy_server import llm_router
+        entry = None
+        for dep in (getattr(llm_router, "model_list", None) or []):
+            n = (dep.get("model_name") if isinstance(dep, dict)
+                 else getattr(dep, "model_name", None))
+            if n == name:
+                entry = dep
+                break
+        lp = None
+        if isinstance(entry, dict):
+            lp = entry.get("litellm_params")
+        else:
+            lp = getattr(entry, "litellm_params", None)
+        api_base = (lp or {}).get("api_base")
+        api_key = (lp or {}).get("api_key")
+        if not api_base:
+            return []
+        url = str(api_base).rstrip("/") + "/models"
+        req = urllib.request.Request(url)
+        if api_key:
+            req.add_header("Authorization", "Bearer " + str(api_key))
+        # host locale (nomi docker senza punto): bypass di QUALSIASI proxy
+        # env (llmtrim) - i gateway sono reachabili solo sulla rete interna
+        host = urllib.parse.urlparse(url).hostname or ""
+        if "." in host:
+            opener = urllib.request.build_opener()
+        else:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=WILDCARD_LIST_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        out = []
+        for m in (data.get("data") or []):
+            mid = str(m.get("id") or "").strip()
+            if not mid:
+                continue
+            out.append(mid if mid.startswith(prefix) else prefix + mid)
+            if len(out) >= WILDCARD_MAX_MODELS:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _expand_wildcards(names):
+    """Sostituisce ogni 'X/*' con i nomi concreti dal listing (cache TTL
+    WILDCARD_CACHE_TTL_S); se il listing fallisce resta 'X/*' (i gateway
+    tolleranti lo accettano, gli altri 400-eranno ma il failover avanza)."""
+    out = []
+    now = time.monotonic()
+    for n in names:
+        if not n.endswith("/*"):
+            out.append(n)
+            continue
+        hit = _WILDCARD_CACHE.get(n)
+        if hit and now - hit[0] < WILDCARD_CACHE_TTL_S:
+            conc = hit[1]
+        else:
+            conc = _fetch_pattern_models(n)
+            if conc:
+                _WILDCARD_CACHE[n] = (now, conc)
+            else:
+                conc = [n]
+        out.extend(conc)
+    seen = set()
+    res = []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            res.append(n)
+    return res
 MAP_OUTPUT_TOKENS = 1024
-MAP_CHUNK_INPUT_TOKENS = 90000  # + output < 131072 di small-model
+MAP_CHUNK_INPUT_TOKENS = 90000  # + output < contesto dei piu' piccoli (131072)
 MAP_MAX_CHUNKS = 8
 MAP_TIMEOUT_S = 180
 MAP_ORIGIN = "context_map_reduce"
+
+# T (split+compress della coda): la massa spesso e' nell'ultimo messaggio
+# user (il prompt compilato dall'agente), che B/C/E tengono verbatim
+TAIL_SPLIT_MIN_TOKENS = 32000  # sotto: la coda non e' il problema, skip
+ANCHOR_HEAD_CHARS = 3000       # inizio dell'ultimo user: VERBATIM
+ANCHOR_TAIL_CHARS = 6000       # fine dell'ultimo user: VERBATIM (qui sta
+                               # la richiesta corrente del client)
+TAIL_ORIGIN = "context_tail_split"
+TAIL_HEADER = (
+    "[NOTA: la parte CENTRALE di questo messaggio (lungo) e' stata "
+    "compressa: inizio e fine sono VERBATIM, il mezzo e' riassunto qui "
+    "sotto in modo fedele]\n"
+)
 
 COMPACT_SYSTEM_PROMPT = (
     "You compress conversation context for a coding agent. Rewrite the "
@@ -251,6 +407,76 @@ def _resolve_internal_call_key() -> str:
 INTERNAL_CALL_ORIGIN_KEY = _resolve_internal_call_key()
 
 
+# --- stima token adattiva (densita' + tiktoken) ------------------------------
+# Il fisso 2.8 chars/token e' giusto per codice/JSON ma SOVRASTIMA la prosa
+# ~2x: su un transcript reale da ~479k char di prosa la stima era 171k token
+# contro ~88k reali -> falsa saturazione -> cascata sprecata e 413 su una
+# richiesta che stava nel contesto (incidente 2026-10-05). Ratio ADATTIVO
+# alla densita' dei simboli + secondo parere tiktoken (gia' dentro litellm)
+# sui soli prompt grandi.
+NON_WORD_RE = re.compile(r"[^\w\s]|_")
+LONG_ALNUM_RE = re.compile(r"[A-Za-z0-9_]{32,}")  # base64/hex/sha: testo denso
+CJK_RE = re.compile(
+    "[\u1100-\u11ff\u2e80-\ua4cf\ua960-\ua97f\uac00-\ud7ff"
+    "\uf900-\ufaff\uff00-\uffef\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]"
+)
+PROSE_CHARS_PER_TOKEN = 4.6   # inglese col tokenizer llama (misurato)
+MIXED_CHARS_PER_TOKEN = 3.6
+CJK_CHARS_PER_TOKEN = 1.5     # peggior caso: ~1 token ogni 1.5 char
+DENSE_DENSITY = 0.20          # >= 20% simboli/non-parole: codice/JSON
+MIXED_DENSITY = 0.10
+TIKTOKEN_MIN_CHARS = 150000   # tiktoken solo sui prompt grossi (~30k+ token)
+_TIKTOKEN_ENC = None
+_TIKTOKEN_FAILED = False
+
+
+def _chars_per_token(text):
+    """Ratio caratteri/token di UN pezzo di testo, dalla densita' dei
+    simboli: codice/JSON (denso) -> 2.8, conservativo come prima; prosa
+    pura -> 4.6; CJK -> 1.5. Il ratio piu' basso (piu' token stimati) vale
+    per il testo denso: si sovrastima la prosa, non si sottostima mai il
+    codice."""
+    n = len(text)
+    if not n:
+        return PROSE_CHARS_PER_TOKEN
+    if len(CJK_RE.findall(text)) / n > 0.15:
+        return CJK_CHARS_PER_TOKEN
+    density = len(NON_WORD_RE.findall(text)) / n
+    if density >= DENSE_DENSITY:
+        return CHARS_PER_TOKEN
+    if density <= MIXED_DENSITY:
+        # prosa con base64/hash/sha dentro: resta prudente
+        return (PROSE_CHARS_PER_TOKEN
+                if len(LONG_ALNUM_RE.findall(text)) < 3
+                else MIXED_CHARS_PER_TOKEN)
+    # misto: interpolazione lineare tra prosa e denso
+    t = (density - MIXED_DENSITY) / (DENSE_DENSITY - MIXED_DENSITY)
+    return MIXED_CHARS_PER_TOKEN + t * (CHARS_PER_TOKEN - MIXED_CHARS_PER_TOKEN)
+
+
+def _tiktoken_estimate(texts):
+    """Secondo parere tiktoken (cl100k_base, NESSUN moltiplicatore: su
+    trascrizioni reali cl100k conta ~1.2x i token llama sulla prosa e
+    grossomodo gli stessi sul codice, quindi aggiungerne un altro qui
+    ricreerebbe il falso positivo della cascata; il margine 3% di
+    _margin basta). None se tiktoken non e' disponibile."""
+    global _TIKTOKEN_ENC, _TIKTOKEN_FAILED
+    if _TIKTOKEN_FAILED:
+        return None
+    try:
+        if _TIKTOKEN_ENC is None:
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        n = 0
+        for t in texts:
+            if t:
+                n += len(_TIKTOKEN_ENC.encode(t, disallowed_special=()))
+        return n
+    except Exception:
+        _TIKTOKEN_FAILED = True
+        return None
+
+
 class ReasoningClamp(CustomLogger):
 
     def _context_for(self, model):
@@ -260,14 +486,15 @@ class ReasoningClamp(CustomLogger):
         return DEFAULT_CONTEXT
 
     def _estimate_prompt_tokens(self, data):
-        """Stima CONSERVATIVA (sovrastima): l'upstream conta col tokenizer
-        reale, quindi sottostimare significa prendere il 400 dall'upstream.
+        """Stima CONSERVATIVA (mai sottostimare: l'upstream conta col
+        tokenizer reale e un max_tokens oltre la stanza e' un 400 che
+        uccide la catena di fallback).
 
-        Conta ANCHE gli schemi tools/functions (messa nel prompt
-        dall'upstream, prima zero-token: con 18 schemi Strata ne conta 1403
-        REALI) e le immagini."""
+        Ratio adattivo per pezzo (densita', vedi _chars_per_token) e max()
+        con tiktoken sui soli prompt grandi. Conta ANCHE gli schemi
+        tools/functions (messi nel prompt dall'upstream: 18 schemi Strata =
+        1403 token REALI) e le immagini."""
         msgs = data.get("messages") or []
-        chars = 0
         # tools/functions: schemi JSON, ratio piu' denso della prosa
         schemas = data.get("tools") or data.get("functions") or []
         tool_tokens = 0
@@ -277,13 +504,14 @@ class ReasoningClamp(CustomLogger):
             except Exception:
                 j = str(t)
             tool_tokens += int(len(j) / TOOLS_CHARS_PER_TOKEN) + TOOL_FIXED_TOKENS
+        texts = []
         images = 0
         for m in msgs:
             if not isinstance(m, dict):
                 continue
             c = m.get("content")
             if isinstance(c, str):
-                chars += len(c)
+                texts.append(c)
             elif isinstance(c, list):
                 for part in c:
                     if isinstance(part, dict):
@@ -293,15 +521,33 @@ class ReasoningClamp(CustomLogger):
                         for k in ("text", "content"):
                             v = part.get(k)
                             if isinstance(v, str):
-                                chars += len(v)
+                                texts.append(v)
+                    elif isinstance(part, str):
+                        texts.append(part)
             for k in ("reasoning", "reasoning_content", "name"):
                 v = m.get(k)
                 if isinstance(v, str):
-                    chars += len(v)
+                    texts.append(v)
             if m.get("tool_calls"):
-                chars += len(str(m["tool_calls"]))
-        return (int(chars / CHARS_PER_TOKEN) + PER_MESSAGE_OVERHEAD * len(msgs)
+                texts.append(str(m["tool_calls"]))
+        est = sum(int(len(t) / _chars_per_token(t)) for t in texts)
+        chars = sum(len(t) for t in texts)
+        if chars >= TIKTOKEN_MIN_CHARS:
+            tk = _tiktoken_estimate(texts)
+            if tk and tk > est:
+                est = tk
+        return (est + PER_MESSAGE_OVERHEAD * len(msgs)
                 + tool_tokens + images * IMAGE_TOKEN_COST)
+
+    def _estimate_subset(self, msgs, data):
+        """Stima di SOLO alcuni messaggi (con gli stessi tools): serve a
+        decidere se la coda (dall'ultimo user in poi) satura da sola - in
+        quel caso B/C/E, che la tengono verbatim, non possono aiutare."""
+        sub = {"messages": list(msgs)}
+        for k in ("tools", "functions"):
+            if data.get(k):
+                sub[k] = data[k]
+        return self._estimate_prompt_tokens(sub)
 
     def _margin(self, est):
         """Margine di sicurezza della stima: FISSO + PROPORZIONALE.
@@ -408,7 +654,12 @@ class ReasoningClamp(CustomLogger):
         return data
 
     async def _compact_with_provider(self, data, model, est):
-        """Livello B: sintetizza il corpo con un modello da 262k."""
+        """Livello B: sintetizza la STORIA (tutto cio' che precede l'ultimo
+        user, che resta verbatim) con un modello a contesto grande. I
+        compattori preferiti (COMPACTOR_MODELS) vengono provati per primi;
+        se nessuno e' disponibile o contiene il corpo, il pool si apre a
+        OGNI modello configurato su litellm che possa contenerlo
+        (_worker_pool, richiesta utente 2026-10-06)."""
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         body_src, tail = self._split_tail(msgs)
         if not body_src:
@@ -417,14 +668,22 @@ class ReasoningClamp(CustomLogger):
         if len(body) < COMPACT_MIN_CHARS:
             return None, "body-too-small"
         from litellm.proxy.proxy_server import llm_router
+        if llm_router is None:
+            return None, "no-router"
+        # stima del corpo per il FILTRO del pool: qui serve ACCURATEZZA, non
+        # prudenza - il ratio denso (2.8) sovrastima la prosa ~40-60% e
+        # escluderebbe compattori capaci, buttando la cascata sul livello
+        # lossy C. tiktoken (seconda opinione gia' wired) se disponibile:
+        # un compattatore marginale che risponde 400 costa un giro di
+        # failover, escluderli TUTTI costa la compressione lossy.
+        body_est = (_tiktoken_estimate([body])
+                    or int(len(body) / CHARS_PER_TOKEN))
+        pool = self._worker_pool(body_est, COMPACTOR_MODELS,
+                                 output_tokens=COMPACT_OUTPUT_TOKENS)
+        if not pool:
+            return None, f"no-compactor-fits:{body_est}tok"
         failures = []
-        for comp in COMPACTOR_MODELS:
-            cctx = self._context_for(comp)
-            body_est = int(len(body) / CHARS_PER_TOKEN)
-            if self._saturated(body_est, cctx):
-                # il compattore non contiene il corpo: inutile provarlo
-                failures.append(f"{comp}:too-small")
-                continue
+        for comp in pool:
             try:
                 resp = await asyncio.wait_for(
                     llm_router.acompletion(
@@ -483,7 +742,149 @@ class ReasoningClamp(CustomLogger):
               flush=True)
         return data, f"compress:{after}"
 
-    # ---------------- E: map/reduce sui modelli locali -----------------------
+    # ---------------- operari di riassunto (pool dinamico) ------------------
+
+    def _worker_pool(self, needed_tokens, preferred, output_tokens=MAP_OUTPUT_TOKENS):
+        """OGNI modello configurato su litellm che puo' contenere
+        `needed_tokens` di input (+ output + margine), ordinato per
+        preferenza. Richiesta utente 2026-10-06: "cascade model selection,
+        exploit ANY possible litellm configured model, even the ones hosted
+        by inference4free" - niente piu' liste chiude di operari.
+        I WILDCARD della model_list (groq/*, gemini/*, ...) vengono ESPASI
+        nei nomi concreti richiedibili via listing del gateway (cache TTL):
+        chiamare acompletion col nome letterale "groq/*" manderebbe
+        model="*" all'upstream -> 400/404 garantiti (visto in produzione).
+        Se il listing non risponde resta il nome wildcard: i gateway
+        tolleranti (inference4free, synthetic) lo accettano comunque."""
+        names = []
+        try:
+            from litellm.proxy.proxy_server import llm_router
+            for dep in (getattr(llm_router, "model_list", None) or []):
+                n = (dep.get("model_name") if isinstance(dep, dict)
+                     else getattr(dep, "model_name", None))
+                if n and str(n) not in names:
+                    names.append(str(n))
+        except Exception:
+            names = []
+        names = _expand_wildcards(names)
+
+        def rank(n):
+            for i, p in enumerate(preferred):
+                if n == p or n.startswith(p):
+                    return i
+            return len(preferred)
+
+        budget = needed_tokens + output_tokens + self._margin(needed_tokens)
+        return [n for n in sorted(names, key=rank)
+                if not any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS)
+                and self._context_for(n) >= budget]
+
+    async def _summarize_chunks(self, chunks, origin, model):
+        """Riassume i chunk con FAILOVER sul pool dinamico: operario
+        "appiccicoso" (il primo che riesce resta per i chunk successivi),
+        ogni fallimento/risposta vuota avanza al successivo, max
+        MAX_WORKERS_TRIED operari distinti. Ritorna (brief, info) con
+        brief=None su fallimento totale."""
+        from litellm.proxy.proxy_server import llm_router
+        if llm_router is None:
+            return None, "no-router"
+        # chunk misurato col ratio denso: la stima del CHUNK deve stare
+        # bassa (non sovrastimare) per non escludere operari validi; il
+        # margine del pool copre il residuo
+        chunk_est = max(int(len(c) / CHARS_PER_TOKEN) for c in chunks)
+        pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED)
+        if not pool:
+            return None, f"no-worker-fits:{chunk_est}tok"
+        failures = []
+        wi = 0
+        used = None
+        summaries = []
+        for i, chunk in enumerate(chunks):
+            s = None
+            while wi < len(pool) and wi < MAX_WORKERS_TRIED:
+                w = pool[wi]
+                try:
+                    resp = await asyncio.wait_for(
+                        llm_router.acompletion(
+                            model=w,
+                            messages=[{"role": "system",
+                                       "content": MAP_SYSTEM_PROMPT},
+                                      {"role": "user", "content": chunk}],
+                            max_tokens=MAP_OUTPUT_TOKENS,
+                            num_retries=0,
+                            fallbacks=[],
+                            drop_params=True,
+                            metadata={INTERNAL_CALL_ORIGIN_KEY: origin},
+                        ),
+                        timeout=MAP_TIMEOUT_S,
+                    )
+                    s = (resp.choices[0].message.content or "").strip()
+                except Exception as e:
+                    failures.append(f"{w}:{type(e).__name__}")
+                    wi += 1
+                    continue
+                if not s:
+                    failures.append(f"{w}:empty")
+                    wi += 1
+                    continue
+                used = w
+                break
+            if not s:
+                return None, "|".join(failures[-4:]) or "no-worker"
+            summaries.append(f"--- parte {i + 1}/{len(chunks)} ---\n{s}")
+        print(f"[reasoning_clamp] riassunti {len(chunks)} chunk su '{used}' "
+              f"(pool provato: {', '.join(pool[:MAX_WORKERS_TRIED])})",
+              flush=True)
+        return "\n\n".join(summaries), used or "?"
+
+    # ---------------- T: split+compress della coda --------------------------
+
+    async def _split_compress_tail(self, data, model, est):
+        """Livello T (richiesta utente 2026-10-06: "quando il contesto
+        supera lo splitiamo e lo compriamiamo con un qualche llm"): quando
+        la massa e' nell'ULTIMO messaggio user (il prompt compilato
+        dall'agente), B/C/E non possono liberarla perche' la coda resta
+        verbatim. T tiene verbatim solo le ANCORE (inizio + fine, dove sta
+        la richiesta corrente) e riassume il mezzo con il pool dinamico."""
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            m = msgs[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return None, "no-user-msg"
+        c = msgs[idx].get("content")
+        if not isinstance(c, str) or not c:
+            # content list (vision/parts): non riscriverlo qui
+            return None, "tail-not-text"
+        tail_est = int(len(c) / _chars_per_token(c))
+        if tail_est < TAIL_SPLIT_MIN_TOKENS:
+            return None, f"tail-too-small:{tail_est}"
+        if len(c) <= ANCHOR_HEAD_CHARS + ANCHOR_TAIL_CHARS:
+            return None, "no-middle"
+        head = c[:ANCHOR_HEAD_CHARS]
+        anchor = c[len(c) - ANCHOR_TAIL_CHARS:]
+        middle = c[ANCHOR_HEAD_CHARS:len(c) - ANCHOR_TAIL_CHARS]
+        if len(middle) < COMPACT_MIN_CHARS:
+            return None, "middle-too-small"
+        chunks = self._chunk_for_map(middle)
+        if not chunks:
+            return None, "no-chunks"
+        brief, info = await self._summarize_chunks(chunks, TAIL_ORIGIN, model)
+        if brief is None:
+            return None, info
+        new_c = head + "\n" + TAIL_HEADER + brief + "\n" + anchor
+        new_msgs = list(msgs)
+        new_msgs[idx] = dict(msgs[idx], content=new_c)
+        data["messages"] = new_msgs
+        print(f"[reasoning_clamp] T {model}: ultimo user {len(c)} char -> "
+              f"{len(new_c)} char (mezzo in {len(chunks)} chunk, {info})",
+              flush=True)
+        return data, f"tail:{len(chunks)}"
+
+    # ---------------- E: map/reduce sul pool dinamico -----------------------
 
     def _chunk_for_map(self, body):
         """Taglia la trascrizione in chunk di ~MAP_CHUNK_INPUT_TOKENS token;
@@ -506,7 +907,8 @@ class ReasoningClamp(CustomLogger):
         return chunks[:MAP_MAX_CHUNKS]
 
     async def _map_reduce(self, data, model, est):
-        """Livello E: riassunto a chunk su small-model + ricomposizione."""
+        """Livello E: riassunto a chunk dell'intera storia (l'ultimo user
+        resta verbatim come in B/C) + ricomposizione davanti alla coda."""
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         body_src, tail = self._split_tail(msgs)
         if not body_src:
@@ -517,32 +919,10 @@ class ReasoningClamp(CustomLogger):
         chunks = self._chunk_for_map(body)
         if not chunks:
             return None, "no-chunks"
-        from litellm.proxy.proxy_server import llm_router
-        summaries = []
-        for i, chunk in enumerate(chunks):
-            try:
-                resp = await asyncio.wait_for(
-                    llm_router.acompletion(
-                        model=MAP_MODEL,
-                        messages=[{"role": "system",
-                                   "content": MAP_SYSTEM_PROMPT},
-                                  {"role": "user", "content": chunk}],
-                        max_tokens=MAP_OUTPUT_TOKENS,
-                        num_retries=0,
-                        fallbacks=[],
-                        drop_params=True,
-                        metadata={INTERNAL_CALL_ORIGIN_KEY: MAP_ORIGIN},
-                    ),
-                    timeout=MAP_TIMEOUT_S,
-                )
-                s = (resp.choices[0].message.content or "").strip()
-            except Exception as e:
-                return None, f"chunk{i}:{type(e).__name__}:{str(e)[:120]}"
-            if not s:
-                return None, f"chunk{i}:empty"
-            summaries.append(f"--- parte {i + 1}/{len(chunks)} ---\n{s}")
-        brief = "\n\n".join(summaries)
-        print(f"[reasoning_clamp] E {model}: map/reduce su {MAP_MODEL} "
+        brief, info = await self._summarize_chunks(chunks, MAP_ORIGIN, model)
+        if brief is None:
+            return None, info
+        print(f"[reasoning_clamp] E {model}: map/reduce "
               f"({len(chunks)} chunk, {len(body)} char -> {len(brief)} char)",
               flush=True)
         return self._apply_compacted(data, brief, tail), f"map:{len(chunks)}"
@@ -562,10 +942,12 @@ class ReasoningClamp(CustomLogger):
                 "prompt_tokens_estimated": est,
                 "tried": tried,
                 "hint": ("il prompt supera il contesto del modello e la "
-                         "cascata di compattazione (B compattatore 262k -> C "
-                         "compressione BM25 -> E map/reduce) non ha liberato "
-                         "spazio: riduci il contesto del client o usa un "
-                         "modello con contesto maggiore"),
+                         "cascata di compattazione (B compattori a contesto "
+                         "grande -> C compressione BM25 -> T split+compress "
+                         "della coda -> E map/reduce, tutti con failover sul "
+                         "pool dinamico dei modelli configurati) non ha "
+                         "liberato spazio: riduci il contesto del client o "
+                         "usa un modello con contesto maggiore"),
             },
         )
 
@@ -583,11 +965,37 @@ class ReasoningClamp(CustomLogger):
         if not self._saturated(est, ctx):
             return data
         print(f"[reasoning_clamp] overflow {model}: ~{est} tok + "
-              f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata B/C/E",
+              f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata B/C/T/E",
               flush=True)
+        # La coda (dall'ultimo user in poi) resta verbatim in B/C/E: se
+        # satura DA SOLA quei livelli non possono liberare spazio - solo T
+        # (che comprime il mezzo dell'ultimo messaggio user) puo' aiutare.
+        # Cosi' si evitano 3 chiamate cloud prima di un 413 assicurato.
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        body_src, tail = self._split_tail(msgs)
+        if tail:
+            tail_est = self._estimate_subset(tail, data)
+            if self._saturated(tail_est, ctx):
+                tried = [f"tail-alone:{tail_est}"]
+                try:
+                    new, info = await self._split_compress_tail(data, model, est)
+                except Exception as e:
+                    new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
+                tried.append(f"T:{info}")
+                if new is not None:
+                    data = new
+                    est = self._estimate_prompt_tokens(data)
+                    self._clamp_output(data, model, est)
+                    if not self._saturated(est, ctx):
+                        print(f"[reasoning_clamp] {model}: cascata risolta "
+                              f"da T (~{est} tok, contesto {ctx})", flush=True)
+                        return data
+                # la coda resta verbatim anche per B/C/E: nessun aiuto
+                return self._overflow(data, model, est, tried)
         tried = []
         for name, fn in (("B", self._compact_with_provider),
                          ("C", self._compress_locally),
+                         ("T", self._split_compress_tail),
                          ("E", self._map_reduce)):
             try:
                 if name == "C":
@@ -601,6 +1009,9 @@ class ReasoningClamp(CustomLogger):
                 new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
             tried.append(f"{name}:{info}")
             if new is None:
+                # visibilita': un livello che salta non deve sparire nei log
+                print(f"[reasoning_clamp] {name} {model}: nessun guadagno "
+                      f"({info})", flush=True)
                 continue
             data = new
             est = self._estimate_prompt_tokens(data)
