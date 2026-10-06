@@ -452,6 +452,73 @@ def _fetch_proxy_models():
         return {}
 
 
+def _fetch_explicit_contexts(deployments):
+    """Listing di ogni api_base di deployment ESPLICITI (non wildcard) per
+    contesto/prezzo per-modello: i gruppi senza wildcard (synthetic dal
+    2026-10-06) non passano da _fetch_pattern_models. Per ogni id upstream U
+    del listing riceve _DYN_CTX (context_length/max_model_len/context_window/
+    max_input_tokens) e _TIER_HINTS (pricing.prompt) il deployment il cui
+    model_name == U o finisce con "/"+U. BLOCCANTE: SOLO dal thread daemon.
+    api_base raggruppati: UNA sola fetch per upstream. Stesso bypass proxy
+    di _fetch_pattern_models (host con punto = default opener, altrimenti
+    no-proxy)."""
+    groups = {}
+    for dep in deployments:
+        lp = (dep.get("litellm_params") if isinstance(dep, dict)
+              else getattr(dep, "litellm_params", None)) or {}
+        base = lp.get("api_base")
+        if not base:
+            continue
+        key = lp.get("api_key")
+        name = (dep.get("model_name") if isinstance(dep, dict)
+                else getattr(dep, "model_name", "")) or ""
+        groups.setdefault((str(base), str(key) if key else ""), []).append(str(name))
+    for (base, key), names in groups.items():
+        try:
+            url = str(base).rstrip("/") + "/models"
+            req = urllib.request.Request(url)
+            if key and key != "dummy":
+                req.add_header("Authorization", "Bearer " + key)
+            host = urllib.parse.urlparse(url).hostname or ""
+            opener = (urllib.request.build_opener() if "." in host
+                      else urllib.request.build_opener(
+                          urllib.request.ProxyHandler({})))
+            with opener.open(req, timeout=WILDCARD_LIST_TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        for m in (data.get("data") or []):
+            if not isinstance(m, dict):
+                continue
+            uid = str(m.get("id") or "").strip()
+            if not uid:
+                continue
+            ctx = None
+            for f in ("context_length", "max_model_len", "context_window",
+                      "max_input_tokens"):
+                v = m.get(f)
+                if isinstance(v, (int, float)) and v > 0:
+                    ctx = int(v)
+                    break
+            price = None
+            pr = m.get("pricing")
+            if isinstance(pr, dict) and pr.get("prompt") is not None:
+                try:
+                    p = float(pr.get("prompt"))
+                    if p >= 0:
+                        price = p
+                except (TypeError, ValueError):
+                    pass
+            if ctx is None and price is None:
+                continue
+            for name in names:
+                if name == uid or name.endswith("/" + uid):
+                    if ctx is not None:
+                        _DYN_CTX[name] = ctx
+                    if price is not None:
+                        _TIER_HINTS[name] = price
+
+
 def _refresher_proxy_models():
     """Thread daemon: rilegge /v1/models ogni PROXY_MODELS_TTL_S (dinamico:
     config.yaml cambiata o /model/new vengono visti senza riavviare)."""
@@ -473,17 +540,27 @@ def _refresher_proxy_models():
                     print(f"[reasoning_clamp] /v1/models non disponibile "
                           f"(tentativo {fails}); tengo l'ultima lista",
                           flush=True)
-        # contesti per-modello dai listing gateway/upstream (i WILDCARD del
-        # model_list): alimenta _DYN_CTX per il clamp/pool - anche il modello
-        # MAIN (es. synthetic/syn:large:text, non un wildcard) ha cosi' il
-        # suo contesto REALE dal vivo senza aspettare la prima cascata
+        # contesti per-modello dai listing gateway/upstream: i WILDCARD del
+        # model_list via _fetch_pattern_models, le entry ESPLICITE via
+        # _fetch_explicit_contexts (synthetic dal 2026-10-06). Alimenta
+        # _DYN_CTX per clamp/pool: anche il modello MAIN ha cosi' il suo
+        # contesto REALE dal vivo senza aspettare la prima cascata
         try:
             from litellm.proxy.proxy_server import llm_router
+            wildcards = []
+            explicit = []
             for dep in (getattr(llm_router, "model_list", None) or []):
                 n = (dep.get("model_name") if isinstance(dep, dict)
                      else getattr(dep, "model_name", None))
-                if n and str(n).endswith("/*"):
-                    _fetch_pattern_models(str(n))
+                n = str(n) if n else ""
+                if n.endswith("/*"):
+                    wildcards.append(n)
+                elif n:
+                    explicit.append(dep)
+            for w in wildcards:
+                _fetch_pattern_models(w)
+            if explicit:
+                _fetch_explicit_contexts(explicit)
         except Exception:
             pass
         # primo aggancio mancato (proxy in avvio): ritento presto, non tra 10'
@@ -1012,14 +1089,15 @@ class ReasoningClamp(CustomLogger):
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
         if not keys:
             return
+        # DIRETTIVA UTENTE 2026-10-06: la catena di fallback deve tenere
+        # conto del contesto DA CUI il modello e' partito -> il budget e'
+        # quello del modello RICHIESTO (finestra reale via _window_for), NON
+        # il minimo della catena: un prompt grande destinato a un modello da
+        # 512k non viene piu' striminzito per farcelo stare anche nei
+        # fallback da 196k. Se il primario cade e il prompt non entra nel
+        # target di fallback, il target risponde 400 e la catena avanza
+        # (comportamento accettato esplicitamente).
         ctx = self._window_for(model)
-        chain = data.get("fallbacks")
-        if isinstance(chain, list) and chain:
-            # la richiesta deve starci ANCHE se cade sull'ultimo target
-            # (small-model, 131072): limita al contesto piu' piccolo della
-            # catena (i default litellm_params.max_tokens sono uniti da
-            # litellm DOPO l'hook e non sono visibili qui - vedi config)
-            ctx = min([ctx] + [self._window_for(str(t)) for t in chain])
         if est is None:
             est = self._estimate_prompt_tokens(data)
         budget = ctx - est - self._margin(est)
@@ -1047,12 +1125,9 @@ class ReasoningClamp(CustomLogger):
         MIN_FORCED_OUTPUT ci sta -> al chiamante il 413 vero."""
         keys = [k for k in MAX_TOKEN_KEYS
                 if isinstance(data.get(k), (int, float)) and data[k] > 0]
+        # stessa regola di _clamp_output (direttiva utente 2026-10-06): il
+        # budget e' quello del modello DI PARTENZA, non il minimo della catena
         ctx = self._window_for(model)
-        chain = data.get("fallbacks")
-        if isinstance(chain, list) and chain:
-            # stessa regola di _clamp_output: deve starci ANCHE sull'ultimo
-            # target della catena di fallback
-            ctx = min([ctx] + [self._window_for(str(t)) for t in chain])
         room = ctx - est - SAFETY_MARGIN
         if room < MIN_FORCED_OUTPUT:
             return False

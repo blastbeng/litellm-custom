@@ -148,10 +148,13 @@ so a big-prompt request kills the **whole fallback chain**
 floor for the synthetic wildcard — real per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
-`max_completion_tokens`) to `context − prompt`, and — when the request
-carries a fallback chain — to the **smallest context in the chain**: the
-budget must fit every target, including `small-model` (196608), the final
-fallback of every model. The pre-call hook runs **once
+`max_completion_tokens`) to `context − prompt` of the **model the request
+was addressed to** (its real window via `_window_for`) — 2026-10-06 user
+directive: "la catena di fallback deve tenere conto del contesto da cui il
+modello è partito". The chain no longer shrinks the budget to its smallest
+member: a large prompt aimed at a 512k model keeps its full headroom, and if
+the primary fails while the prompt does not fit a fallback target, that
+target 400s and the chain advances (accepted behaviour). The pre-call hook runs **once
 per client request** (`proxy/utils.py`), not once per fallback attempt, so the
 budget computed on the requested model is **inherited by every fallback
 target**. The `litellm_params` defaults (`max_tokens`) are merged into every
@@ -186,12 +189,16 @@ left for the answer — and the **overflow cascade** below takes over.
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml`** (196608 since
 2026-10-06 for `local-model`/`small-model` — previously 131072, capped by the
-local hardware; 131072 for `synthetic/*` and `inference4free/*`, the
-**minimum true for the whole wildcard** — their real per-model contexts
+local hardware). **synthetic is 13 explicit entries** (12 chat + the nomic
+embedding) with the real per-model contexts exposed on `/v1/models`
 (`syn:large:text` 524288, `syn:small:text` 196608, `hf:openai/gpt-oss-120b`
-131072; `inference4free/*` 10000–1000000) reach the clamp and the worker pool
-dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
-`reasoning_clamp.py`; still 131072 for `groq/openai/gpt-oss-120b` / `-20b`,
+131072, …) — litellm's wildcard expansion propagates ids only, never context
+fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
+needs a config entry. `inference4free/*` stays a wildcard (dynamic lineup):
+its real per-model contexts (10000–1000000) reach the clamp and the worker
+pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
+`reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still
+131072 for `groq/openai/gpt-oss-120b` / `-20b`,
 whose real Groq context is 131072 even though the `groq/*` wildcard declares
 262144 as the ceiling for its largest model; 16384 for `embedding-model`;
 262144 for `openrouter/*`, `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific

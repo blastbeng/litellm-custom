@@ -105,39 +105,210 @@ model_list:
       max_input_tokens: 16384
 
 
-  # --- Modelli synthetic.new: importati in automatico ---
-  # Wildcard unica "synthetic/*" per runtime + listing. Il capture rimuove
-  # "synthetic/", quindi all'endpoint arrivano gli id nativi ("syn:large:text",
-  # "hf:openai/gpt-oss-120b", ...). /v1/models espande la wildcard con la
-  # lista REALE dell'endpoint (check_provider_endpoint).
-  - model_name: synthetic/*
+  # --- Modelli synthetic.new: ENTRY ESPLICITE (2026-10-06) ---
+  # Direttiva utente: litellm deve SEMPRE esporre il contesto corretto per
+  # ogni modello. L'espansione wildcard di litellm propaga solo gli ID (mai
+  # i campi contesto): un wildcard NON puo' esporre contesti per-modello ->
+  # 13 entry esplicite (12 chat + l'embedding nomic, NON nel listing chat)
+  # con i contesti REALI del listing. Un modello NUOVO su synthetic.new
+  # richiede una entry qui. I contesti vengono comunque riletti DAL VIVO
+  # dal listing (reasoning_clamp: _DYN_CTX via _fetch_explicit_contexts):
+  # un context_length cambiato lato synthetic viene visto senza toccare la
+  # config. La policy fallback per synthetic/* resta in reasoning_clamp.
+
+  - model_name: synthetic/syn:large:text
     litellm_params:
-      model: openai/*
+      model: openai/syn:large:text
       api_base: https://api.synthetic.new/openai/v1
-      api_key: syn_YOUR_SYNTHETIC_API_KEY
-      # 32768 (era 131072): i litellm_params default vengono uniti da litellm
-      # a OGNI tentativo, fallback inclusi, DOPO l'hook (che non li vede):
-      # prompt + default deve stare nel contesto di OGNI target della catena
-      # (small-model/local-model 196608, synthetic min 131072: il vincolo e'
-      # il piu' piccolo della catena)
+      api_key: &synthetic_key x
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      # reasoning di default per OGNI richiesta su questa wildcard
-      # (sovrascrivibile dal client): synthetic supporta
-      # none/low/medium/high/xhigh/max
       reasoning_effort: xhigh
     model_info:
-      # contesti REALI per modello (listing synthetic 2026-10-06):
-      # syn:large:text, syn:large:vision, GLM-5.3, GLM-5.3-Flash,
-      # DeepSeek-V4.1-Flash, Kimi-K3 = 524288; syn:small:vision, Qwen3.8-27B,
-      # Nemotron-3-Super = 262144; syn:small:text, GLM-4.7-Flash = 196608;
-      # hf:openai/gpt-oss-120b = 131072. Un WILDCARD dichiara il MINIMO vero
-      # per tutto il gruppo; il contesto REALE per-modello arriva al clamp e
-      # al pool dinamicamente dal listing (reasoning_clamp: _DYN_CTX/
-      # _window_for) - syn:large:text usa davvero 512k
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/syn:small:text
+    litellm_params:
+      model: openai/syn:small:text
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 196608
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/syn:large:vision
+    litellm_params:
+      model: openai/syn:large:vision
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/syn:small:vision
+    litellm_params:
+      model: openai/syn:small:vision
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:openai/gpt-oss-120b
+    litellm_params:
+      model: openai/hf:openai/gpt-oss-120b
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
       max_input_tokens: 131072
       max_output_tokens: 65536
       max_tokens: 65536
 
+  - model_name: synthetic/hf:zai-org/GLM-5.3
+    litellm_params:
+      model: openai/hf:zai-org/GLM-5.3
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:zai-org/GLM-5.3-Flash
+    litellm_params:
+      model: openai/hf:zai-org/GLM-5.3-Flash
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash
+    litellm_params:
+      model: openai/hf:deepseek-ai/DeepSeek-V4.1-Flash
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:moonshotai/Kimi-K3
+    litellm_params:
+      model: openai/hf:moonshotai/Kimi-K3
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 524288
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:Qwen/Qwen3.8-27B
+    litellm_params:
+      model: openai/hf:Qwen/Qwen3.8-27B
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:zai-org/GLM-4.7-Flash
+    litellm_params:
+      model: openai/hf:zai-org/GLM-4.7-Flash
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 196608
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+    litellm_params:
+      model: openai/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 65536
+
+  - model_name: synthetic/hf:nomic-ai/nomic-embed-text-v1.5
+    litellm_params:
+      model: openai/hf:nomic-ai/nomic-embed-text-v1.5
+      api_base: https://api.synthetic.new/openai/v1
+      api_key: *synthetic_key
+      # default uniti da litellm a OGNI tentativo DOPO l'hook: deve
+      # starci nel modello DI PARTENZA (la catena non riduce piu' il
+      # budget: direttiva utente 2026-10-06)
+      max_tokens: 32768
+      reasoning_effort: xhigh
+    model_info:
+      max_input_tokens: 8192
+      # embedding: contesto nomic-embed-text-v1.5
   # --- Modelli OpenRouter: importati in automatico ---
   # Nome pubblico "openrouter/<id-nativo>" (es. openrouter/z-ai/glm-5.3-prime).
   # Listing tramite openrouter-gw: riscrive /v1/* -> /api/v1/* (l'API
