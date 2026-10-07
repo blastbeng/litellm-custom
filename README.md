@@ -287,9 +287,44 @@ preference list. Because the classification is price/brand/pattern based
 rather than a closed id list, delisted models drop out via the 10-minute
 listing cache and newly listed ones join automatically.
 
+**Never-expensive worker filter** (user directive 2026-10-07: *"NEVER use
+expensive models during prompt compression / summarization / clamping"*):
+a costly model is not demoted — it is **excluded** from the worker pool
+entirely, by a three-layer price engine in `reasoning_clamp.py`:
+
+1. **Our channel's listing price** (authoritative — it is what we actually
+   pay): `pricing.prompt` harvested from the gateway listings into
+   `_TIER_HINTS`. Price parsing accepts OpenRouter's plain strings and
+   Synthetic's `"$0.0000006"` format (previously `float()` silently failed on
+   the `$` and Synthetic prices never reached the tiers). Price **beats the
+   name**: a free `pro` stays allowed, Kimi-K3 at $3/M is excluded although
+   `kimi` is a cheap pattern.
+2. **Web price index**: the daemon periodically fetches OpenRouter's
+   *public* `api/v1/models` (no key, ~450 models) into `_WEB_PRICES` and
+   applies those market prices to **other providers** whose gateways hide
+   pricing (groq, gemini), matching by model **family** — the last id
+   segment, with date/instruct suffixes normalized
+   (`kimi-k2-instruct-0905` → `kimi-k2`).
+3. **Flagship regexp net** (`EXPENSIVE_WORKER_RES`) when no price is known:
+   `pro`, `opus`, `sonnet`, `ultra`, `premium`, `large`, `max`,
+   `kimi-k[3-9]`, `deepseek-v[4-9]`, `gpt-[4-9]`, `o[1-9]`, `grok-[2-9]`,
+   `claude`, `command-*` — with a cheap-variant veto
+   (`WORKER_CHEAP_OVERRIDE_RES`: `flash`, `mini`, `nano`, `lite`, `small`,
+   `tiny`, `haiku`, `fast`, `free`, `air`), so `deepseek-v4-pro` is excluded
+   while `deepseek-v4.1-flash`, `o3-mini`, `grok-4-fast`, `claude-3-haiku`
+   stay eligible.
+
+A model with **no price signal at all** is also excluded (never gamble
+money on an unproven cost). Never excluded: local hardware and free
+channels (brand `free`, `:free`, `ollama-cloud`) — zero cost by
+definition. `WORKER_MAX_PRICE_USD_PER_TOKEN = CHEAP_PRICE_USD_PER_TOKEN`
+(≈ $0.50/M prompt). `openrouter/auto` was removed from `COMPACTOR_MODELS`
+for the same reason: auto-routing can land on an expensive model, and the
+choice is not controllable.
+
 | Level | What it does | Lossy? |
 |---|---|---|
-| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in cost-tier order (free → cheap → paid; inside a tier `COMPACTOR_MODELS` first: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite` → `openrouter/auto`, then the rest of the tier), 45 s each, no retries, no fallbacks. | Faithful summary |
+| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in cost-tier order (free → cheap; inside a tier `COMPACTOR_MODELS` first: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite`, then the rest of the tier), 45 s each, no retries, no fallbacks. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
 | **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
 | **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate fits; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |

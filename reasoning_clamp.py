@@ -280,7 +280,10 @@ MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 COMPACTOR_MODELS = (
     "groq/openai/gpt-oss-120b",
     "gemini/models/gemini-2.5-flash-lite",
-    "openrouter/auto",
+    # "openrouter/auto" RIMOSSO (utente 2026-10-07: mai modelli costosi tra
+    # gli operari): auto instrada a MODELLI QUALSIASI, scelta non controllabile
+    # - puo' atterrare su un flagship costoso. "openrouter/free" (solo gratis)
+    # resta nel pool via listing.
 )
 COMPACTOR_TIMEOUT_S = 45
 COMPACT_OUTPUT_TOKENS = 4096   # tetto della sintesi prodotta dal compattatore
@@ -378,6 +381,188 @@ def _model_tier(n):
     if any(p in low for p in CHEAP_PATTERNS):
         return TIER_CHEAP
     return TIER_PAID
+
+
+# ---------- FILTRO COSTO degli operari (utente 2026-10-07: "NEVER use
+# expensive models during prompt compression/summarization/clamping - deepseek
+# v4 pro, kimi k3, ecc.") ----------
+# Un operario (B compattori, T/T2/E riassunti) viene ESCLUSO dal pool (non
+# solo demotato) se e' COSTOSO. Tre strati, in ordine di autorevolezza:
+#   1. PREZZO DEL NOSTRO CANALE (_TIER_HINTS dai listing dei gateway:
+#      synthetic e openrouter espongono pricing.prompt) - e' quello che
+#      paghiamo DAVVERO. Sopra WORKER_MAX_PRICE -> MAI. VINCE sul nome: un
+#      "pro" gratis resta ammesso, un "flash" a $3/M (Kimi-K3) e' escluso.
+#   2. INDICE PREZZI WEB (_WEB_PRICES: listing PUBBLICO di openrouter -
+#      api/v1/models senza key, ~450 modelli - fetch periodica del thread
+#      daemon): copre i gateway che NON espongono prezzi (groq, gemini)
+#      applicando il prezzo di mercato openrouter al modello equivalente di
+#      altro provider (richiesta utente 2026-10-07), match per FAMIGLIA
+#      (ultimo segmento dell'id, varianti -data/-instrutto normalizzate).
+#   3. REGEXP dei FLAGSHIP (EXPENSIVE_WORKER_RES: "pro", "opus", "sonnet",
+#      "large", "max", "kimi-k3", "deepseek-v4", "gpt-4/5", "o1/o3",
+#      "grok-4", "claude", ...) - rete di sicurezza quando NESSUN prezzo e'
+#      disponibile. WORKER_CHEAP_OVERRIDE_RES vetoa i match per le varianti
+#      economiche by-design (flash/mini/nano/lite/small/haiku/fast/air).
+# Mai esclusi: hardware locale e canali GRATIS (brand "free", ":free",
+# ollama-cloud) - costo zero per definizione, a prescindere dal nome.
+# Nessun segnale di costo -> ESCLUSO (conservativo: non si rischiano soldi
+# su un costo non provato).
+WORKER_MAX_PRICE_USD_PER_TOKEN = CHEAP_PRICE_USD_PER_TOKEN  # ~$0.50/M prompt
+EXPENSIVE_WORKER_RES = tuple(re.compile(p) for p in (
+    # suffissi/titoli premium (boundari: "minimax" NON matcha "max")
+    r"(?:^|[^a-z0-9])(?:pro|opus|sonnet|ultra|premium|large|max)(?:$|[^a-z0-9])",
+    r"kimi-?k[3-9]",          # flagship moonshot (k2/k2-instruct resta)
+    r"deepseek-?v[4-9]",      # v4+ (chat/reasoner/v3 restano; -flash vetoato)
+    r"gpt-[4-9]",             # gpt-4/5+ (gpt-oss NO: "o" non e' cifra)
+    r"(?:^|[^a-z0-9])o[1-9](?:$|[^a-z0-9])",  # o1/o3/o4 reasoning (non "omni")
+    r"grok-[2-9]",            # grok-4 (grok-3-mini/grok-4-fast vetoati)
+    r"claude",                # qualsiasi claude (haiku vetoato)
+    r"command-(?:a|r|x|l)",   # cohere premium
+))
+WORKER_CHEAP_OVERRIDE_RES = tuple(re.compile(p) for p in (
+    r"flash", r"mini", r"nano", r"lite", r"small", r"tiny", r"haiku",
+    r"fast", r"free", r"air",
+))
+
+WEB_PRICES_URL = os.environ.get(
+    "REASONING_CLAMP_WEB_PRICES_URL", "https://openrouter.ai/api/v1/models")
+WEB_PRICES_TTL_S = 6 * 3600    # i prezzi di mercato cambiano raramente
+WEB_PRICES_TIMEOUT_S = 25
+_WEB_PRICES = {"ts": 0.0, "fam": {}, "id": {}}  # famiglia/id -> USD/token
+_WEB_PRICES_LOCK = threading.Lock()
+_WEB_PRICES_SEEN = [False, -1]  # [log gia' dato, ultimo conteggio famiglie]
+
+
+def _web_family_variants(fam):
+    """Varianti normalizzate di una famiglia ('kimi-k2-instruct-0905' ->
+    ['kimi-k2-instruct-0905', 'kimi-k2-instruct', 'kimi-k2']): le marche di
+    data (-0905, -0423) e '-instruct' che i provider mettono nell'id non
+    esistono su openrouter. Versioni vere (glm-5.3) NON vengono toccate."""
+    out = []
+    cur = fam
+    for _ in range(4):
+        if cur in out:
+            break
+        out.append(cur)
+        nxt = re.sub(r"-\d{3,5}$", "", cur)
+        if nxt == cur:
+            nxt = re.sub(r"-instruct$", "", cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return out
+
+
+def _ingest_web_prices(data):
+    """Listing pubblico openrouter -> indice prezzi. SOLO thread daemon
+    (bloccante). pricing.prompt e' USD/token (stringa, anche con $)."""
+    by_id, by_fam = {}, {}
+    for m in (data.get("data") or []):
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "").strip().lower()
+        pr = m.get("pricing")
+        p = _price_usd_per_token(pr.get("prompt")) if isinstance(pr, dict) \
+            else None
+        if not mid or p is None:
+            continue
+        by_id[mid] = p
+        fam = mid.rsplit("/", 1)[-1]
+        for v in _web_family_variants(fam):
+            cur = by_fam.get(v)
+            if cur is None or p < cur:
+                by_fam[v] = p
+    return by_id, by_fam
+
+
+def _maybe_refresh_web_prices():
+    """Fetch dell'indice prezzi web se stale. SOLO thread daemon (bloccante):
+    stessa disciplina del listing /v1/models - mai fetch bloccanti nell'event
+    loop. Host con punto = default opener (via proxy env -> llmtrim, come i
+    gateway). Fallimento: si tiene l'indice vecchio, ritento al giro dopo."""
+    with _WEB_PRICES_LOCK:
+        stale = (time.monotonic() - _WEB_PRICES["ts"]) >= WEB_PRICES_TTL_S
+    if not stale:
+        return
+    try:
+        req = urllib.request.Request(WEB_PRICES_URL)
+        with urllib.request.build_opener().open(
+                req, timeout=WEB_PRICES_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        by_id, by_fam = _ingest_web_prices(data)
+        if not by_fam:
+            raise ValueError("indice prezzi vuoto")
+        with _WEB_PRICES_LOCK:
+            _WEB_PRICES["id"] = by_id
+            _WEB_PRICES["fam"] = by_fam
+            _WEB_PRICES["ts"] = time.monotonic()
+            n = len(by_fam)
+        if not _WEB_PRICES_SEEN[0] or n != _WEB_PRICES_SEEN[1]:
+            print(f"[reasoning_clamp] prezzi web (openrouter pubblico): "
+                  f"{len(by_id)} modelli, {n} famiglie - operari sopra "
+                  f"${WORKER_MAX_PRICE_USD_PER_TOKEN * 1e6:.2f}/M ESCLUSI",
+                  flush=True)
+            _WEB_PRICES_SEEN[0] = True
+            _WEB_PRICES_SEEN[1] = n
+    except Exception as exc:
+        if not _WEB_PRICES_SEEN[0]:
+            print(f"[reasoning_clamp] prezzi web non disponibili: "
+                  f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+
+
+def _web_price_for(model):
+    """Prezzo di mercato USD/token (PROMPT) dall'indice web per un modello
+    nostro, o None se sconosciuto. Match per id SENZA il nostro prefisso
+    ('synthetic/hf:moonshotai/Kimi-K3' -> 'moonshotai/kimi-k3'), poi per
+    FAMIGLIA con varianti normalizzate."""
+    with _WEB_PRICES_LOCK:
+        by_id = _WEB_PRICES["id"]
+        by_fam = _WEB_PRICES["fam"]
+        if not by_id and not by_fam:
+            return None
+    # i dict sono RIMPIAZZATI (mai mutati) dal daemon: il riferimento letto
+    # sotto lock resta valido e immutabile
+    s = str(model).lower()
+    core = s.split("/", 1)[-1]           # via il prefisso provider nostro
+    if core.startswith("hf:"):
+        core = core[3:]
+    p = by_id.get(core)
+    if p is not None:
+        return p
+    fam = core.rsplit("/", 1)[-1]
+    for v in _web_family_variants(fam):
+        p = by_fam.get(v)
+        if p is not None:
+            return p
+    return None
+
+
+def _worker_too_expensive(model):
+    """TRUE = modello ESCLUSO dal pool degli operari di compressione/riassunto
+    (utente 2026-10-07: 'NEVER use expensive models - deepseek v4 pro, kimi
+    k3, ecc.'). Prezzo noto VINCE sul nome: un 'pro' gratis resta ammesso, un
+    'flash' a $3/M e' escluso; nessun segnale di costo -> escluso."""
+    s = str(model)
+    if s in ("small-model", "local-model", "embedding-model"):
+        return False                      # hardware locale: costo zero
+    hint = _TIER_HINTS.get(s)
+    if hint is not None and hint >= 0:    # prezzo del NOSTRO canale: autorevole
+        return hint > WORKER_MAX_PRICE_USD_PER_TOKEN
+    if ":free" in s:
+        return False
+    brand = s.split("/", 1)[0].lower()
+    if "free" in brand or brand == "ollama-cloud" or s == "openrouter/free":
+        return False                      # canale gratis: costo zero
+    p = _web_price_for(s)                 # mercato (openrouter pubblico)
+    if p is not None:
+        return p > WORKER_MAX_PRICE_USD_PER_TOKEN
+    low = s.lower()
+    if any(rx.search(low) for rx in EXPENSIVE_WORKER_RES):
+        return not any(rx.search(low) for rx in WORKER_CHEAP_OVERRIDE_RES)
+    if any(pat in low for pat in CHEAP_PATTERNS):
+        return False
+    return True
+
 
 # ESPANSIONE WILDCARD -> nomi concreti (listing dei gateway, cache TTL).
 # Il model_list di litellm contiene pattern ("groq/*"): per una chiamata
@@ -534,13 +719,8 @@ def _fetch_explicit_contexts(deployments):
                     break
             price = None
             pr = m.get("pricing")
-            if isinstance(pr, dict) and pr.get("prompt") is not None:
-                try:
-                    p = float(pr.get("prompt"))
-                    if p >= 0:
-                        price = p
-                except (TypeError, ValueError):
-                    pass
+            if isinstance(pr, dict):
+                price = _price_usd_per_token(pr.get("prompt"))
             if ctx is None and price is None:
                 continue
             for name in names:
@@ -607,6 +787,10 @@ def _refresher_proxy_models():
             if not _SWEEP_SEEN[0]:
                 print(f"[reasoning_clamp] sweep contesti non riuscito: "
                       f"{type(exc).__name__}", flush=True)
+        # INDICE PREZZI WEB (openrouter pubblico, nessuna key): classifica
+        # come COSTOSI anche i modelli dei gateway che NON espongono prezzi
+        # (groq, gemini) - utente 2026-10-07: mai operari costosi
+        _maybe_refresh_web_prices()
         # primo aggancio mancato (proxy in avvio): ritento presto, non tra 10'
         time.sleep(PROXY_MODELS_TTL_S
                    if (got or _PROXY_MODELS_CACHE["models"]) else 30)
@@ -707,6 +891,26 @@ def _worker_banned(w):
     return bool(ban and ban[0] > time.monotonic())
 
 
+def _price_usd_per_token(v):
+    """pricing.prompt dei listing -> USD/token (float) o None (nascosto/
+    assente/non numerico). Formati visti: openrouter '0.00000069' (stringa),
+    synthetic '$0.0000006' (stringa CON $ - il vecchio float() lanciava
+    ValueError e i prezzi synthetic non arrivavano MAI ai tier/filter),
+    numeri gia' float."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if v >= 0 else None
+    s = str(v).strip().lstrip("$").replace(",", "").strip()
+    if not s:
+        return None
+    try:
+        p = float(s)
+    except ValueError:
+        return None
+    return p if p >= 0 else None
+
+
 def _fetch_pattern_models(name):
     """Listing {api_base}/models per un pattern 'X/*': ritorna i nomi
     PUBBLICI richiedibili ('groq/openai/gpt-oss-120b', 'gemini/models/
@@ -759,12 +963,9 @@ def _fetch_pattern_models(name):
             # un modello nuovo listato dal provider viene classificato senza
             # toccare il codice (classificazione dinamica)
             pr = m.get("pricing") if isinstance(m, dict) else None
-            if isinstance(pr, dict) and pr.get("prompt") is not None:
-                try:
-                    p = float(pr.get("prompt"))
-                except (TypeError, ValueError):
-                    p = -1.0
-                if p >= 0:
+            if isinstance(pr, dict):
+                p = _price_usd_per_token(pr.get("prompt"))
+                if p is not None:
                     _TIER_HINTS[full] = p
             # contesto REALE per-modello (vedi _DYN_CTX): campo per provider -
             # synthetic/inference4free/openrouter "context_length", groq
@@ -1387,6 +1588,10 @@ class ReasoningClamp(CustomLogger):
         def fits(n):
             # non-chat esclusi ANCHE se arrivano solo dal listing
             if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
+                return False
+            # MAI un modello costoso come operario (utente 2026-10-07: il
+            # prezzo comprime, non il flagship): escluso, non demotato
+            if _worker_too_expensive(n):
                 return False
             # finestra REALE per-modello (gateway _DYN_CTX -> listing
             # litellm -> statico di gruppo): stessa fonte del clamp
