@@ -33,9 +33,18 @@ Config via env:
   GW_CA      - bundle CA (root + llmtrim)
   MODELS_CACHE - "1" = abilita la cache last-good del listing
   MODELS_CACHE_FILE - path del file cache (default /cache/models.json)
+  CONTEXT_FROM - path di un endpoint NATIVO che espone il context_length
+               per-modello quando il listing OpenAI-compatible NON lo
+               include (Ollama: "/api/tags", campo details.context_length).
+               Il valore viene iniettato in /v1/models come "context_length"
+               cosi' reasoning_clamp (_DYN_CTX) usa il contesto REALE
+               per-modello, come per gli altri provider. Best-effort: se
+               l'endpoint non risponde o il campo manca, il listing resta
+               com'e' (vale il valore statico di config.yaml).
 """
 import json
 import os
+import time
 
 import httpx
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +58,7 @@ CA = os.environ.get("GW_CA", "/data/ca-bundle.pem")
 STRIP_LATEST = os.environ.get("STRIP_LATEST", "") == "1"
 MODELS_CACHE = os.environ.get("MODELS_CACHE", "") == "1"
 CACHE_FILE = os.environ.get("MODELS_CACHE_FILE", "/cache/models.json")
+CONTEXT_FROM = os.environ.get("CONTEXT_FROM", "")
 
 _client_kwargs = {"timeout": httpx.Timeout(600.0, connect=15.0)}
 if PROXY:
@@ -58,6 +68,42 @@ client = httpx.Client(**_client_kwargs)
 
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
                "accept-encoding", "keep-alive"}
+
+
+_CTX_CACHE = (0.0, {})
+_CTX_TTL = 60.0
+
+
+def _native_contexts():
+    """Mappa {nome_nativo: context_length} dall'endpoint CONTEXT_FROM.
+
+    Ollama NON espone context_length nel listing OpenAI-compatible
+    (/v1/models), ma lo dichiara nell'endpoint nativo /api/tags
+    (details.context_length): senza questo, reasoning_clamp userebbe il
+    valore statico della wildcard per TUTTI i modelli ollama/*. Best-effort
+    con memo TTL 60s: {} se l'upstream non risponde o il campo manca.
+    """
+    global _CTX_CACHE
+    if not CONTEXT_FROM:
+        return {}
+    now = time.time()
+    ts, cached = _CTX_CACHE
+    if cached and now - ts < _CTX_TTL:
+        return cached
+    try:
+        r = client.get(UPSTREAM + CONTEXT_FROM)
+        out = {}
+        if r.status_code == 200:
+            for m in r.json().get("models", []):
+                name = str(m.get("name") or m.get("model") or "")
+                ctx = (m.get("details") or {}).get("context_length")
+                if name and isinstance(ctx, (int, float)) and ctx > 0:
+                    out[name] = int(ctx)
+        _CTX_CACHE = (now, out)
+        return out
+    except Exception as e:
+        print(f"gw: context fetch skip: {type(e).__name__}: {e}", flush=True)
+        return {}
 
 
 def _load_cache():
@@ -119,13 +165,18 @@ class Handler(BaseHTTPRequestHandler):
         aggiunge ai modelli senza tag esplicito): il nome pubblico diventa
         "<PREFIX><model>" invece di "<PREFIX><model>:latest" (Ollama risolve
         comunque il nome senza tag). ATTENZIONE: se esistessero sia "x" che
-        "x:latest" gli id colliderebbero."""
+        "x:latest" gli id colliderebbero.
+        Con CONTEXT_FROM il context_length per-modello viene iniettato
+        nell'entry (mappato per nome NATIVO, prima dello strip/prefix)."""
         try:
             j = json.loads(data)
+            ctxs = _native_contexts()
             for m in j.get("data", []):
                 if "id" not in m:
                     continue
                 mid = str(m["id"])
+                if mid in ctxs and "context_length" not in m:
+                    m["context_length"] = ctxs[mid]
                 if STRIP_LATEST and mid.endswith(":latest"):
                     mid = mid[: -len(":latest")]
                 if not mid.startswith(ID_PREFIX):

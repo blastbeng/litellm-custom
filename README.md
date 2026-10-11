@@ -2,8 +2,9 @@
 
 A personal LLM router built on **LiteLLM Proxy** with lightweight Python
 gateways: a single OpenAI-compatible endpoint (`:4000`) that aggregates local
-models (llama-swap on a dedicated PC) and cloud providers (synthetic.new,
-OpenRouter, Groq, Gemini, Ollama Cloud, inference4free), with **dynamic**
+models (llama-swap and Ollama on a dedicated PC) and cloud providers
+(synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud, inference4free), with
+**dynamic**
 wildcard model listing, fallback policy and `reasoning_effort` handling.
 
 ```
@@ -14,8 +15,10 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
  localhost:4000      │   │  :4000      │              │  tracks/compresses LLM   │     │   (api.groq.com,
                      │   └──┬───┬───┬──┘              └──────────────────────────┘     │   openrouter.ai,
                      │      │   │   │                                                  │   generativelanguage,
-                     │      │   │   └────────────► llama-gate ──► blastpc:11435      │   api.synthetic.new,
-                     │      │   │        (TCP gate, http|https auto, PC off → 503)   │   ollama.com)
+                     │      │   │   ├────────────► llama-gate ──► blastpc:11435      │   api.synthetic.new,
+                     │      │   │   │        (TCP gate, http|https auto, PC off → 503)│  ollama.com)
+                     │      │   │   └────────────► ollama-gw ──► ollama-gate ──► 11434│
+                     │      │   │        (TCP gate, plain HTTP, PC off → 503)        │
                      │      │   │                                                  │
                      │      │   ├────► openrouter-gw ─┐                           │
                      │      │   ├────► groq-gw ───────┤ (via llmtrim)             │
@@ -31,6 +34,8 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 |---|---|---|
 | `litellm` | `config/config.yaml` | LiteLLM proxy/router (port 4000) |
 | `llama-gate` | `llama-gate/gate.py` | TCP gate to llama-swap — `GATE_TLS=auto`: tries TLS, falls back to plain HTTP on `WRONG_VERSION_NUMBER` (llama-swap runs **plain HTTP** since 2026-10-02, previously `https` self-signed with gate-side TLS termination; litellm always stays plain HTTP; PC off → 503 in ~2s) |
+| `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama's OpenAI-compatible API (`blastpc:11434`) — `GATE_TLS=0`, Ollama serves **plain HTTP** on that port, so the TLS probe is skipped; PC off → 503 in ~2s |
+| `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama local listing with `ID_PREFIX=ollama/` + `STRIP_LATEST=1`, no cache (models visible only while the PC is online; PC off → the gate 503s) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
 | `groq-gw`, `gemini-gw`, `inference4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
@@ -83,9 +88,13 @@ litellm even when the endpoint is down.
 2026-10-02): it is reached **only after every other fallback in the chain
 has failed**.
 
-**Local Ollama was removed on 2026-10-04** (`ollama/*`, `ollama-gate`,
-`ollama-gw`): the only local stack left is llama-swap behind `llama-gate`.
-**`ollama-cloud/*` (ollama.com) is untouched** — it is a cloud provider.
+**Local Ollama was restored on 2026-10-11** (`ollama/*`, `ollama-gate`,
+`ollama-gw`): the Windows PC serves its OpenAI-compatible API on
+`blastpc:11434` behind the same TCP gate as llama-swap. It is **not** a
+fallback step of any chain (it is only reached when requested directly);
+`ollama/*` lands on `small-model` through the generic branch below.
+**`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
+untouched.
 
 - **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
   then **`small-model`** as the final resort.
@@ -107,7 +116,7 @@ has failed**.
   embedding-capable model in the chain, any other target would 400 on an
   embeddings request.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
-  `openrouter/free`, `ollama-cloud/*`, `inference4free/*`,
+  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
   and any future prefix) → **`small-model`** directly.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
@@ -201,7 +210,9 @@ pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 131072 for `groq/openai/gpt-oss-120b` / `-20b`,
 whose real Groq context is 131072 even though the `groq/*` wildcard declares
 262144 as the ceiling for its largest model; 16384 for `embedding-model`;
-262144 for `openrouter/*`, `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
+131072 for `ollama/*` (Ollama does **not** expose `context_length` in its
+listing, so the wildcard value stays static); 262144 for `openrouter/*`,
+`groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
 entries are matched before generic prefixes.
 
 ## Context overflow cascade (`B → C → T → E → 413`)

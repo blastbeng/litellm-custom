@@ -12,8 +12,8 @@ xhigh/max vengono ridotti al massimo valore supportato dal provider.
 - gemini/* : valori validi high/medium/low/minimal/none ("xhigh" non
   esiste) -> xhigh/max clamped a "high"; default "high" se il client non
   passa nulla (gemini e gemma lo accettano tutti).
-- Gli altri modelli (synthetic/*, openrouter/*, ollama-cloud/*, locale)
-  non vengono toccati: il loro default xhigh sta gia' in config.yaml.
+- Gli altri modelli (synthetic/*, openrouter/*, ollama/*, ollama-cloud/*,
+  locale) non vengono toccati: il loro default xhigh sta gia' in config.yaml.
 
 POLICY FALLBACK per-modello (richiesta utente 2026-10-02, wildcard-safe):
 le chiavi dei fallback in config.yaml NON supportano wildcard (litellm
@@ -32,8 +32,8 @@ self.fallbacks)):
   modello llama-swap)
 - synthetic/syn:small:text e synthetic/syn:small:vision -> ["small-model"]
   (richiesta utente 2026-10-04: ALLINEATI, UN SOLO target che e'
-  small-model - niente local-model, niente Ollama locale (rimossa
-  dappertutto). Piccolo->piccolo: small-model e' la capacita' piu' vicina
+  small-model - niente local-model. Piccolo->piccolo: small-model e' la
+  capacita' piu' vicina
   a syn:small:*. syn:small:VISION su small-model (text-only su llama-swap)
   puo' rispondere 400 sull'input vision: scelta esplicita dell'utente,
   la catena resta questa)
@@ -43,14 +43,15 @@ self.fallbacks)):
   llama-swap, Qwen3-Embedding-0.6b. UN solo target: gli altri modelli
   llama-swap sono CHAT e su una richiesta embedding risponderebbero 400)
 - local-model       -> ["small-model"] (small-model come ultima spiaggia;
-  l'Ollama locale e' stata rimossa dappertutto, richiesta utente 2026-10-04)
+  l'Ollama locale (ripristinata il 2026-10-11) NON e' un gradino della
+  catena - scelta utente 2026-10-04 confermata)
 - small-model       -> [] (nessun auto-fallback: e' lui l'ultimo ricorso
   di tutti gli altri, riprovarlo da solo non avrebbe senso)
 - embedding-model   -> [] (nessun auto-fallback: e' l'unico modello
   embedding del fallback chain, un target CHAT su una richiesta embedding
   risponderebbe 400 - stesso motivo di small-model)
 - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
+  ollama/*, ollama-cloud/*, inference4free/* e QUALSIASI prefisso futuro)
   -> ["small-model"]: nessun gradino intermedio, small-model e' l'ultimo
   ricorso diretto. La lista di config.yaml mantiene la catch-all
   "*": ["small-model"] come rete di sicurezza (ombreggiata da questo
@@ -161,8 +162,8 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 FINAL_FALLBACK = "small-model"
 
 # synthetic/syn:small:text e synthetic/syn:small:vision (richiesta utente
-# 2026-10-04: ALLINEATI): UN SOLO fallback, small-model - niente local-model,
-# niente Ollama locale (rimossa dappertutto). Piccolo->piccolo: small-model e'
+# 2026-10-04: ALLINEATI): UN SOLO fallback, small-model - niente local-model.
+# Piccolo->piccolo: small-model e'
 # la capacita' piu' vicina a syn:small:* (contesto 196608, stessa gate di
 # local-model -> 503 in ~2s col PC spento). syn:small:VISION su small-model
 # (text-only su llama-swap) puo' rispondere 400 sull'input vision: scelta
@@ -220,6 +221,7 @@ CONTEXT_BY_PREFIX = (
     ("synthetic/hf:nomic-ai/nomic-embed-text-v1.5", 8192),
     ("synthetic/", 131072),  # floor per id synthetic NON in tabella
     ("inference4free/", 131072),
+    ("ollama/", 131072),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
     # NOTA ordine: gli entry specifici PRIMA del prefisso generico "groq/"
@@ -2009,8 +2011,9 @@ class ReasoningClamp(CustomLogger):
             # risponderebbero 400 (stesso motivo di small-model)
             data["fallbacks"] = []
         elif model == "local-model":
-            # small-model in ultima spiaggia (Ollama locale rimossa
-            # dappertutto, richiesta utente 2026-10-04)
+            # small-model in ultima spiaggia (Ollama locale ripristinata il
+            # 2026-10-11 ma NON e' un gradino della catena, richiesta utente
+            # 2026-10-04 confermata)
             data["fallbacks"] = [FINAL_FALLBACK]
         elif model in (SYN_SMALL_TEXT, SYN_SMALL_VISION):
             # richiesta utente 2026-10-04: syn:small:TEXT e syn:small:VISION
@@ -2038,7 +2041,7 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = ["local-model", FINAL_FALLBACK]
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
-            # openrouter/free, ollama-cloud/*, inference4free/* e
+            # openrouter/free, ollama/*, ollama-cloud/*, inference4free/* e
             # qualunque prefisso futuro): nessun gradino intermedio,
             # small-model e' l'ultimo ricorso diretto (richiesta utente
             # 2026-10-02). La catch-all "*": ["small-model"] in config.yaml

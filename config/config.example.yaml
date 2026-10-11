@@ -104,6 +104,31 @@ model_list:
       # contesto dichiarato da llama-swap per l'embedding model
       max_input_tokens: 16384
 
+  # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
+  # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
+  # docker-compose.yml. Endpoint OpenAI-compatible nativo di Ollama
+  # (/v1/models + /v1/chat/completions): listing DINAMICO via
+  # check_provider_endpoint -> tutti i modelli ollama/* sono visibili su
+  # litellm e instradati 1:1 (il capture rimuove "ollama/").
+  # model_info unico per la wildcard (si applica a TUTTI i modelli ollama/*).
+  # NIENTE MODELS_CACHE su ollama-gw: i modelli appaiono SOLO col PC online.
+  # Fallback finale per ollama/*: small-model (vedi fallbacks).
+  - model_name: ollama/*
+    litellm_params:
+      model: openai/*
+      api_base: http://ollama-gw/v1
+      api_key: dummy
+      # PC spento: la ollama-gate 503a in ~2s; PC acceso: l'inferenza locale
+      # puo' essere lenta -> stesso tetto dei modelli llama-swap.
+      timeout: 1800
+    model_info:
+      # contesto dei modelli Ollama attuali (wildcard unica: si applica a
+      # TUTTI i modelli ollama/*) - aggiornare se i contesti cambiano. Ollama
+      # NON espone il context_length nel listing, quindi il valore resta
+      # statico qui (reasoning_clamp: CONTEXT_BY_PREFIX "ollama/").
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
 
   # --- Modelli synthetic.new: ENTRY ESPLICITE (2026-10-06) ---
   # Direttiva utente: litellm deve SEMPRE esporre il contesto corretto per
@@ -367,8 +392,9 @@ model_list:
 
   # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
   # Nome pubblico "ollama-cloud/<model>": il prefisso "-cloud" marca che sono
-  # i modelli di ollama.com (cloud), NON locali - l'Ollama locale e' stata
-  # rimossa il 2026-10-04, il prefisso resta per chiarezza.
+  # i modelli di ollama.com (cloud), NON locali - l'Ollama LOCALE (blastpc)
+  # vive nella wildcard "ollama/*" qui sopra, prefisso distinto perche' il
+  # "ollama/" nudo e' riservato ai modelli locali.
   - model_name: ollama-cloud/*
     litellm_params:
       model: openai/*
@@ -427,8 +453,8 @@ litellm_settings:
   # di TUTTI i modelli, raggiunto SOLO dopo che tutti gli altri fallback sono
   # miseramente falliti. Catene per-modello (via callback reasoning_clamp,
   # wildcard-safe):
-  # (Ollama LOCALE rimossa il 2026-10-04: niente ollama/*, ollama-gate,
-  #  ollama-gw - resta ollama-cloud/*, che e' ollama.com)
+  # (Ollama LOCALE ripristinata il 2026-10-11: ollama/* via ollama-gate +
+  #  ollama-gw; ollama-cloud/* resta ollama.com, provider separato)
   # - synthetic/*  -> local-model -> small-model
   # - synthetic/syn:small:text e synthetic/syn:small:vision -> small-model
   #   (richiesta utente 2026-10-04: ALLINEATI, UN SOLO fallback,
@@ -443,7 +469,7 @@ litellm_settings:
   # - embedding-model -> NESSUN fallback (unico modello embedding della
   #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama-cloud/*, inference4free/*) -> small-model direttamente
+  #   ollama/*, ollama-cloud/*, inference4free/*) -> small-model direttamente
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via
