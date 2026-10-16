@@ -104,6 +104,88 @@ model_list:
       # contesto dichiarato da llama-swap per l'embedding model
       max_input_tokens: 16384
 
+  # --- Modelli MEDIA di llama-swap (PC 192.168.1.29): img/vid/tts/music ---
+  # (richiesta utente 2026-10-16) llama-swap espone TUTTI i suoi modelli su
+  # GET /v1/models e la sua config cambia spesso: i media NON hanno entry
+  # esplicite qui, sono QUATTRO WILDCARD PARZIALI che seguono il listing DAL
+  # VIVO. check_provider_endpoint: true (litellm_settings) fa interrogare a
+  # litellm il listing del provider - api_base llama-gate -> llama-swap:11435
+  # - e il pattern filtra per prefisso: aggiungere/togliere/rinominare un
+  # modello in llama-swap lo fa comparire/sparire qui SENZA toccare questa
+  # config. Un tipo NUOVO di media con un prefisso diverso richiede invece
+  # una quinta wildcard + il mode corrispondente (non deducibile dal nome).
+  #   img-*   -> POST /v1/images/generations  (stable-diffusion.cpp, sd-server)
+  #   vid-*   -> POST /v1/images/generations  (sd-server serve il video dallo
+  #              STESSO endpoint: llama-swap NON ha /v1/videos, che sarebbe
+  #              404 e la rotta video OpenAI e' asincrona/Sora)
+  #   tts-*   -> POST /v1/audio/speech        (audio.cpp, audiocpp_server)
+  #   music-* -> POST /v1/audio/speech        (audiocpp_server)
+  # MECCANICA: model_name "llama-swap/img-*" (il prefisso "llama-swap/" e'
+  # OBBLIGATORIO: get_known_models_from_wildcard fa split("/", 1) e senza "/"
+  # non espande NULLA) + litellm_params.model "openai/img-*". Al match
+  # PatternMatchRouter cattura il suffisso e lo sostituisce nel primo "*"
+  # del model -> "openai/img-flux-dev"; l'openai provider toglie "openai/"
+  # e manda a llama-swap l'id NATIVO "img-flux-dev" (llama-swap vuole il suo
+  # id, non il nome pubblico). Il nome PUBBLICO resta "llama-swap/img-flux-dev".
+  # NON e' la wildcard generica "llama-swap/*": quella catturerebbe anche
+  # local-model/small-model/embedding-model, che qui sopra hanno gia' le loro
+  # entry esplicite con contesti reali.
+  # mode: la ROTTA della richiesta sceglie l'endpoint (/v1/images/generations
+  # o /v1/audio/speech), NON il mode; mode serve al listing, alle UI e alla
+  # contabilita' - dichiararlo corretto costa zero e documenta l'uso.
+  # NESSUN FALLBACK (richiesta utente 2026-10-16): la callback
+  # reasoning_clamp azzera i fallback di OGNI "llama-swap/*" (media). Il
+  # motivo: un target CHAT (small-model) su una richiesta immagine/audio
+  # risponderebbe 400 e non esiste un "equivalente" media su cui ripiegare -
+  # l'errore dell'upstream deve arrivare al client cosi' com'e'.
+  # timeout 1800 + gate: stessa scelta di local-model (PC spento -> la gate
+  # 503a in ~2s; modello enorme in caricamento -> fino a 30 min di tetto).
+  - model_name: llama-swap/img-*
+    litellm_params:
+      model: openai/img-*
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      # Listing 2026-10-16: img-edit-qwen, img-flux-dev, img-flux-schnell,
+      # img-qwen-image, img-sdxl-light, img-zimage-turbo
+      mode: image_generation
+
+  - model_name: llama-swap/vid-*
+    litellm_params:
+      model: openai/vid-*
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      # Listing 2026-10-16: vid-ltx25, vid-wan22-14b, vid-wan22-5b
+      # (sd.cpp: il video si richiede come un'immagine, /v1/images/generations)
+      mode: image_generation
+
+  - model_name: llama-swap/tts-*
+    litellm_params:
+      model: openai/tts-*
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      # Listing 2026-10-16: tts-chatterbox, tts-kokoro, tts-pocket, tts-qwen3,
+      # tts-supertonic, tts-voxcpm2, tts-voxtral (audiocpp_server; le voci
+      # disponibili per modello si leggono da GET /v1/audio/voices su
+      # llama-swap: non replicato qui)
+      mode: audio_speech
+
+  - model_name: llama-swap/music-*
+    litellm_params:
+      model: openai/music-*
+      api_base: http://llama-gate/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      # Listing 2026-10-16: music-ace-step, music-minimax3, music-stable-audio
+      # (audiocpp_server: musica/canzoni via /v1/audio/speech)
+      mode: audio_speech
+
   # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
   # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
   # docker-compose.yml. Endpoint OpenAI-compatible nativo di Ollama
@@ -456,10 +538,20 @@ litellm_settings:
   # (Ollama LOCALE ripristinata il 2026-10-11: ollama/* via ollama-gate +
   #  ollama-gw; ollama-cloud/* resta ollama.com, provider separato)
   # - synthetic/*  -> local-model -> small-model
-  # - synthetic/syn:small:text e synthetic/syn:small:vision -> small-model
-  #   (richiesta utente 2026-10-04: ALLINEATI, UN SOLO fallback,
-  #   piccolo->piccolo. syn:small:VISION su small-model (text-only su
-  #   llama-swap) puo' rispondere 400 sull'input vision: scelta esplicita)
+  # - synthetic/syn:small:text -> small-model -> ollama/small-model ->
+  #   inference4free/auto -> openrouter/free (richiesta utente 2026-10-12: TRE
+  #   gradini, QUATTRO con l'aggiunta del gemello Ollama. small-model locale
+  #   PRIMO, poi ollama/small-model (Ollama sullo STESSO PC 192.168.1.29:11434,
+  #   via ollama-gw + ollama-gate: server INDIPENDENTE da llama-swap, quindi
+  #   regge quando llama-swap e' occupo o da 429), poi due cloud GRATIS: nomi
+  #   concreti risolti dalle wildcard ollama/*, inference4free/* e openrouter/*
+  #   del model_list - vedi reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
+  # - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
+  #   2026-10-14): small-model -> ollama/small-model -> inference4free/auto ->
+  #   openrouter/free, stessi quattro gradini e stesso ordine. Ri-allineata al
+  #   testo dopo la divergenza del 2026-10-12; la scelta 2026-10-04 del solo
+  #   small-model e' superata. Sui target locali text-only una richiesta vision
+  #   puo' 400: hop sprecato, la catena prosegue)
   # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
   #   (embeddings: quando synthetic non e' disponibile la richiesta cade sul
   #   modello embedding di llama-swap; vedi reasoning_clamp)
@@ -468,6 +560,12 @@ litellm_settings:
   #   altri; riprovarlo da solo non avrebbe senso)
   # - embedding-model -> NESSUN fallback (unico modello embedding della
   #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
+  # - llama-swap/* (img-*, vid-*, tts-*, music-*) -> NESSUN fallback
+  #   (richiesta utente 2026-10-16: i MEDIA di llama-swap non hanno un
+  #   "equivalente" su cui ripiegare e un target CHAT risponderebbe 400 su
+  #   /v1/images/generations e /v1/audio/speech: l'errore dell'upstream va
+  #   al client cosi' com'e'. Il prefisso copre tutte e quattro le wildcard
+  #   media; i modelli CHAT di llama-swap non hanno prefisso)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
   #   ollama/*, ollama-cloud/*, inference4free/*) -> small-model direttamente
   # Le chiavi dei fallback in litellm NON supportano wildcard

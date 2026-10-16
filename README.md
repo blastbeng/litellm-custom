@@ -82,6 +82,45 @@ For unstable upstreams (deepseek4free is a project under development): if
 disk (header `X-Models-Cache: stale`). Models remain always visible in
 litellm even when the endpoint is down.
 
+## Media models (llama-swap image / video / audio)
+
+Since 2026-10-16 llama-swap also serves **image generation, video
+generation, TTS and music** models. They are exposed by **four partial
+wildcards** that follow llama-swap's listing live — there is no per-model
+entry, so adding/removing/renaming a model in llama-swap makes it
+appear/disappear here without touching this config:
+
+| wildcard | upstream endpoint | native ids (listing 2026-10-16) |
+|---|---|---|
+| `llama-swap/img-*` | `POST /v1/images/generations` | `img-edit-qwen`, `img-flux-dev`, `img-flux-schnell`, `img-qwen-image`, `img-sdxl-light`, `img-zimage-turbo` |
+| `llama-swap/vid-*` | `POST /v1/images/generations` | `vid-ltx25`, `vid-wan22-14b`, `vid-wan22-5b` |
+| `llama-swap/tts-*` | `POST /v1/audio/speech` | `tts-chatterbox`, `tts-kokoro`, `tts-pocket`, `tts-qwen3`, `tts-supertonic`, `tts-voxcpm2`, `tts-voxtral` |
+| `llama-swap/music-*` | `POST /v1/audio/speech` | `music-ace-step`, `music-minimax3`, `music-stable-audio` |
+
+Public name `llama-swap/img-flux-dev`; the upstream receives the **native**
+id `img-flux-dev` (`PatternMatchRouter` capture → `openai/img-flux-dev`, then
+the `openai` provider strips its own prefix). Same `llama-gate` as the chat
+models: PC off → 503 in ~2s, huge model loading → up to 30 min.
+
+- **The `llama-swap/` prefix is mandatory**: `get_known_models_from_wildcard`
+  does `split("/", 1)` and expands **nothing** without a `/`.
+- **Video goes through the image endpoint**: llama-swap has no `/v1/videos`
+  (it would 404, and the OpenAI video route is async/`Sora`-shaped);
+  stable-diffusion.cpp serves video from `/v1/images/generations` too.
+- **The chat models of llama-swap keep their unprefixed names**
+  (`local-model`, `small-model`, `embedding-model`), with their explicit
+  entries and real contexts — that is why a single `llama-swap/*` wildcard is
+  *not* used: it would swallow them too.
+- **No fallback** (user request 2026-10-16) — see the fallback policy below.
+  They are also **excluded from the context-cascade worker pool**
+  (`_worker_pool`), where their local-hardware tier would otherwise put them
+  first in line as compression workers.
+- `mode` in `model_info` (`image_generation` / `audio_speech`) documents the
+  use for listings/UIs/cost tracking; the **endpoint is chosen by the route
+  the client calls**, not by `mode`.
+- Voices are per model: `GET /v1/audio/voices?model=<id>` on llama-swap
+  (e.g. `tts-kokoro` → `["if_sara","im_nicola"]`).
+
 ## Fallback policy
 
 **`small-model` is the final fallback of every model** (user request
@@ -90,19 +129,42 @@ has failed**.
 
 **Local Ollama was restored on 2026-10-11** (`ollama/*`, `ollama-gate`,
 `ollama-gw`): the Windows PC serves its OpenAI-compatible API on
-`blastpc:11434` behind the same TCP gate as llama-swap. It is **not** a
-fallback step of any chain (it is only reached when requested directly);
-`ollama/*` lands on `small-model` through the generic branch below.
+`blastpc:11434` behind the same TCP gate as llama-swap. It is a fallback step
+of **two** chains only — `ollama/small-model` is step 2 of both
+`synthetic/syn:small:text` (user request 2026-10-12) and
+`synthetic/syn:small:vision` (user request 2026-10-14, chains identical);
+every other `ollama/*` model lands on `small-model` through the generic branch
+below.
 **`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
 untouched.
 
 - **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
   then **`small-model`** as the final resort.
-- **`synthetic/syn:small:text`** and **`synthetic/syn:small:vision`** →
-  **`small-model`** only (user request 2026-10-04: **aligned**, a single
-  fallback, capacity-matched small → small).
-  `small-model` is text-only on llama-swap, so a vision request may 400 on
-  it: that is the explicit choice behind aligning both to one target.
+- **`synthetic/syn:small:text`** → **`small-model`** → **`ollama/small-model`**
+  → **`inference4free/auto`** → **`openrouter/free`** (user request 2026-10-12:
+  **four steps**; since 2026-10-14 `syn:small:vision` has the *identical*
+  chain). `small-model`
+  (llama-swap local, capacity matched small → small) comes **first**, then
+  `ollama/small-model` — the Ollama twin on the **same PC** (`192.168.1.29:11434`,
+  via `ollama-gw` + `ollama-gate`): an **independent server**, so it answers when
+  llama-swap is busy or 429s (its one-request-at-a-time serialization is exactly
+  why this step exists). Its static context is 131072 < 196608, so a prompt that
+  fits step 1 can 400 here — one wasted hop, the chain continues. The name must
+  exist in Ollama on the PC, otherwise the upstream 404s: also just a failed hop.
+  The two **free cloud** models are the safety net for when the local PC is off.
+  `ollama/small-model`, `inference4free/auto` and `openrouter/free` are
+  **concrete names resolved by the `ollama/*`, `inference4free/*` and
+  `openrouter/*` wildcards** in the model_list (litellm `get_model_list` →
+  `_get_wildcard_deployments` → `PatternMatchRouter.route`), **not** fictional
+  prefixes.
+- **`synthetic/syn:small:vision`** → **`small-model`** → **`ollama/small-model`**
+  → **`inference4free/auto`** → **`openrouter/free`** — the *identical* chain of
+  `synthetic/syn:small:text` (user request 2026-10-14: same four steps, same
+  order; defined as an alias so the two cannot diverge again). This re-aligns
+  the two chains after the 2026-10-12 divergence and supersedes the 2026-10-04
+  single-target choice. `small-model` and `ollama/small-model` are text-only on
+  the PC, so a vision request may 400 on them: one wasted hop, the chain
+  continues.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
   **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
@@ -115,6 +177,16 @@ untouched.
 - **`embedding-model`** (requested directly) → no fallback: it is the only
   embedding-capable model in the chain, any other target would 400 on an
   embeddings request.
+- **`llama-swap/*` media models** (`img-*`, `vid-*`, `tts-*`, `music-*`) →
+  **no fallback at all** (user request 2026-10-16). An image, a video, a
+  speech sample or a music track cannot be produced by a chat model, so any
+  hop in a chain could only 400 upstream — and would silently turn a failed
+  generation into a bogus chat answer. The callback returns `[]` for **every**
+  `llama-swap/...` name, so the config catch-all `"*": ["small-model"]` is
+  bypassed too (the per-request `fallbacks: []` overrides it); a generation
+  error surfaces as-is. The same prefix check keeps these models out of the
+  context-cascade **worker pool** (`_worker_pool`), where their
+  local-hardware tier would otherwise rank them first as compression workers.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
   `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
   and any future prefix) → **`small-model`** directly.
