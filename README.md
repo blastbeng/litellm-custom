@@ -123,47 +123,41 @@ models: PC off → 503 in ~2s, huge model loading → up to 30 min.
 
 ## Fallback policy
 
-**`small-model` is the final fallback of every model** (user request
-2026-10-02): it is reached **only after every other fallback in the chain
-has failed**.
+**`small-model` is no longer a fallback of any model** (user request
+2026-10-25). It remains a standalone model that can be called directly, but no
+chain contains it any more: when a chain is exhausted, the upstream error
+reaches the client unchanged.
 
 **Local Ollama was restored on 2026-10-11** (`ollama/*`, `ollama-gate`,
 `ollama-gw`): the Windows PC serves its OpenAI-compatible API on
-`blastpc:11434` behind the same TCP gate as llama-swap. It is a fallback step
-of **two** chains only — `ollama/small-model` is step 2 of both
-`synthetic/syn:small:text` (user request 2026-10-12) and
-`synthetic/syn:small:vision` (user request 2026-10-14, chains identical);
-every other `ollama/*` model lands on `small-model` through the generic branch
-below.
+`blastpc:11434` behind the same TCP gate as llama-swap. `ollama/small-model`
+is the local step of **two** chains only — `synthetic/syn:small:text` (user
+request 2026-10-12) and `synthetic/syn:small:vision` (user request 2026-10-14,
+chains identical).
 **`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
 untouched.
 
-- **`synthetic/*`** → **`local-model`** (llama-swap local model) first,
-  then **`small-model`** as the final resort.
-- **`synthetic/syn:small:text`** → **`small-model`** → **`ollama/small-model`**
-  → **`inference4free/auto`** → **`openrouter/free`** (user request 2026-10-12:
-  **four steps**; since 2026-10-14 `syn:small:vision` has the *identical*
-  chain). `small-model`
-  (llama-swap local, capacity matched small → small) comes **first**, then
-  `ollama/small-model` — the Ollama twin on the **same PC** (`192.168.1.29:11434`,
-  via `ollama-gw` + `ollama-gate`): an **independent server**, so it answers when
-  llama-swap is busy or 429s (its one-request-at-a-time serialization is exactly
-  why this step exists). Its static context is 131072 < 196608, so a prompt that
-  fits step 1 can 400 here — one wasted hop, the chain continues. The name must
-  exist in Ollama on the PC, otherwise the upstream 404s: also just a failed hop.
-  The two **free cloud** models are the safety net for when the local PC is off.
-  `ollama/small-model`, `inference4free/auto` and `openrouter/free` are
-  **concrete names resolved by the `ollama/*`, `inference4free/*` and
-  `openrouter/*` wildcards** in the model_list (litellm `get_model_list` →
-  `_get_wildcard_deployments` → `PatternMatchRouter.route`), **not** fictional
-  prefixes.
-- **`synthetic/syn:small:vision`** → **`small-model`** → **`ollama/small-model`**
-  → **`inference4free/auto`** → **`openrouter/free`** — the *identical* chain of
-  `synthetic/syn:small:text` (user request 2026-10-14: same four steps, same
-  order; defined as an alias so the two cannot diverge again). This re-aligns
-  the two chains after the 2026-10-12 divergence and supersedes the 2026-10-04
-  single-target choice. `small-model` and `ollama/small-model` are text-only on
-  the PC, so a vision request may 400 on them: one wasted hop, the chain
+- **`synthetic/*`** → **`local-model`** (llama-swap local model), single step.
+- **`synthetic/syn:small:text`** → **`ollama/small-model`** →
+  **`inference4free/auto`** → **`openrouter/free`** (user request 2026-10-12;
+  since 2026-10-14 `syn:small:vision` has the *identical* chain).
+  `ollama/small-model` — the Ollama model on the **same PC**
+  (`192.168.1.29:11434`, via `ollama-gw` + `ollama-gate`) — comes **first**:
+  an **independent server**, so it answers when llama-swap is busy or 429s (its
+  one-request-at-a-time serialization is exactly why this step exists). Its
+  static context is 131072, so a larger prompt can 400 here — one wasted hop,
+  the chain continues. The name must exist in Ollama on the PC, otherwise the
+  upstream 404s: also just a failed hop. The two **free cloud** models are the
+  safety net for when the local PC is off. `ollama/small-model`,
+  `inference4free/auto` and `openrouter/free` are **concrete names resolved by
+  the `ollama/*`, `inference4free/*` and `openrouter/*` wildcards** in the
+  model_list (litellm `get_model_list` → `_get_wildcard_deployments` →
+  `PatternMatchRouter.route`), **not** fictional prefixes.
+- **`synthetic/syn:small:vision`** → **`ollama/small-model`** →
+  **`inference4free/auto`** → **`openrouter/free`** — the *identical* chain of
+  `synthetic/syn:small:text` (user request 2026-10-14: same steps, same order;
+  defined as an alias so the two cannot diverge again). The local target is
+  text-only, so a vision request may 400 there: one wasted hop, the chain
   continues.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
@@ -171,9 +165,9 @@ untouched.
   16384, same `llama-gate` as the other local models). Single target: the
   other llama-swap models are chat models and would 400 on an embeddings
   request, so there is no further step.
-- **`local-model`** itself (requested directly) → **`small-model`**.
-- **`small-model`** → no fallback at all: it is the last resort of
-  everyone else, retrying it alone would make no sense.
+- **`local-model`** itself (requested directly) → **no fallback** (user
+  request 2026-10-25: `small-model` removed from every chain).
+- **`small-model`** → no fallback: standalone model, never a fallback.
 - **`embedding-model`** (requested directly) → no fallback: it is the only
   embedding-capable model in the chain, any other target would 400 on an
   embeddings request.
@@ -182,22 +176,22 @@ untouched.
   speech sample or a music track cannot be produced by a chat model, so any
   hop in a chain could only 400 upstream — and would silently turn a failed
   generation into a bogus chat answer. The callback returns `[]` for **every**
-  `llama-swap/...` name, so the config catch-all `"*": ["small-model"]` is
-  bypassed too (the per-request `fallbacks: []` overrides it); a generation
-  error surfaces as-is. The same prefix check keeps these models out of the
-  context-cascade **worker pool** (`_worker_pool`), where their
-  local-hardware tier would otherwise rank them first as compression workers.
+  `llama-swap/...` name, so no config catch-all can pull in a chat model (the
+  per-request `fallbacks: []` overrides it); a generation error surfaces as-is.
+  The same prefix check keeps these models out of the context-cascade
+  **worker pool** (`_worker_pool`), where their local-hardware tier would
+  otherwise rank them first as compression workers.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
   `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
-  and any future prefix) → **`small-model`** directly.
+  and any future prefix) → **no fallback**.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
 (`get_fallback_model_group`: exact match / provider-stripped / `"*"` only),
 so the per-model policy is implemented in the `reasoning_clamp.py` callback
 via **per-request** `litellm_params.fallbacks`, which override the config
 list (`router.py`: `kwargs.get("fallbacks", self.fallbacks)`).
-`config.yaml` keeps the catch-all `"*": ["small-model"]` entry as a safety
-net for requests that skip the callback.
+The config catch-all `"*": ["small-model"]` was **removed** (2026-10-25); the
+callback sets an explicit `fallbacks` list (often empty) on every request.
 
 ## `reasoning_effort` handling (cascade)
 
@@ -225,7 +219,7 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model` → `small-model`; 196608 for the locals, 131072
+(`synthetic/*` → `local-model`; 196608 for the locals, 131072
 floor for the synthetic wildcard — real per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and

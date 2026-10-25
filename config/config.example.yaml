@@ -194,7 +194,7 @@ model_list:
   # litellm e instradati 1:1 (il capture rimuove "ollama/").
   # model_info unico per la wildcard (si applica a TUTTI i modelli ollama/*).
   # NIENTE MODELS_CACHE su ollama-gw: i modelli appaiono SOLO col PC online.
-  # Fallback finale per ollama/*: small-model (vedi fallbacks).
+  # Nessun fallback per ollama/* (richiesta utente 2026-10-25).
   - model_name: ollama/*
     litellm_params:
       model: openai/*
@@ -427,8 +427,8 @@ model_list:
       api_base: http://openrouter-gw/v1
       api_key: sk-or-v1-YOUR_OPENROUTER_API_KEY
       # NIENTE max_tokens di default: verrebbe unito da litellm a OGNI
-      # tentativo (fallback inclusi, dopo l'hook) e su small-model (196608,
-      # ultimo ricorso di tutti) produrrebbe un 400; senza tetto ogni modello
+      # tentativo (fallback inclusi, dopo l'hook) e sui modelli con contesto
+      # piccolo produrrebbe un 400; senza tetto ogni modello
       # OpenRouter usa il proprio output di default
       # reasoning di default per OGNI richiesta (OpenRouter accetta
       # reasoning_effort come alias del suo parametro unificato
@@ -459,7 +459,8 @@ model_list:
   # Endpoint OpenAI-compatible (generativelanguage.googleapis.com/v1beta/
   # openai) via gemini-gw (PATH_PRE "/v1beta/openai": litellm chiama sempre
   # {origin}/v1). NIENTE max_tokens di default (come openrouter/*):
-  # verrebbe unito a ogni tentativo di fallback e 400erebbe su small-model.
+  # verrebbe unito a ogni tentativo di fallback e 400erebbe sui modelli con
+  # contesto piccolo.
   # reasoning gestito dalla callback reasoning_clamp (default
   # "high"; "xhigh" non e' un valore valido su Gemini).
   - model_name: gemini/*
@@ -483,7 +484,7 @@ model_list:
       api_base: https://ollama.com/v1
       api_key: YOUR_OLLAMA_API_KEY
       # NIENTE max_tokens di default (come openrouter/* e gemini/*): su
-      # small-model (196608, ultimo ricorso di tutti) produrrebbe un 400
+      # modelli con contesto piccolo produrrebbe un 400
       # reasoning di default per OGNI richiesta (sovrascrivibile dal client);
       # i modelli senza reasoning lo ignorano
       reasoning_effort: xhigh
@@ -531,33 +532,30 @@ litellm_settings:
   cache: false
   drop_params: false
 
-  # Fallback (richiesta utente 2026-10-02): small-model e' l'ULTIMO ricorso
-  # di TUTTI i modelli, raggiunto SOLO dopo che tutti gli altri fallback sono
-  # miseramente falliti. Catene per-modello (via callback reasoning_clamp,
+  # Fallback (richiesta utente 2026-10-25): small-model NON e' piu' un
+  # fallback di NESSUN modello. Resta un modello autonomo, invocabile
+  # direttamente; quando una catena si esaurisce l'errore dell'upstream
+  # arriva al client. Catene per-modello (via callback reasoning_clamp,
   # wildcard-safe):
   # (Ollama LOCALE ripristinata il 2026-10-11: ollama/* via ollama-gate +
   #  ollama-gw; ollama-cloud/* resta ollama.com, provider separato)
-  # - synthetic/*  -> local-model -> small-model
-  # - synthetic/syn:small:text -> small-model -> ollama/small-model ->
-  #   inference4free/auto -> openrouter/free (richiesta utente 2026-10-12: TRE
-  #   gradini, QUATTRO con l'aggiunta del gemello Ollama. small-model locale
-  #   PRIMO, poi ollama/small-model (Ollama sullo STESSO PC 192.168.1.29:11434,
-  #   via ollama-gw + ollama-gate: server INDIPENDENTE da llama-swap, quindi
-  #   regge quando llama-swap e' occupo o da 429), poi due cloud GRATIS: nomi
-  #   concreti risolti dalle wildcard ollama/*, inference4free/* e openrouter/*
-  #   del model_list - vedi reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
+  # - synthetic/*  -> local-model
+  # - synthetic/syn:small:text -> ollama/small-model -> inference4free/auto ->
+  #   openrouter/free (richiesta utente 2026-10-12: ollama/small-model e'
+  #   Ollama sullo STESSO PC 192.168.1.29:11434, via ollama-gw + ollama-gate:
+  #   server INDIPENDENTE da llama-swap, quindi regge quando llama-swap e'
+  #   occupo o da 429; poi due cloud GRATIS: nomi concreti risolti dalle
+  #   wildcard ollama/*, inference4free/* e openrouter/* del model_list - vedi
+  #   reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
   # - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
-  #   2026-10-14): small-model -> ollama/small-model -> inference4free/auto ->
-  #   openrouter/free, stessi quattro gradini e stesso ordine. Ri-allineata al
-  #   testo dopo la divergenza del 2026-10-12; la scelta 2026-10-04 del solo
-  #   small-model e' superata. Sui target locali text-only una richiesta vision
-  #   puo' 400: hop sprecato, la catena prosegue)
+  #   2026-10-14): ollama/small-model -> inference4free/auto -> openrouter/free,
+  #   stessi gradini e stesso ordine. Il target locale e' text-only: una
+  #   richiesta vision puo' 400, hop sprecato, la catena prosegue.
   # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
   #   (embeddings: quando synthetic non e' disponibile la richiesta cade sul
   #   modello embedding di llama-swap; vedi reasoning_clamp)
-  # - local-model -> small-model
-  # - small-model -> NESSUN fallback (e' lui l'ultimo ricorso di tutti gli
-  #   altri; riprovarlo da solo non avrebbe senso)
+  # - local-model -> NESSUN fallback (richiesta utente 2026-10-25)
+  # - small-model -> NESSUN fallback (modello autonomo, mai fallback)
   # - embedding-model -> NESSUN fallback (unico modello embedding della
   #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
   # - llama-swap/* (img-*, vid-*, tts-*, music-*) -> NESSUN fallback
@@ -567,16 +565,14 @@ litellm_settings:
   #   al client cosi' com'e'. Il prefisso copre tutte e quattro le wildcard
   #   media; i modelli CHAT di llama-swap non hanno prefisso)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama/*, ollama-cloud/*, inference4free/*) -> small-model direttamente
+  #   ollama/*, ollama-cloud/*, inference4free/*) -> NESSUN fallback
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via
   # litellm_params.fallbacks per-request, che OVERRIDE questa lista
   # (router.py: kwargs.get("fallbacks", self.fallbacks)). La catch-all
-  # "*": ["small-model"] qui sotto e' la rete di sicurezza per qualunque
-  # richiesta che non passi dalla callback.
-  fallbacks:
-    - "*": ["small-model"]
+  # "*": ["small-model"] e' stata RIMOSSA (richiesta utente 2026-10-25): non
+  # resta alcuna lista statica di fallback.
 
 router_settings:
   # enable_pre_call_checks DISATTIVO: con le wildcard i nomi espansi non
