@@ -27,8 +27,14 @@ self.fallbacks)):
   nessuna catena lo contiene piu': quando una catena si esaurisce l'errore
   dell'upstream arriva al client.
 
-- synthetic/*            -> ["local-model"]
-  (llama-swap locale, unico gradino)
+  REGOLA (richiesta utente 2026-10-28): le chiamate INTERNE della cascata
+  (B/T/T2/E, riconosciute dal metadata interno) girano con fallbacks=[] -
+  il clamp usa lo STESSO modello della richiesta e non hopa su altri modelli.
+  Nello stesso giro local-model e' stato rimosso dalla catena synthetic/*.
+
+- synthetic/*            -> [] (NESSUN fallback: local-model rimosso il
+  2026-10-28; restano solo i rami esatti qui sotto - syn:small:text,
+  syn:small:vision, embedding nomic)
 - synthetic/syn:small:text -> ["ollama/small-model",
   "inference4free/auto","openrouter/free"] (richiesta utente 2026-10-12:
   ollama/small-model (Ollama sullo STESSO PC: server INDIPENDENTE da
@@ -79,7 +85,8 @@ token del prompt col tokenizer REALE e risponde 400
 never truncated" - il testo NON e' di litellm, che con
 enable_pre_call_checks: false non fa alcun controllo), e litellm incapsula il
 400 come BadRequestError: cosi' una richiesta con prompt grande uccide la
-CATENA DI FALLBACK intera (synthetic/* -> local-model).
+CATENA DI FALLBACK intera (synthetic/*; local-model era l'unico gradino fino
+al 2026-10-28, ora il ramo generico synthetic/* non ha fallback).
 Strata puo' anche accorciare max_tokens DA SOLO (esatto, senza stima):
 "fit_max_tokens": true in strata-<model>.json sul PC (o About -> Model
 settings nella sua web UI) - restano da clampare i cloud (synthetic/* ecc.).
@@ -127,18 +134,20 @@ una cascata a livelli, e dopo ogni livello riusa la stima per il clamp:
      (modello, contesto, stima, livelli provati, hint) invece di far
      partire la richiesta e farla morire sulla catena di fallback.
 
-POOL OPERARI DINAMICO (richiesta utente 2026-10-06: "cascade model
-selection, exploit ANY possible litellm configured model, even the ones
-hosted by inference4free"): T, E e i compattori di B non usano piu' liste
-chiuse. _worker_pool enumera OGNI modello configurato su litellm (model_list
-del router: wildcard inclusi, es. inference4free/*), ordina per preferenza
-(piccoli/veloci prima per T/E, contesto grande prima per B), esclude i
-non-chat (embedding/whisper/guard/rerank: risponderebbero 400) e quelli il
-cui contesto non contiene il chunk. Failover per-chunk: il primo operario
-che riesce resta "appiccicoso" per i chunk successivi, ogni fallimento/
-risposta vuota avanza al successivo, finche' non si esaurisce il budget di
-tempo WORKER_TIME_BUDGET_S (niente piu' tetto fisso di operari: si prova
-TUTTO il pool, richiesta utente 2026-10-06).
+POOL OPERARI = MODELLO DELLA RICHIESTA (richiesta utente 2026-10-28, che
+sostituisce il pool dinamico del 2026-10-06): B, T, T2 ed E chiamano SEMPRE
+lo stesso modello della richiesta. _worker_pool riceve only=<model> e
+restituisce un pool di UN solo elemento (niente wildcard, niente listing,
+niente ordine per tier) e la chiamata interna gira con fallbacks=[]: una
+richiesta a synthetic/syn:large:text viene compattata da
+synthetic/syn:large:text, una a gemini/... da gemini/..., e cosi' via.
+Restano i filtri di CAPACITA': il livello si salta se il modello non
+contiene il corpo (contesto reale via _window_for), se e' non-chat
+(embedding/whisper/guard/rerank: 400) o un media di llama-swap. Il filtro di
+PREZZO (mai modelli costosi come operari) NON si applica al modello della
+richiesta: e' gia' quello scelto dal client. Conseguenza voluta: col modello
+giu' o troppo piccolo per il corpo, B/T2/E non hanno piu' una rete di
+sicurezza su altri modelli - resta C (BM25, locale) e poi F (413).
 
 La cascata gira SOLO nell'async hook (B, T ed E fanno chiamate LLM); il
 pre_call_hook sync applica solo policy/clamp, senza rete. Le chiamate
@@ -330,11 +339,10 @@ PROMPT_ERR_PCT = 0.03
 MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 
 # --- cascata overflow: B -> C -> T -> E -> F ---
-# B: ordine PREFERITO dei compattori (modelli a contesto grande). Da
-# ottobre 2026 la lista non e' piu' chiusa: se nessun preferito e'
-# disponibile/contiene il corpo, _worker_pool apre il pool a OGNI altro
-# modello configurato su litellm che possa contenere il corpo (richiesta
-# utente 2026-10-06: "exploit any possible litellm configured model").
+# B: compattatore = MODELLO DELLA RICHIESTA (richiesta utente 2026-10-28).
+# COMPACTOR_MODELS e' solo l'ordine preferito quando il nome della richiesta
+# e' un WILDCARD letterale (unico caso in cui _worker_pool resta dinamico):
+# il percorso normale non sceglie piu' un compattatore lato server.
 COMPACTOR_MODELS = (
     "groq/openai/gpt-oss-120b",
     "gemini/models/gemini-2.5-flash-lite",
@@ -350,12 +358,10 @@ MIN_BRIEF_CHARS = 200          # sintesi piu' corta accettata (sotto = fallita)
 COMPACT_ORIGIN = "context_compaction"
 COMPRESS_TARGET_RATIO = 0.55   # C: target = 55% del contesto (margine risposta)
 
-# T/E: ordine PREFERITO degli operari di riassunto (piccoli/veloci prima).
-# Il pool REALE e' dinamico (_worker_pool): OGNI modello configurato su
-# litellm (wildcard inclusi, es. inference4free/*) entra nel pool se il suo
-# contesto contiene il chunk; l'ordine PRIMARIO e' il tier di costo
-# (gratis -> economico -> costoso, vedi _model_tier) e i preferiti decidono
-# SOLO l'ordine DENTRO ogni tier.
+# T/E/T2: operario = MODELLO DELLA RICHIESTA (richiesta utente 2026-10-28).
+# SUMMARIZER_PREFERRED vale solo se il nome della richiesta e' un wildcard
+# letterale, quando _worker_pool resta dinamico; nel percorso normale non c'e'
+# scelta ne' ordine di tier: c'e' un solo modello, quello chiamato dal client.
 SUMMARIZER_PREFERRED = (
     "small-model",
     "groq/openai/gpt-oss-20b",
@@ -1515,8 +1521,12 @@ class ReasoningClamp(CustomLogger):
         # failover, escluderli TUTTI costa la compressione lossy.
         body_est = (_tiktoken_estimate([body])
                     or int(len(body) / CHARS_PER_TOKEN))
+        # SOLO il modello della richiesta (richiesta utente 2026-10-28): la
+        # sintesi della storia usa lo stesso modello che il client ha
+        # chiamato, non un compattatore altrui
         pool = self._worker_pool(body_est, COMPACTOR_MODELS,
-                                 output_tokens=COMPACT_OUTPUT_TOKENS)
+                                 output_tokens=COMPACT_OUTPUT_TOKENS,
+                                 only=model)
         if not pool:
             return None, f"no-compactor-fits:{body_est}tok"
         failures = []
@@ -1588,10 +1598,15 @@ class ReasoningClamp(CustomLogger):
               flush=True)
         return data, f"compress:{after}"
 
-    # ---------------- operari di riassunto (pool dinamico) ------------------
+    # ------------- operari di riassunto (modello della richiesta) ------------
 
-    def _worker_pool(self, needed_tokens, preferred, output_tokens=MAP_OUTPUT_TOKENS):
-        """OGNI modello configurato su litellm che puo' contenere
+    def _worker_pool(self, needed_tokens, preferred,
+                     output_tokens=MAP_OUTPUT_TOKENS, only=None):
+        """Pool di operari di un livello della cascata. PERCORSO NORMALE
+        (`only` = modello della richiesta, richiesta utente 2026-10-28): UN
+        solo candidato, nessuna scelta lato server - vedi l'ultimo paragrafo.
+        PERCORSO DINAMICO (solo con nome wildcard letterale): OGNI modello
+        configurato su litellm che puo' contenere
         `needed_tokens` di input (+ output + margine), ordinato per
         (tier di costo, preferenza): prima i modelli GRATIS
         (inference4free, openrouter/:free, listing a prezzo zero, locali),
@@ -1611,29 +1626,43 @@ class ReasoningClamp(CustomLogger):
         al pool i modelli presenti nel listing ma non in model_list e usa i
         contesti REALI (max_input_tokens/max_output_tokens) invece della
         stima statica: aggiungere/togliere un modello da litellm viene visto
-        senza toccare il codice (richiesta utente 2026-10-06)."""
-        names = []
-        try:
-            from litellm.proxy.proxy_server import llm_router
-            for dep in (getattr(llm_router, "model_list", None) or []):
-                n = (dep.get("model_name") if isinstance(dep, dict)
-                     else getattr(dep, "model_name", None))
-                if n and str(n) not in names:
-                    names.append(str(n))
-        except Exception:
-            names = []
-        names = _expand_wildcards(names)
+        senza toccare il codice (richiesta utente 2026-10-06).
 
-        # listing dinamico /v1/models (cache del thread daemon): gli id non
-        # in model_list entrano nel pool; i contesti reali sostituiscono la
-        # stima. Listing non ancora pronto -> dyn vuoto: solo model_list.
-        _ensure_proxy_models_refresher()
+        MODELLO DELLA RICHIESTA (richiesta utente 2026-10-28): con `only` il
+        pool e' composto da QUEL SOLO modello - la cascata (B/T/T2/E) usa lo
+        stesso modello della richiesta, non un pool di modelli altrui. Con
+        `only` non c'e' espansione wildcard ne' merge del listing ne' ordine
+        per tier: un solo candidato, valutato solo sul fatto che contenga il
+        corpo. Un nome wildcard letterale resta sul pool dinamico perche'
+        richiederebbe model="*" all'upstream (400/404 visto in produzione)."""
+        # solo = modello della richiesta da usare in ESCLUSIVA (vedi docstring)
+        solo = str(only) if only and "*" not in str(only) else None
+        names = []
         dyn = {}
+        _ensure_proxy_models_refresher()
         with _PROXY_MODELS_LOCK:
             dyn.update(_PROXY_MODELS_CACHE["models"])
-        for mid in dyn:
-            if mid not in names:
-                names.append(mid)
+        if solo:
+            names = [solo]
+        else:
+            try:
+                from litellm.proxy.proxy_server import llm_router
+                for dep in (getattr(llm_router, "model_list", None) or []):
+                    n = (dep.get("model_name") if isinstance(dep, dict)
+                         else getattr(dep, "model_name", None))
+                    if n and str(n) not in names:
+                        names.append(str(n))
+            except Exception:
+                names = []
+            names = _expand_wildcards(names)
+
+            # listing dinamico /v1/models (cache del thread daemon): gli id
+            # non in model_list entrano nel pool; i contesti reali
+            # sostituiscono la stima. Listing non ancora pronto -> dyn vuoto:
+            # solo model_list.
+            for mid in dyn:
+                if mid not in names:
+                    names.append(mid)
 
         def rank(n):
             for i, p in enumerate(preferred):
@@ -1659,8 +1688,11 @@ class ReasoningClamp(CustomLogger):
             if n.startswith(LLAMA_SWAP_MEDIA_PREFIX):
                 return False
             # MAI un modello costoso come operario (utente 2026-10-07: il
-            # prezzo comprime, non il flagship): escluso, non demotato
-            if _worker_too_expensive(n):
+            # prezzo comprime, non il flagship): escluso, non demotato.
+            # ECCEZIONE: il modello della richiesta (solo) - e' gia' quello
+            # scelto dal client, escluderlo toglierebbe del tutto B/T/T2/E
+            # (richiesta utente 2026-10-28)
+            if n != solo and _worker_too_expensive(n):
                 return False
             # finestra REALE per-modello (gateway _DYN_CTX -> listing
             # litellm -> statico di gruppo): stessa fonte del clamp
@@ -1691,16 +1723,15 @@ class ReasoningClamp(CustomLogger):
                [n for n in ordered if n in banned]
 
     async def _summarize_chunks(self, chunks, origin, model):
-        """Riassume i chunk con FAILOVER sull'INTERO pool dinamico entro il
-        budget di tempo WORKER_TIME_BUDGET_S (richiesta utente 2026-10-06:
-        "provare tutti i possibili modelli, con un limite di tempo; errore
-        solo quando proprio non riusciamo a fare nulla"): operario
-        "appiccicoso" (il primo che riesce resta per i chunk successivi),
-        ogni fallimento/risposta vuota avanza al successivo finche' c'e'
-        budget. Se il budget (o il pool) finisce a meta', si tengono i
-        PARZIALI: almeno un chunk riassunto = compressione utile, il livello
-        successivo della cascata completa se serve. Ritorna (brief, info)
-        con brief=None solo su fallimento TOTALE."""
+        """Riassume i chunk con l'operario = MODELLO DELLA RICHIESTA
+        (richiesta utente 2026-10-28: niente piu' pool dinamico di modelli
+        altrui - un chunk viene riassunto dallo stesso modello che il client
+        ha chiamato). Resta il budget di tempo WORKER_TIME_BUDGET_S: pool di
+        UN elemento, quindi un solo tentativo per chunk; se fallisce si
+        tengono i PARZIALI gia' prodotti (almeno un chunk riassunto =
+        compressione utile, il livello successivo della cascata completa se
+        serve). Ritorna (brief, info) con brief=None solo su fallimento
+        TOTALE."""
         from litellm.proxy.proxy_server import llm_router
         if llm_router is None:
             return None, "no-router"
@@ -1708,7 +1739,9 @@ class ReasoningClamp(CustomLogger):
         # bassa (non sovrastimare) per non escludere operari validi; il
         # margine del pool copre il residuo
         chunk_est = max(int(len(c) / CHARS_PER_TOKEN) for c in chunks)
-        pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED)
+        # SOLO il modello della richiesta (richiesta utente 2026-10-28): i
+        # livelli T/T2/E riassumono col modello che il client ha chiamato
+        pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED, only=model)
         if not pool:
             return None, f"no-worker-fits:{chunk_est}tok"
         deadline = time.monotonic() + WORKER_TIME_BUDGET_S
@@ -1776,7 +1809,8 @@ class ReasoningClamp(CustomLogger):
         la massa e' nell'ULTIMO messaggio user (il prompt compilato
         dall'agente), B/C/E non possono liberarla perche' la coda resta
         verbatim. T tiene verbatim solo le ANCORE (inizio + fine, dove sta
-        la richiesta corrente) e riassume il mezzo con il pool dinamico."""
+        la richiesta corrente) e riassume il mezzo col modello della
+        richiesta."""
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         idx = None
         for i in range(len(msgs) - 1, -1, -1):
@@ -1823,7 +1857,7 @@ class ReasoningClamp(CustomLogger):
         413). Comprime IN PLACE i messaggi DOPO l'ultimo messaggio user
         (risultati tool / assistant), il piu' grande prima, finche' la
         stima rientra nel contesto. Viene sostituito SOLO il 'content'
-        testuale (T2_HEADER + riassunto dal pool dinamico): ruolo,
+        testuale (T2_HEADER + riassunto del modello della richiesta): ruolo,
         tool_call_id e tool_calls restano - un tool result orfanizzato
         sarebbe un 400 del provider. TTL: T2_TIME_BUDGET_S totale per la
         passata + budget per-chunk dentro _summarize_chunks; i guadagni
@@ -1880,7 +1914,7 @@ class ReasoningClamp(CustomLogger):
               f"compressi, stima ~{cur} tok (contesto {ctx})", flush=True)
         return data, f"t2:{done}"
 
-    # ---------------- E: map/reduce sul pool dinamico -----------------------
+    # ---------------- E: map/reduce (modello della richiesta) ---------------
 
     def _chunk_for_map(self, body):
         """Taglia la trascrizione in chunk di ~MAP_CHUNK_INPUT_TOKENS token;
@@ -1941,8 +1975,8 @@ class ReasoningClamp(CustomLogger):
                          "cascata di compattazione (B compattori a contesto "
                          "grande -> C compressione BM25 -> T split+compress "
                          "della coda -> T2 compressione dei messaggi dopo "
-                         "l'ultimo user -> E map/reduce, tutti con failover "
-                         "sul pool dinamico dei modelli configurati) non ha "
+                         "l'ultimo user -> E map/reduce, tutti eseguiti "
+                         "col modello stesso della richiesta) non ha "
                          "liberato spazio: riduci il contesto del client o "
                          "usa un modello con contesto maggiore"),
             },
@@ -2069,7 +2103,13 @@ class ReasoningClamp(CustomLogger):
         # Regola (richiesta utente 2026-10-25): small-model NON e' piu' un
         # fallback di nessun modello. Resta un modello autonomo, invocabile
         # direttamente; qui garantiamo che nessuna catena lo contenga.
-        if model == "small-model":
+        if self._internal(data):
+            # chiamata INTERNA della cascata (B/T/T2/E): stesso modello della
+            # richiesta e NESSUN fallback - un hop su un altro modello
+            # tradirebbe la regola "il clamp usa il modello della richiesta"
+            # (richiesta utente 2026-10-28)
+            data["fallbacks"] = []
+        elif model == "small-model":
             # modello autonomo, mai fallback (richiesta utente 2026-10-25)
             data["fallbacks"] = []
         elif model == "embedding-model":
@@ -2111,11 +2151,12 @@ class ReasoningClamp(CustomLogger):
             # catena embedding.
             data["fallbacks"] = list(SYN_EMBED_FALLBACKS)
         elif model.startswith("synthetic/"):
-            # catena fallback: solo local-model (richiesta utente 2026-10-25:
-            # small-model rimosso da ogni catena).
-            # ECCEZIONI: syn:small:text, syn:small:vision e l'embedding
-            # nomic, gestiti dai rami esatti qui sopra
-            data["fallbacks"] = ["local-model"]
+            # NESSUN fallback (richiesta utente 2026-10-28: local-model
+            # rimosso da ogni catena synthetic/*, dopo small-model il
+            # 2026-10-25). I rami esatti qui sopra (syn:small:text,
+            # syn:small:vision, embedding nomic) restano le uniche catene
+            # synthetic/* esistenti.
+            data["fallbacks"] = []
         elif model.startswith(LLAMA_SWAP_MEDIA_PREFIX):
             # richiesta utente 2026-10-16: i MEDIA di llama-swap (img-*,
             # vid-*, tts-*, music-*) NON hanno MAI un fallback. Il ramo sta

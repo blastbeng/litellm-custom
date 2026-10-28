@@ -137,7 +137,9 @@ chains identical).
 **`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
 untouched.
 
-- **`synthetic/*`** → **`local-model`** (llama-swap local model), single step.
+- **`synthetic/*`** → **no fallback** (user request 2026-10-28: `local-model`
+  removed from every `synthetic/*` chain, right after `small-model` on
+  2026-10-25). Only the three exact chains below remain.
 - **`synthetic/syn:small:text`** → **`ollama/small-model`** →
   **`inference4free/auto`** → **`openrouter/free`** (user request 2026-10-12;
   since 2026-10-14 `syn:small:vision` has the *identical* chain).
@@ -219,7 +221,7 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` → `local-model`; 196608 for the locals, 131072
+(`synthetic/*` has no fallback since 2026-10-28; 196608 for the locals, 131072
 floor for the synthetic wildcard — real per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
@@ -288,9 +290,23 @@ the chain, so shrinking `max_tokens` cannot save it: the prompt itself has to
 shrink. `async_pre_call_hook` then runs a cascade and, after each level,
 re-estimates the prompt and re-applies the clamp.
 
-**Dynamic worker pool** (`_worker_pool`, 2026-10-06 request: "exploit any
-possible litellm configured model, even the ones hosted by inference4free"):
-every level that makes LLM calls builds its worker list **dynamically from
+**Worker = the request's own model** (user request 2026-10-28, supersedes the
+2026-10-06 dynamic pool): every level that makes LLM calls — B compaction,
+T/T2 tail summarisation, E map/reduce — calls **the very model the client
+asked for** (`_worker_pool(..., only=model)` returns a one-element pool, and
+the internal call runs with `fallbacks=[]`). A request for
+`synthetic/syn:large:text` is therefore compacted by `synthetic/syn:large:text`,
+never by a free/local model behind the scenes. Capacity filters still apply
+(the level is skipped when that model cannot hold the body via `_window_for`,
+or when it is a non-chat/media model), but the *never-expensive worker* price
+filter is bypassed for the request's own model — it is already the model the
+client chose. Consequence, intended: if the model is down or too small for the
+body, B/T2/E have no safety net — C (BM25, local) remains, then 413.
+
+**Dynamic worker pool (legacy path, wildcard request names only)**
+(`_worker_pool` without `only`): a request whose model name is a literal
+wildcard (`groq/*`) cannot be called upstream, so those requests fall back to
+the old behaviour: every level builds its worker list **dynamically from
 `llm_router.model_list`** — every configured model is eligible, wildcards
 included. **Dynamic `/v1/models` interrogation** (2026-10-06 request: "adapt
 the code to our model list DINAMICALLY"): a background daemon re-reads the
@@ -401,11 +417,11 @@ choice is not controllable.
 
 | Level | What it does | Lossy? |
 |---|---|---|
-| **B** | Compact the **history** (everything before the last `user` message) with the dynamic pool in cost-tier order (free → cheap; inside a tier `COMPACTOR_MODELS` first: `groq/openai/gpt-oss-120b` → `gemini/models/gemini-2.5-flash-lite`, then the rest of the tier), 45 s each, no retries, no fallbacks. | Faithful summary |
+| **B** | Compact the **history** (everything before the last `user` message) with the **request's own model** (2026-10-28), 45 s, no retries, no fallbacks. Legacy wildcard-name requests only: the dynamic pool in cost-tier order, `COMPACTOR_MODELS` first inside a tier. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
-| **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised through the dynamic worker pool. A structured note marks the compression. | Yes (middle only) |
+| **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised by the **request's own model**. A structured note marks the compression. | Yes (middle only) |
 | **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate fits; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |
-| **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised through the dynamic worker pool (180 s each), partials re-placed before the current request. | Yes |
+| **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised by the **request's own model** (180 s each), partials re-placed before the current request. | Yes |
 | **F** | Nothing freed space → if the **prompt alone fits** (`est ≤ context`) this is *not* a `prompt_too_large`: `max_tokens` is **forced to the room left** (`context − est − 1024`, flat margin, floor `MIN_FORCED_OUTPUT = 256` — below it the real 413 stands) and the request **is sent**: our 413 was deterministic and killed every client retry, while an upstream 400 is recoverable through the fallback chain and Strata shortens the completion itself (`fit_max_tokens`). Only when the prompt genuinely exceeds the context → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`). | — |
 
 **Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
