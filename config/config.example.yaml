@@ -526,6 +526,12 @@ litellm_settings:
   # host con poca RAM (es. RPi5) il limite basso evita picchi in OOM.
   max_request_size: 50
   num_retries: 0
+  # Timeout HTTP GLOBALE (secondi) per ogni modello che non ne dichiara uno
+  # proprio in litellm_params. Senza questa chiave litellm (1.109) usa il
+  # fallback interno di 600s per le chat completion, mentre i modelli locali
+  # hanno timeout: 1800: qui il tetto diventa uniforme (30 min). I client
+  # httpx condivisi mantengono connect=5s.
+  request_timeout: 1800
   cache: false
   drop_params: false
 
@@ -579,8 +585,13 @@ router_settings:
   # ModelNotMappedError PRIMA della chiamata, deviando tutto silenziosamente
   # sul fallback catch-all.
   enable_pre_call_checks: false
-  num_retries: 1
-  retry_after: 1
+  # 3 retry (4 tentativi totali) sullo stesso modello prima di arrendersi;
+  # solo per errori ritentabili (408/409/429/5xx, incluso il "Connection
+  # error" che arriva come 500). Le catene di fallback restano invariate.
+  num_retries: 3
+  # Pavimento del backoff (esponenziale: 2s, 2s, 4s; il Retry-After del
+  # provider, se <= 60s, ha la precedenza).
+  retry_after: 2
 
 general_settings:
   master_key: sk-YOUR_LITELLM_MASTER_KEY
