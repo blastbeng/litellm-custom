@@ -176,6 +176,13 @@ from litellm.integrations.custom_logger import CustomLogger
 
 GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 
+# Testo aggiunto quando lo stream upstream viene troncato dopo che il client
+# ha gia' ricevuto contenuto (vedi async_post_call_streaming_iterator_hook):
+# meglio una risposta parziale con un avviso esplicito di un 500 che la perde.
+TRUNCATED_STREAM_MARKER = (
+    "\n\n[risposta interrotta: il provider ha chiuso lo stream in anticipo]"
+)
+
 # NOTA (richiesta utente 2026-10-25): small-model NON e' piu' un fallback di
 # NESSUN modello - nessuna costante FINAL_FALLBACK. Resta solo un modello
 # autonomo, invocabile direttamente; quando una catena si esaurisce l'errore
@@ -2208,6 +2215,81 @@ class ReasoningClamp(CustomLogger):
     def pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         # sync: policy + clamp, nessuna rete (la cascata richiede await)
         return self._apply(data)
+
+    async def async_post_call_streaming_iterator_hook(
+        self, user_api_key_dict, response, request_data
+    ):
+        """Chiude in modo PULITO uno stream che l'upstream tronca a meta'.
+
+        Caso reale (2026-10-30, syn:large:text 95k token): synthetic.new -
+        nginx davanti a vLLM - chiude il body chunked SENZA il chunk finale
+        quando il backend resta muto ~60s (visto anche un 502 nginx a 63s
+        sulla stessa richiesta). aiohttp lo riporta come
+        "TransferEncodingError: Not enough data to satisfy transfer length
+        header"; litellm, avendo gia' mandato chunk al client, NON puo' fare
+        fallback (router.stream_with_fallbacks rilancia l'originale) e
+        OpenWebUI mostra un 500 perdendo la risposta parziale.
+
+        Qui, se l'eccezione arriva DOPO che il client ha ricevuto contenuto,
+        lo stream viene chiuso con un chunk finale esplicito: il client tiene
+        il testo parziale + il marcatore. Se non e' stato emesso NULLA
+        l'eccezione risale, cosi' retry/fallback di litellm restano invariati.
+        Client disconnesso (CancelledError/GeneratorExit) resta un errore
+        del client, non dell'upstream: rilanciato.
+        """
+        emitted = False
+        last = None
+        try:
+            async for chunk in response:
+                emitted = True
+                last = chunk
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as e:
+            if not emitted:
+                raise
+            print(
+                f"[reasoning_clamp] stream upstream troncato dopo l'output "
+                f"({type(e).__name__}: {e}) -> chiusura pulita con marcatore",
+                flush=True,
+            )
+            marker = self._truncated_stream_marker(last, request_data)
+            if marker is not None:
+                yield marker
+
+    @staticmethod
+    def _truncated_stream_marker(last, request_data):
+        """Chunk finale (finish_reason "stop") col testo del marcatore.
+
+        Ricostruito dall'ultimo chunk per conservare id/created/model del
+        provider: OpenWebUI aggancia la fine dello stream a quel messaggio.
+        Se la costruzione fallisce (cambio di tipi litellm) si chiude e
+        basta, senza rimettere in piedi l'errore.
+        """
+        try:
+            from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
+
+            return ModelResponseStream(
+                id=getattr(last, "id", None) or "chatcmpl-stream-truncated",
+                created=getattr(last, "created", None) or int(time.time()),
+                model=getattr(last, "model", None)
+                or str((request_data or {}).get("model") or ""),
+                choices=[
+                    StreamingChoices(
+                        index=0,
+                        delta=Delta(content=TRUNCATED_STREAM_MARKER),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+        except Exception as e:
+            print(
+                f"[reasoning_clamp] marcatore stream non costruito: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            return None
 
 
 rclamp = ReasoningClamp()
