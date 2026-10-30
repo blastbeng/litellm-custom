@@ -20,15 +20,13 @@ services:
       # - LITELLM_LOG WARNING: meno stringhe di log retenute/stampate
       MALLOC_ARENA_MAX: "2"
       LITELLM_LOG: WARNING
-    # Hard-limit: se litellm supera questi confini viene OOM-killed LUI (e
-    # riavviato) invece di spingere tutto l'host in OOM su zram (16GB azzerati).
-    # Base osservata ~660MB. Il vecchio tetto 1g/1g (memswap_limit = mem_limit
-    # -> ZERO swap extra) faceva morire litellm al primo picco: il kernel memcg
-    # OOM lo uccideva a ~995MB. Ora 1.5g hard + 1g di swap zram come cuscinetto,
-    # cosi' uno spike sfoga in zram (compresso) invece di uccidere il processo.
-    mem_limit: 1536m
-    memswap_limit: 2560m
-    oom_score_adj: 200
+    # Tetto ALTO: litellm non deve essere OOM-killed (ogni kill tronca gli
+    # stream in corso -> TransferEncodingError lato OpenWebUI), quindi 2g di
+    # RAM + 1g di swap. Base osservata ~600MB; il vecchio 1g/1g moriva a
+    # ~995MB e il 1.5g/2.5g + oom_score_adj 200 lo rendeva il primo candidato
+    # all'OOM anche sull'host. oom_score_adj resta 0 (default).
+    mem_limit: 2g
+    memswap_limit: 3g
     volumes:
       - ./config/config.yaml:/app/config.yaml
       - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
