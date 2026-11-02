@@ -115,6 +115,38 @@ now deal with it:
   single explicit chunk (the SSE status is already gone at that point). Normal
   responses pass through untouched.
 
+### Quarantine of models that keep breaking (`reasoning_clamp`)
+
+A model that fails repeatedly (rate limit, 5xx, timeout, connection error, or
+a quota notice served as a 200) is temporarily **hidden from the listings** so
+that an external client does not pick it, and the compaction cascade stops
+using it as a worker. One sliding-window counter per **public model name**,
+fed by both client requests (`async_post_call_failure_hook`) and the internal
+cascade attempts:
+
+| Knob | Value | Meaning |
+|---|---|---|
+| `QUAR_FAIL_THRESHOLD` | 3 | failures inside the window |
+| `QUAR_FAIL_WINDOW_S` | 600 | sliding window (10 min) |
+| `QUAR_BASE_S` | 900 | first quarantine: 15 min |
+| `QUAR_MAX_S` | 21600 | escalation cap: each relapse doubles it, up to 6 h |
+
+Effects and guarantees:
+
+* the name disappears from `/v1/models`, `/model/info` and
+  `/model_group/info` (and `/v1/models/{id}` answers 404) through
+  `async_filter_listed_models`; it comes back **by itself** when the TTL
+  expires — no config change, the wildcard stays;
+* it is **not** chosen by `_worker_pool` while quarantined (no wasted hop);
+* it is still **callable** if a client asks for it explicitly: hiding is not
+  blocking, so a healthy model is re-enabled by its first success
+  (`_quar_note_ok`) without waiting for the TTL;
+* only provider faults count — 400/401/404 and context-overflow are our
+  errors and never quarantine a model;
+* `auto` and every `*/auto` are **never** quarantined (nor counted): they are
+  the fallback by definition, hiding them would empty the fallback list;
+* state is in RAM only: a litellm restart clears all quarantines.
+
 ## Media models (llama-swap image / video / audio)
 
 Since 2026-10-16 llama-swap also serves **image generation, video

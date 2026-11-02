@@ -1001,81 +1001,144 @@ def _ensure_proxy_models_refresher():
 # proxy non ascolta ancora (fase di avvio) il thread ritenta ogni 30s
 _ensure_proxy_models_refresher()
 
-# ---------------- BLACKLIST TEMPORANEA degli operari ----------------------
-# Richiesta utente 2026-10-06: "system to temp blacklist models
-# (incrementally) that fail too often when used for
-# compression/summarization/clamping". I falli sono contati DIRETTAMENTE nei
-# punti in cui gli operari chiamano l'LLM (B compattori, T/E riassunti:
-# eccezioni E risposte vuote) - niente parsing dei log: stessa informazione,
-# zero ambiguita'. Contatore a finestra scivolante: WORKER_FAIL_THRESHOLD
-# falli entro WORKER_FAIL_WINDOW_S -> blacklist per WORKER_BAN_BASE_S; ogni
-# nuova recidiva RADDOPPIA la durata (incrementale, tetto WORKER_BAN_MAX_S).
-# Un successo pulito consuma un fallo e fa decadere uno strike; un successo
-# MENTRE e' in blacklist lo ricovera subito (la quota del provider e'
-# tornata). I blacklistati NON vengono esclusi dal pool: solo DEMOTI in
-# fondo - se tutto il resto fallisce si riprova comunque (auto-guarigione,
-# mai pool vuoto per colpa del blacklist). Vale SOLO per gli operari interni
-# (compressione/riassunto/clamp): il traffico dei client non tocca questi
-# contatori.
-WORKER_FAIL_WINDOW_S = 600      # finestra dei falli (10 min)
-WORKER_FAIL_THRESHOLD = 3       # falli nella finestra -> blacklist
-WORKER_BAN_BASE_S = 900         # prima blacklist: 15 min
-WORKER_BAN_MAX_S = 86400        # tetto escalation: 24h
-_WORKER_FAILS = {}              # id -> [timestamp dei falli nella finestra]
-_WORKER_BANS = {}               # id -> [ban_until_monotonic, strikes]
-_WORKER_HEALTH_LOCK = threading.Lock()
+# ---------------- QUARANTENA dei modelli che si spaccano -------------------
+# Due richieste utente che qui sono UNA sola cosa:
+#  - 2026-10-06: blacklist temporanea (incrementale) degli operari che
+#    fallivano troppo spesso in compressione/riassunto;
+#  - 2026-11-02: "escludere da litellm con un TTL i modelli che chiamiamo che
+#    si spaccano troppo spesso o vanno in ratelimit, cosi' un provider
+#    esterno non li 'vede' momentaneamente".
+# Stesso stato, stesso contatore. L'id e' il NOME PUBBLICO del modello
+# (es. gpt4free/xxx), alimentato da tre sorgenti:
+#  - i tentativi interni della cascata (eccezione o risposta vuota),
+#  - i fallimenti delle richieste dei CLIENT (async_post_call_failure_hook:
+#    429, 5xx, timeout, errore di connessione; NON 400/401/404/context),
+#  - l'avviso di quota travestito da 200 (-> 429) e lo stream troncato.
+# Finestra scivolante: QUAR_FAIL_THRESHOLD falli entro QUAR_FAIL_WINDOW_S ->
+# modello in quarantena per QUAR_BASE_S; ogni recidiva RADDOPPIA (tetto
+# QUAR_MAX_S). Un successo azzera i falli e fa decadere uno strike; un
+# successo DURANTE la quarantena la chiude subito (il provider e' tornato).
+# Effetti della quarantena:
+#  - il modello SPARISCE dalla listing (async_filter_listed_models ->
+#    /v1/models, /model/info, /model_group/info; /v1/models/{id} risponde
+#    404) finche' il TTL non scade: nessuna config toccata, la wildcard
+#    resta e il nome torna da solo;
+#  - NON viene scelto come operaio dalla cascata (fits() in _worker_pool),
+#    cosi' una compressione non spreca il primo tentativo;
+#  - resta CHIAMABILE se un client lo chiede esplicitamente (nascondere non
+#    e' bloccare): cosi' un modello tornato sano si riabilita al primo
+#    successo, senza aspettare il TTL.
+# MAI in quarantena i router automatici (`auto`, `*/auto`): sono il ripiego
+# per definizione, nasconderli svuoterebbe la lista dei ripieghi (richiesta
+# utente 2026-11-02: "non escludiamo mai il router Auto e il provider Auto di
+# gpt4free"). Restano contati? No: non si contano nemmeno i loro falli.
+QUAR_FAIL_WINDOW_S = 600        # finestra dei falli (10 min)
+QUAR_FAIL_THRESHOLD = 3         # falli nella finestra -> quarantena
+QUAR_BASE_S = 900               # prima quarantena: 15 min
+QUAR_MAX_S = 21600              # tetto escalation: 6h (era 24h quando valeva
+                                # solo per gli operari: per la listing e' troppo)
+QUAR_PROTECTED_SUFFIX = "/auto"  # oltre al nome esatto "auto"
+_QUAR_FAILS = {}                # id -> [timestamp dei falli nella finestra]
+_QUAR_BANS = {}                 # id -> [until_monotonic, strikes]
+_QUAR_LOCK = threading.Lock()
+_QUAR_LAST_HIDDEN = [set()]     # ultimo insieme loggato (solo per il log)
 
 
-def _worker_note_fail(w, err=""):
-    """Conta un fallo dell'operario `w` (eccezione o risposta vuota); alla
-    soglia applica la blacklist (log incluso, durata raddoppiata a ogni
-    recidiva). Chiamare SOLO per i tentativi operario-interni."""
+def _quar_protected(w):
+    """True per i modelli che non vanno MAI in quarantena (router automatici)."""
+    if not w:
+        return False
+    s = str(w)
+    return s == "auto" or s.endswith(QUAR_PROTECTED_SUFFIX)
+
+
+def _quarantined(w):
+    """True se `w` e' in quarantena ADESSO.
+
+    Lettura lock-free: get atomico sotto GIL; la scadenza e' verificata sul
+    monotonic corrente, cosi' la listing smette di filtrare da sola allo
+    scadere del TTL (nessun thread di pulizia).
+    """
+    if not w or _quar_protected(w):
+        return False
+    ban = _QUAR_BANS.get(w)
+    return bool(ban and ban[0] > time.monotonic())
+
+
+def _quar_note_fail(w, err=""):
+    """Conta un fallo di `w` (eccezione, risposta vuota, quota travestita);
+    alla soglia mette il modello in quarantena, con log e durata raddoppiata
+    a ogni recidiva. I protetti (*/auto) non vengono nemmeno contati."""
+    if not w or _quar_protected(w):
+        return
     now = time.monotonic()
-    with _WORKER_HEALTH_LOCK:
-        fl = [t for t in _WORKER_FAILS.get(w, [])
-              if now - t < WORKER_FAIL_WINDOW_S]
+    with _QUAR_LOCK:
+        fl = [t for t in _QUAR_FAILS.get(w, [])
+              if now - t < QUAR_FAIL_WINDOW_S]
         fl.append(now)
-        _WORKER_FAILS[w] = fl
-        if len(fl) < WORKER_FAIL_THRESHOLD:
+        _QUAR_FAILS[w] = fl
+        if len(fl) < QUAR_FAIL_THRESHOLD:
             return
-        ban = _WORKER_BANS.get(w)
+        ban = _QUAR_BANS.get(w)
         if ban and ban[0] > now:
-            return                      # gia' in blacklist: nessun nuovo log
+            return                      # gia' in quarantena: nessun nuovo log
         strikes = (ban[1] if ban else 0) + 1
-        dur = min(WORKER_BAN_MAX_S, WORKER_BAN_BASE_S * (2 ** (strikes - 1)))
-        _WORKER_BANS[w] = [now + dur, strikes]
-        _WORKER_FAILS[w] = []
-        print(f"[reasoning_clamp] blacklist {w} per {dur // 60}m "
+        dur = min(QUAR_MAX_S, QUAR_BASE_S * (2 ** (strikes - 1)))
+        _QUAR_BANS[w] = [now + dur, strikes]
+        _QUAR_FAILS[w] = []
+        print(f"[reasoning_clamp] quarantena {w} per {dur // 60}m "
               f"(recidiva {strikes}, {len(fl)} falli/"
-              f"{WORKER_FAIL_WINDOW_S // 60}m"
-              f"{': ' + str(err)[:80] if err else ''})", flush=True)
+              f"{QUAR_FAIL_WINDOW_S // 60}m"
+              f"{': ' + str(err)[:80] if err else ''}) -> fuori dalla listing",
+              flush=True)
 
 
-def _worker_note_ok(w):
-    """Operario riuscito: azzera i falli e fa decadere uno strike; se era in
-    blacklist lo ricovera subito (l'operario ha risposto di nuovo)."""
+def _quar_note_ok(w):
+    """Successo: azzera i falli e fa decadere uno strike; se il modello era
+    in quarantena la chiude subito (ha risposto di nuovo)."""
+    if not w:
+        return
     now = time.monotonic()
-    with _WORKER_HEALTH_LOCK:
-        _WORKER_FAILS.pop(w, None)
-        ban = _WORKER_BANS.get(w)
+    with _QUAR_LOCK:
+        _QUAR_FAILS.pop(w, None)
+        ban = _QUAR_BANS.get(w)
         if not ban:
             return
         was_banned = ban[0] > now
         strikes = ban[1] - 1
         if strikes <= 0:
-            _WORKER_BANS.pop(w, None)
+            _QUAR_BANS.pop(w, None)
         else:
-            _WORKER_BANS[w] = [0, strikes]   # strike decaduto, non dimenticato
+            _QUAR_BANS[w] = [0, strikes]   # strike decaduto, non dimenticato
         if was_banned:
-            print(f"[reasoning_clamp] blacklist: {w} ricoverato (l'operario "
-                  f"ha risposto di nuovo)", flush=True)
+            print(f"[reasoning_clamp] quarantena: {w} riabilitato (ha risposto "
+                  f"di nuovo) -> di nuovo nella listing", flush=True)
 
 
-def _worker_banned(w):
-    """True se l'operario e' in blacklist ADESSO (lettura lock-free: get
-    atomico sotto GIL; la scadenza e' verificata sul monotonic corrente)."""
-    ban = _WORKER_BANS.get(w)
-    return bool(ban and ban[0] > time.monotonic())
+def _quar_failure_kind(exc):
+    """Etichetta del guasto se e' colpa del MODELLO, altrimenti None.
+
+    Contano solo i guasti del provider: rate limit, 5xx, timeout, errore di
+    connessione. Un 400/401/404 o un context overflow sono errori NOSTRI
+    (parametri, chiave, prompt troppo lungo): mettere in quarantena il modello
+    per quelli nasconderebbe modelli sani.
+    """
+    code = getattr(exc, "status_code", None)
+    if code == 429:
+        return "rate-limit"
+    if isinstance(code, int) and 500 <= code <= 599:
+        return f"http-{code}"
+    name = type(exc).__name__
+    if "Timeout" in name:
+        return "timeout"
+    if "Connection" in name:
+        return "connection"
+    if "RateLimit" in name:
+        return "rate-limit"
+    if ("InternalServer" in name or "ServiceUnavailable" in name
+            or "BadGateway" in name):
+        return "server"
+    return None
 
 
 def _price_usd_per_token(v):
@@ -1678,13 +1741,13 @@ class ReasoningClamp(CustomLogger):
                 brief = (resp.choices[0].message.content or "").strip()
             except Exception as e:
                 failures.append(f"{comp}:{type(e).__name__}:{str(e)[:120]}")
-                _worker_note_fail(comp, f"{type(e).__name__}: {e}")
+                _quar_note_fail(comp, f"{type(e).__name__}: {e}")
                 continue
             if len(brief) < MIN_BRIEF_CHARS:
                 failures.append(f"{comp}:empty-brief")
-                _worker_note_fail(comp, "empty-brief")
+                _quar_note_fail(comp, "empty-brief")
                 continue
-            _worker_note_ok(comp)
+            _quar_note_ok(comp)
             print(f"[reasoning_clamp] B {model}: compattato da {comp} "
                   f"({len(body)} char -> {len(brief)} char di sintesi)",
                   flush=True)
@@ -1800,6 +1863,11 @@ class ReasoningClamp(CustomLogger):
             # non-chat esclusi ANCHE se arrivano solo dal listing
             if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
                 return False
+            # QUARANTENA (2026-11-02): chi ha appena fallito troppo spesso
+            # non deve essere scelto come operaio. I protetti ("auto",
+            # "*/auto") non sono MAI in quarantena, quindi non li tocca.
+            if _quarantined(n):
+                return False
             # MEDIA di llama-swap (img-*/vid-*/tts-*/music-*): MAI operari
             # della cascata. Entrano nel pool dal modello wildcard
             # ("llama-swap/img-*") e dal listing di /v1/models, e _model_tier
@@ -1836,15 +1904,11 @@ class ReasoningClamp(CustomLogger):
         ordered = [n for n in sorted(
                     names, key=lambda n: (_model_tier(n), rank(n)))
                 if fits(n)]
-        # BLACKLIST TEMPORANEA (falli ripetuti come operari, 2026-10-06):
-        # i blacklistati non sono esclusi ma solo DEMOTI in fondo (snapshot
-        # unico: nessun duplicato se un ban scade a meta' ordinamento) - se
-        # tutto il resto fallisce si riprova comunque (auto-guarigione)
-        banned = {n for n in ordered if _worker_banned(n)}
-        if not banned:
-            return ordered
-        return [n for n in ordered if n not in banned] + \
-               [n for n in ordered if n in banned]
+        # I modelli in QUARANTENA sono gia' esclusi da fits(), non demoti:
+        # la cascata non deve sprecare un tentativo su chi ha appena fallito
+        # (richiesta utente 2026-11-02). Se il pool resta vuoto si risale di
+        # livello (vedi _cascade), non si ripesca il quarantenato.
+        return ordered
 
     async def _summarize_chunks(self, chunks, origin, model):
         """Riassume i chunk con l'operario = MODELLO DELLA RICHIESTA
@@ -1898,15 +1962,15 @@ class ReasoningClamp(CustomLogger):
                     s = (resp.choices[0].message.content or "").strip()
                 except Exception as e:
                     failures.append(f"{w}:{type(e).__name__}")
-                    _worker_note_fail(w, f"{type(e).__name__}: {e}")
+                    _quar_note_fail(w, f"{type(e).__name__}: {e}")
                     wi += 1
                     continue
                 if not s:
                     failures.append(f"{w}:empty")
-                    _worker_note_fail(w, "empty")
+                    _quar_note_fail(w, "empty")
                     wi += 1
                     continue
-                _worker_note_ok(w)
+                _quar_note_ok(w)
                 used = w
                 break
             if not s:
@@ -2432,6 +2496,49 @@ class ReasoningClamp(CustomLogger):
         # sync: policy + clamp, nessuna rete (la cascata richiede await)
         return self._apply(data)
 
+    async def async_post_call_failure_hook(
+        self, request_data, original_exception, user_api_key_dict,
+        traceback_str=None,
+    ):
+        """Fallimento di una richiesta CLIENT -> conta per la quarantena.
+
+        Arriva quando litellm ha esaurito i retry del router (num_retries 3),
+        quindi un 429 transitorio isolato non basta: servono
+        QUAR_FAIL_THRESHOLD falli in QUAR_FAIL_WINDOW_S. Contano solo i guasti
+        del modello (429/5xx/timeout/connessione, vedi _quar_failure_kind):
+        400/401/404 e context overflow sono errori nostri. Non solleva nulla:
+        l'errore al client resta esattamente quello originale.
+        """
+        kind = _quar_failure_kind(original_exception)
+        if kind:
+            _quar_note_fail(
+                str((request_data or {}).get("model") or ""), kind
+            )
+        return None
+
+    async def async_filter_listed_models(self, user_api_key_dict, model_names):
+        """Nasconde i modelli in quarantena dalle listing.
+
+        Gira su /v1/models, /v1/models/{id}, /model/info e
+        /model_group/info: e' l'unico punto in cui litellm permette di
+        stringere la lista (mai di allargarla). Il nome ricompare da solo
+        allo scadere del TTL (nessun thread di pulizia: _quarantined guarda
+        l'orologio) e chi ha bisogno di quel modello puo' ancora chiederlo
+        esplicitamente: qui si toglie solo dalla VETRINA.
+        """
+        hidden = {n for n in model_names if _quarantined(n)}
+        if not hidden:
+            return model_names
+        # log solo quando l'insieme CAMBIA: /v1/models viene interrogato di
+        # continuo dalle UI e un print per chiamata sarebbe rumore
+        if hidden != _QUAR_LAST_HIDDEN[0]:
+            _QUAR_LAST_HIDDEN[0] = hidden
+            shown = ", ".join(sorted(hidden)[:5])
+            more = "..." if len(hidden) > 5 else ""
+            print(f"[reasoning_clamp] listing: {len(hidden)} modelli in "
+                  f"quarantena nascosti ({shown}{more})", flush=True)
+        return [n for n in model_names if n not in hidden]
+
     async def async_post_call_success_hook(
         self, data, user_api_key_dict, response
     ):
@@ -2445,9 +2552,15 @@ class ReasoningClamp(CustomLogger):
         cosi' l'errore e' visibile (OpenWebUI lo mostra) invece di sembrare
         una risposta. Il resto delle risposte passa invariato.
         """
-        if not _upstream_notice(_response_text(response)):
-            return response
+        text = _response_text(response)
         model = str((data or {}).get("model") or "")
+        if text is None:
+            # stream (o embedding): lo stato lo decide l'iterator hook
+            return response
+        if not _upstream_notice(text):
+            _quar_note_ok(model)
+            return response
+        _quar_note_fail(model, "quota-200")
         print(
             f"[reasoning_clamp] avviso di throttling servito come 200 "
             f"(model={model}) -> 429 esplicito",
@@ -2501,6 +2614,10 @@ class ReasoningClamp(CustomLogger):
                 if probing:
                     probe += _chunk_text(chunk)
                     if _upstream_notice(probe):
+                        _quar_note_fail(
+                            str((request_data or {}).get("model") or ""),
+                            "quota-200",
+                        )
                         print(
                             "[reasoning_clamp] avviso di throttling nello "
                             f"stream (model={str((request_data or {}).get('model') or '')})"
@@ -2528,9 +2645,16 @@ class ReasoningClamp(CustomLogger):
                 f"({type(e).__name__}: {e}) -> chiusura pulita con marcatore",
                 flush=True,
             )
+            _quar_note_fail(
+                str((request_data or {}).get("model") or ""),
+                f"stream {type(e).__name__}",
+            )
             marker = self._truncated_stream_marker(last, request_data)
             if marker is not None:
                 yield marker
+        else:
+            # stream finito senza errori: il modello ha risposto davvero
+            _quar_note_ok(str((request_data or {}).get("model") or ""))
 
     @staticmethod
     def _truncated_stream_marker(last, request_data, text=TRUNCATED_STREAM_MARKER):
