@@ -469,7 +469,24 @@ COMPACTOR_MODELS = (
     # - puo' atterrare su un flagship costoso. "openrouter/free" (solo gratis)
     # resta nel pool via listing.
 )
+# Modelli che NON compattano con se stessi (richiesta utente 2026-11-02):
+# local-model gira su llama-swap con UN SOLO slot di concorrenza (la seconda
+# richiesta prende subito 429 "concurrency_limit"), quindi chiedergli di
+# riassumere la propria storia mentre la richiesta vera attende il turno
+# significa mettersi in coda dietro se stessi -> TimeoutError, 3 falli/10m,
+# quarantena 15m e modello nascosto dalle UI (OpenWebUI/AiderDesk "model not
+# found"). La compattazione passa quindi a small-model: stesso llama-swap ma
+# processo/slot SEPARATO, quindi non aspetta lo slot di local-model.
+# Chiave = modello della richiesta, valore = compattatore che esegue B/T/T2/E.
+COMPACTOR_OVERRIDE = {"local-model": "small-model"}
 COMPACTOR_TIMEOUT_S = 45
+# Timeout per un compattatore DELEGATO (COMPACTOR_OVERRIDE): il locale che
+# eredita il lavoro puo' dover essere CARICATO da llama-swap (cold start) e il
+# corpo da sintetizzare e' enorme (141k token: decine di secondi di prompt
+# eval anche a modello caldo). 45s farebbero fallire la compattazione proprio
+# nel caso che l'override deve risolvere, e ogni TimeoutError e' un fallo in
+# piu' verso la quarantena del delegato. Resta dentro WORKER_TIME_BUDGET_S.
+COMPACTOR_OVERRIDE_TIMEOUT_S = 300
 COMPACT_OUTPUT_TOKENS = 4096   # tetto della sintesi prodotta dal compattatore
 COMPACT_MIN_CHARS = 400        # sotto questo il corpo non merita una chiamata
 MIN_BRIEF_CHARS = 200          # sintesi piu' corta accettata (sotto = fallita)
@@ -1682,6 +1699,22 @@ class ReasoningClamp(CustomLogger):
         data["messages"] = new_msgs
         return data
 
+    def _compactor_for(self, model):
+        """Modello che ESEGUE la compattazione (B/T/T2/E) per `model`.
+
+        Percorso normale: e' il modello della richiesta stesso (richiesta
+        utente 2026-10-28). Eccezione COMPACTOR_OVERRIDE: i modelli single-slot
+        di llama-swap (local-model) delegano a un ALTRO modello locale, perche'
+        compattare con se stessi su uno slot unico significa mettersi in coda
+        dietro la richiesta e andare in TimeoutError (richiesta utente
+        2026-11-02). Un override verso se stesso o vuoto vale come "nessun
+        override"."""
+        m = str(model or "")
+        ov = COMPACTOR_OVERRIDE.get(m)
+        if ov and ov != m:
+            return ov
+        return model
+
     async def _compact_with_provider(self, data, model, est):
         """Livello B: sintetizza la STORIA (tutto cio' che precede l'ultimo
         user, che resta verbatim) con un modello a contesto grande. I
@@ -1709,10 +1742,12 @@ class ReasoningClamp(CustomLogger):
                     or int(len(body) / CHARS_PER_TOKEN))
         # SOLO il modello della richiesta (richiesta utente 2026-10-28): la
         # sintesi della storia usa lo stesso modello che il client ha
-        # chiamato, non un compattatore altrui
+        # chiamato, non un compattatore altrui. Eccezione: i single-slot di
+        # llama-swap delegano a un altro modello locale (COMPACTOR_OVERRIDE,
+        # richiesta utente 2026-11-02).
         pool = self._worker_pool(body_est, COMPACTOR_MODELS,
                                  output_tokens=COMPACT_OUTPUT_TOKENS,
-                                 only=model)
+                                 only=self._compactor_for(model))
         if not pool:
             return None, f"no-compactor-fits:{body_est}tok"
         failures = []
@@ -1736,7 +1771,8 @@ class ReasoningClamp(CustomLogger):
                         drop_params=True,
                         metadata={INTERNAL_CALL_ORIGIN_KEY: COMPACT_ORIGIN},
                     ),
-                    timeout=COMPACTOR_TIMEOUT_S,
+                    timeout=(COMPACTOR_OVERRIDE_TIMEOUT_S if comp != model
+                             else COMPACTOR_TIMEOUT_S),
                 )
                 brief = (resp.choices[0].message.content or "").strip()
             except Exception as e:
@@ -1914,7 +1950,9 @@ class ReasoningClamp(CustomLogger):
         """Riassume i chunk con l'operario = MODELLO DELLA RICHIESTA
         (richiesta utente 2026-10-28: niente piu' pool dinamico di modelli
         altrui - un chunk viene riassunto dallo stesso modello che il client
-        ha chiamato). Resta il budget di tempo WORKER_TIME_BUDGET_S: pool di
+        ha chiamato), salvo COMPACTOR_OVERRIDE per i single-slot di llama-swap
+        (local-model -> small-model, richiesta utente 2026-11-02). Resta il
+        budget di tempo WORKER_TIME_BUDGET_S: pool di
         UN elemento, quindi un solo tentativo per chunk; se fallisce si
         tengono i PARZIALI gia' prodotti (almeno un chunk riassunto =
         compressione utile, il livello successivo della cascata completa se
@@ -1928,8 +1966,10 @@ class ReasoningClamp(CustomLogger):
         # margine del pool copre il residuo
         chunk_est = max(int(len(c) / CHARS_PER_TOKEN) for c in chunks)
         # SOLO il modello della richiesta (richiesta utente 2026-10-28): i
-        # livelli T/T2/E riassumono col modello che il client ha chiamato
-        pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED, only=model)
+        # livelli T/T2/E riassumono col modello che il client ha chiamato;
+        # per i single-slot di llama-swap vale COMPACTOR_OVERRIDE (small-model)
+        pool = self._worker_pool(chunk_est, SUMMARIZER_PREFERRED,
+                                 only=self._compactor_for(model))
         if not pool:
             return None, f"no-worker-fits:{chunk_est}tok"
         deadline = time.monotonic() + WORKER_TIME_BUDGET_S
@@ -2163,8 +2203,8 @@ class ReasoningClamp(CustomLogger):
                          "cascata di compattazione (B compattori a contesto "
                          "grande -> C compressione BM25 -> T split+compress "
                          "della coda -> T2 compressione dei messaggi dopo "
-                         "l'ultimo user -> E map/reduce, tutti eseguiti "
-                         "col modello stesso della richiesta) non ha "
+                         "l'ultimo user -> E map/reduce, eseguiti con "
+                         f"{self._compactor_for(model)}) non ha "
                          "liberato spazio: riduci il contesto del client o "
                          "usa un modello con contesto maggiore"),
             },
