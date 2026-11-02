@@ -183,6 +183,15 @@ TRUNCATED_STREAM_MARKER = (
     "\n\n[risposta interrotta: il provider ha chiuso lo stream in anticipo]"
 )
 
+# Testo che sostituisce un'immagine il cui URL il provider non puo' risolvere
+# (path relativo /api/v1/files/... rimasto tale perche' OpenWebUI non e'
+# riuscita a inlinearla in base64: file mancante o permessi). Vedi
+# _sanitize_unresolvable_images: senza questa sostituzione synthetic risponde
+# 400 "Could not parse image as valid URL" e la richiesta non parte.
+UNRESOLVABLE_IMAGE_NOTE = (
+    "[immagine non disponibile: file locale di OpenWebUI non risolvibile dal provider]"
+)
+
 # NOTA (richiesta utente 2026-10-25): small-model NON e' piu' un fallback di
 # NESSUN modello - nessuna costante FINAL_FALLBACK. Resta solo un modello
 # autonomo, invocabile direttamente; quando una catena si esaurisce l'errore
@@ -2104,8 +2113,107 @@ class ReasoningClamp(CustomLogger):
             return data
         return self._overflow(data, model, est, tried)
 
+    @staticmethod
+    def _image_part_url(part):
+        """URL di una parte immagine OpenAI/Responses (dict o stringa)."""
+        if not isinstance(part, dict):
+            return None
+        if part.get("type") not in ("image_url", "input_image"):
+            return None
+        value = part.get("image_url")
+        if isinstance(value, dict):
+            return value.get("url")
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _unresolvable_image_url(url):
+        """True se il PROVIDER remoto non puo' scaricare quell'immagine.
+
+        Copre i path relativi di OpenWebUI (/api/v1/files/<id>/content, ossia
+        la conversione in base64 fallita: file assente o permessi) e gli host
+        non raggiungibili da fuori (loopback, reti private, .local). I data:
+        URL (base64) e gli http(s) pubblici restano intatti.
+        """
+        if not isinstance(url, str) or not url:
+            return False
+        u = url.strip()
+        if u.startswith("data:"):
+            return False
+        if u.startswith("/") or u.startswith("file:"):
+            return True
+        if not u.lower().startswith(("http://", "https://")):
+            return True
+        try:
+            host = (urllib.parse.urlsplit(u).hostname or "").lower()
+        except ValueError:
+            return True
+        if not host:
+            return True
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1",
+                    "host.docker.internal"):
+            return True
+        if host.endswith(".local"):
+            return True
+        return bool(re.match(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)",
+                             host))
+
+    def _sanitize_unresolvable_images(self, data, model):
+        """Sostituisce le immagini non scaricabili con una nota testuale.
+
+        Vale sia per il body chat (messages[].content) sia per il body
+        Responses (input[] con input_image / function_call_output / message).
+        """
+        note = UNRESOLVABLE_IMAGE_NOTE
+        replaced = 0
+
+        def fix_parts(parts, text_type):
+            nonlocal replaced
+            out = []
+            for part in parts:
+                url = self._image_part_url(part)
+                if url is not None and self._unresolvable_image_url(url):
+                    out.append({"type": text_type, "text": note})
+                    replaced += 1
+                else:
+                    out.append(part)
+            return out
+
+        for msg in data.get("messages") or []:
+            if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                msg["content"] = fix_parts(msg["content"], "text")
+
+        inputs = data.get("input")
+        if isinstance(inputs, list):
+            for idx, item in enumerate(inputs):
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("type")
+                if kind == "input_image":
+                    url = self._image_part_url(item)
+                    if url is not None and self._unresolvable_image_url(url):
+                        inputs[idx] = {"type": "input_text", "text": note}
+                        replaced += 1
+                elif kind == "message" and isinstance(item.get("content"), list):
+                    item["content"] = fix_parts(item["content"], "input_text")
+                elif kind == "function_call_output" and isinstance(item.get("output"), list):
+                    item["output"] = fix_parts(item["output"], "input_text")
+
+        if replaced:
+            print(f"[reasoning_clamp] {model}: {replaced} immagine/i con URL non "
+                  f"risolvibile dal provider -> nota testuale", flush=True)
+        return data
+
     def _apply(self, data):
         model = str(data.get("model") or "")
+        # --- immagini con URL che il PROVIDER non puo' risolvere ---
+        # OpenWebUI manda le immagini come data: URL (base64) e le converte
+        # solo se il file esiste. Quando la conversione fallisce (file
+        # sparito, permessi) resta il path relativo /api/v1/files/<id>/content
+        # o un host locale: il provider remoto risponde 400 "Could not parse
+        # image as valid URL" (incidente 2026-11-02: upload su tmpfs azzerati
+        # al reboot). Qui la parte immagine viene sostituita con una nota
+        # testuale: la richiesta parte e il modello sa che c'era un'immagine.
+        self._sanitize_unresolvable_images(data, model)
         # --- policy fallback per-modello (override per-request) ---
         # Regola (richiesta utente 2026-10-25): small-model NON e' piu' un
         # fallback di nessun modello. Resta un modello autonomo, invocabile
