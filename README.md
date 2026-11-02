@@ -95,6 +95,26 @@ always visible in litellm even when the endpoint is down. Each gateway has
 its **own** cache file (`/cache/gpt4free-models.json`,
 `/cache/models.json` for the disabled inference4free).
 
+### Quota notices served as a 200 (two layers)
+
+Several free backends enforce per-IP quotas but answer **HTTP 200** with the
+quota text as the assistant message (seen 2026-11-02 through gpt4free/Yqcloud:
+`该ip请求过多… 60 次/ora`). To litellm that is a *success*: no retry, no
+fallback, and the client gets unusable text instead of an answer. Two layers
+now deal with it:
+
+* **g4f side**: the `AutoFree` router (`g4f_ext/autofree_g4f.py`) buffers the
+  stream until the first text chunk, matches the notice against `_POISON` and
+  fails over to the next keyless provider. `G4F_IGNORED_PROVIDERS` is the hard
+  deny-list for a provider that never deserves a turn.
+* **litellm side (`reasoning_clamp`)**: `async_post_call_success_hook` looks at
+  the first `UPSTREAM_NOTICE_SCAN_CHARS` (300) chars of a non-streaming answer
+  and turns a notice into a **429** with an explicit message; in streaming the
+  same check runs on the first chunks from
+  `async_post_call_streaming_iterator_hook`, which drop the garbage and emit a
+  single explicit chunk (the SSE status is already gone at that point). Normal
+  responses pass through untouched.
+
 ## Media models (llama-swap image / video / audio)
 
 Since 2026-10-16 llama-swap also serves **image generation, video
@@ -288,7 +308,10 @@ embedding) with the real per-model contexts exposed on `/v1/models`
 fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
 needs a config entry. `gpt4free/*` stays a wildcard (dynamic lineup of ~250
 models) and g4f does **not** expose `context_length` in its listing, so its
-131072 is a static operational floor (no `_DYN_CTX` for this prefix):
+32768 is a static operational floor (no `_DYN_CTX` for this prefix; lowered
+from 131072 on 2026-11-02 because long prompts kept 400ing on the small
+models of the pool, at the cost of running the compaction cascade above
+~32k even for the models that would have coped):
 its real per-model contexts (10000–1000000) reach the clamp and the worker
 pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 `reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still

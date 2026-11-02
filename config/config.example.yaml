@@ -523,10 +523,14 @@ model_list:
       # g4f NON espone il context_length nel listing (verificato 2026-11-02:
       # solo id/owned_by/image/vision) e i modelli sono eterogenei (100k+ per
       # i modelli OpenRouter free, molto meno per i provider keyless senza
-      # documentazione): 131072 = floor operativo conservativo, allineato a
+      # documentazione): 32768 = floor operativo conservativo, allineato a
       # CONTEXT_BY_PREFIX "gpt4free/" di reasoning_clamp.py. Il contesto
-      # REALE per-modello non e' disponibile da nessuna fonte.
-      max_input_tokens: 131072
+      # REALE per-modello non e' disponibile da nessuna fonte. ERA 131072
+      # fino al 2026-11-02: con il floor alto i prompt lunghi andavano 400
+      # sui modelli piccoli del pool. Il prezzo del floor basso e' che oltre
+      # ~32k entra la cascata di compattazione (reasoning_clamp) anche
+      # quando il modello reggerebbe di piu'.
+      max_input_tokens: 32768
       max_output_tokens: 32768
       max_tokens: 32768
 

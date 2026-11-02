@@ -192,6 +192,98 @@ UNRESOLVABLE_IMAGE_NOTE = (
     "[immagine non disponibile: file locale di OpenWebUI non risolvibile dal provider]"
 )
 
+# Avviso di THROTTLING servito come CONTENUTO di una risposta 200.
+# Caso reale 2026-11-02: gpt4free -> provider free (Yqcloud) che risponde
+# "该ip请求过多已被暂时限流 ... (目前限制了每小时60次)" come messaggio
+# assistant. Non c'e' nessun 429: litellm lo tratta come un successo (niente
+# retry, niente fallback) e il client riceve quel testo al posto della
+# risposta. Riconosciuto da async_post_call_success_hook (-> 429 esplicito)
+# e da async_post_call_streaming_iterator_hook (-> chunk esplicito).
+UPSTREAM_NOTICE_MARKERS = (
+    "该ip请求过多",
+    "请求过多已被暂时限流",
+    "chat19.aichatos.xyz",
+)
+# Si guarda solo l'INIZIO del contenuto: l'avviso arriva come PRIMA frase,
+# mentre una risposta legittima che cita questi caratteri non va toccata.
+UPSTREAM_NOTICE_SCAN_CHARS = 300
+# Testo che sostituisce lo stream quando l'avviso arriva mentre si legge:
+# le header SSE (200) sono gia' partite, l'unica cosa utile e' dirlo.
+UPSTREAM_NOTICE_STREAM_TEXT = (
+    "[provider free temporaneamente limitato (quota per IP): la risposta non "
+    "e' stata generata. Riprova tra qualche minuto oppure usa un id "
+    "provider-qualified, es. gpt4free/<provider>/<modello>.]"
+)
+
+
+def _content_text(content):
+    """Testo da un `content` OpenAI: stringa, oppure lista di parti."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+                continue
+            text = getattr(part, "text", None)
+            if text is None and isinstance(part, dict):
+                text = part.get("text")
+            if isinstance(text, str):
+                out.append(text)
+        return " ".join(out)
+    return ""
+
+
+def _response_text(response):
+    """Testo del contenuto di una risposta NON-streaming.
+
+    Copre chat (choices[].message.content, anche a parti), completions
+    testuali (choices[].text) e Responses API (output[].content[].text).
+    None se non c'e' testo (embedding, stream, ...): chi chiama ignora.
+    """
+    try:
+        choices = getattr(response, "choices", None)
+        if choices:
+            first = choices[0]
+            message = getattr(first, "message", None)
+            text = None
+            if message is not None:
+                text = _content_text(getattr(message, "content", None))
+            if not text:
+                text = _content_text(getattr(first, "text", None))
+            return text
+        output = getattr(response, "output", None)
+        if output:
+            parts = [_content_text(getattr(item, "content", None)) for item in output]
+            text = " ".join(p for p in parts if p)
+            return text or None
+    except Exception:
+        return None
+    return None
+
+
+def _chunk_text(chunk):
+    """Testo del delta di un chunk SSE ("" se il chunk non porta contenuto)."""
+    try:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            return ""
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            return ""
+        return _content_text(getattr(delta, "content", None))
+    except Exception:
+        return ""
+
+
+def _upstream_notice(text):
+    """True se `text` e' l'avviso di throttling servito come contenuto 200."""
+    if not text:
+        return False
+    head = text[:UPSTREAM_NOTICE_SCAN_CHARS]
+    return any(marker in head for marker in UPSTREAM_NOTICE_MARKERS)
+
 # NOTA (richiesta utente 2026-10-25): small-model NON e' piu' un fallback di
 # NESSUN modello - nessuna costante FINAL_FALLBACK. Resta solo un modello
 # autonomo, invocabile direttamente; quando una catena si esaurisce l'errore
@@ -281,14 +373,16 @@ CONTEXT_BY_PREFIX = (
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    # gpt4free (dal 2026-11-02 al posto di inference4free): 131072 e' un
+    # gpt4free (dal 2026-11-02 al posto di inference4free): 32768 e' un
     # FLOOR OPERATIVO, non il minimo reale - g4f NON espone context_length
     # nel suo listing (/v1/models: solo id/owned_by/image/vision, verificato)
     # e i ~250 modelli sono eterogenei, quindi _DYN_CTX resta vuoto per
-    # questo prefisso: vale sempre questo valore statico. Sotto il floor si
-    # rischia di compattare prompt che ci starebbero; sopra, di spedire
-    # prompt oversize a un modello piccolo (l'upstream risponde 400 -> hop
-    # sprecato). Allineato a config(.example).yaml.
+    # questo prefisso: vale sempre questo valore statico. Era 131072 fino al
+    # 2026-11-02 (richiesta utente): con il floor alto i prompt lunghi
+    # partivano verso i modelli piccoli del pool e tornavano 400, sprecando
+    # l'hop. Il prezzo del floor basso e' che oltre ~32k parte la cascata di
+    # compattazione anche quando il modello reggerebbe di piu'.
+    ("gpt4free/", 32768),
     ("local-model", 196608),
     ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
@@ -310,7 +404,6 @@ CONTEXT_BY_PREFIX = (
     ("synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 262144),
     ("synthetic/hf:nomic-ai/nomic-embed-text-v1.5", 8192),
     ("synthetic/", 131072),  # floor per id synthetic NON in tabella
-    ("gpt4free/", 131072),
     ("ollama/", 131072),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
@@ -665,11 +758,12 @@ WILDCARD_CACHE_TTL_S = 600
 # tetto per-pattern: il vecchio 40 TRONCAVA i listing da ~50 id (caso storico
 # del proxy inference4free, ora spento: gli id ai margini della lista
 # perdevano il contesto reale 10000 -> floor statico 131072 -> prompt
-# oversize spediti e fallback a monte). 200 copre i gateway piccoli - il
-# listing di gpt4free al 2026-11-02 e' ~250 id: i primi 200 vengono espansi,
-# oltre si resta sul nome wildcard - e limita i listing enormi (openrouter:
-# centinaia)
-WILDCARD_MAX_MODELS = 200
+# oversize spediti e fallback a monte). 300 (era 200 fino al 2026-11-02,
+# richiesta utente) copre TUTTO il listing di gpt4free che al 2026-11-02 e'
+# ~250 id: prima gli ultimi ~53 restavano fuori dal pool di operari e non
+# potevano mai essere scelti. Resta un tetto per i listing enormi
+# (openrouter: centinaia).
+WILDCARD_MAX_MODELS = 300
 _WILDCARD_CACHE = {}           # "groq/*" -> (monotonic, [nomi concreti])
 
 # ------------- INTERROGAZIONE DINAMICA del listing /v1/models -------------
@@ -2338,6 +2432,39 @@ class ReasoningClamp(CustomLogger):
         # sync: policy + clamp, nessuna rete (la cascata richiede await)
         return self._apply(data)
 
+    async def async_post_call_success_hook(
+        self, data, user_api_key_dict, response
+    ):
+        """Avviso di throttling travestito da risposta 200 -> errore 429.
+
+        Un provider free puo' rispondere 200 mettendo il messaggio di quota
+        nel CONTENUTO (gpt4free/Yqcloud, richiesta utente 2026-11-02): per
+        litellm e' un successo, quindi niente retry/fallback e il client
+        riceve testo inutilizzabile al posto della risposta. Qui la risposta
+        viene ispezionata PRIMA di uscire e trasformata in un 429 esplicito,
+        cosi' l'errore e' visibile (OpenWebUI lo mostra) invece di sembrare
+        una risposta. Il resto delle risposte passa invariato.
+        """
+        if not _upstream_notice(_response_text(response)):
+            return response
+        model = str((data or {}).get("model") or "")
+        print(
+            f"[reasoning_clamp] avviso di throttling servito come 200 "
+            f"(model={model}) -> 429 esplicito",
+            flush=True,
+        )
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "provider free temporaneamente limitato (quota per IP) per "
+                f"'{model}': l'upstream ha restituito l'avviso come contenuto "
+                "di un 200. Riprova tra qualche minuto oppure usa un id "
+                "provider-qualified (es. gpt4free/<provider>/<modello>)."
+            ),
+        )
+
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict, response, request_data
     ):
@@ -2358,11 +2485,36 @@ class ReasoningClamp(CustomLogger):
         l'eccezione risale, cosi' retry/fallback di litellm restano invariati.
         Client disconnesso (CancelledError/GeneratorExit) resta un errore
         del client, non dell'upstream: rilanciato.
+
+        In piu' (2026-11-02) guarda i PRIMI UPSTREAM_NOTICE_SCAN_CHARS
+        caratteri di testo: se l'upstream ha spedito l'avviso di throttling
+        come contenuto di un 200 (gpt4free/Yqcloud), il testo-spazzatura non
+        arriva al client: al suo posto un chunk esplicito. Le header SSE sono
+        gia' partite (200), quindi non si puo' piu' cambiare lo status.
         """
         emitted = False
         last = None
+        probe = ""
+        probing = True
         try:
             async for chunk in response:
+                if probing:
+                    probe += _chunk_text(chunk)
+                    if _upstream_notice(probe):
+                        print(
+                            "[reasoning_clamp] avviso di throttling nello "
+                            f"stream (model={str((request_data or {}).get('model') or '')})"
+                            " -> sostituito con messaggio esplicito",
+                            flush=True,
+                        )
+                        marker = self._truncated_stream_marker(
+                            last, request_data, UPSTREAM_NOTICE_STREAM_TEXT
+                        )
+                        if marker is not None:
+                            yield marker
+                        return
+                    if len(probe) >= UPSTREAM_NOTICE_SCAN_CHARS:
+                        probing = False
                 emitted = True
                 last = chunk
                 yield chunk
@@ -2381,13 +2533,15 @@ class ReasoningClamp(CustomLogger):
                 yield marker
 
     @staticmethod
-    def _truncated_stream_marker(last, request_data):
+    def _truncated_stream_marker(last, request_data, text=TRUNCATED_STREAM_MARKER):
         """Chunk finale (finish_reason "stop") col testo del marcatore.
 
         Ricostruito dall'ultimo chunk per conservare id/created/model del
         provider: OpenWebUI aggancia la fine dello stream a quel messaggio.
         Se la costruzione fallisce (cambio di tipi litellm) si chiude e
         basta, senza rimettere in piedi l'errore.
+        `text` e' il testo da mettere come contenuto: il default e' il
+        marcatore di stream troncato, l'avviso di throttling passa il suo.
         """
         try:
             from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
@@ -2400,7 +2554,7 @@ class ReasoningClamp(CustomLogger):
                 choices=[
                     StreamingChoices(
                         index=0,
-                        delta=Delta(content=TRUNCATED_STREAM_MARKER),
+                        delta=Delta(content=text),
                         finish_reason="stop",
                     )
                 ],
