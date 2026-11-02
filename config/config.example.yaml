@@ -533,6 +533,15 @@ model_list:
       max_input_tokens: 32768
       max_output_tokens: 32768
       max_tokens: 32768
+      # VISION (richiesta utente 2026-11-02): g4f accetta immagini e il
+      # routing (AutoFree) sceglie un provider che le gestisce. Il listing di
+      # g4f espone per-modello i flag "image"/"vision", ma l'espansione delle
+      # wildcard di litellm propaga SOLO gli id (get_valid_models ->
+      # list[str]), quindi una capability per-modello non puo' arrivare da
+      # li': la si dichiara sul gruppo. Effetto: i client (OpenWebUI) offrono
+      # l'immagine per tutti i gpt4free/*; un'immagine mandata a un modello
+      # text-only e' un 400 dell'upstream, non un errore di litellm.
+      supports_vision: true
 
   # --- inference4free: DISATTIVATO il 2026-11-02 -------------------------
   # inference4free e' stato spento sul rpi5 e sostituito COMPLETAMENTE da
