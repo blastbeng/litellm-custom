@@ -490,6 +490,51 @@ model_list:
       max_output_tokens: 32768
       max_tokens: 262144
 
+  # --- gpt4free (stack /opt/docker/compose/gpt4free, 192.168.1.13:1337) ---
+  # SOSTITUISCE inference4free (spento sul rpi5 il 2026-11-02; l'entry
+  # storica resta commentata qui sotto come riferimento).
+  # TUTTI i modelli, dinamici: il listing e' il registro di g4f (~250 id al
+  # 2026-11-02, cambia a ogni aggiornamento dell'immagine) -> wildcard
+  # "gpt4free/*" + listing via check_provider_endpoint, nessuna entry
+  # per-modello. Nome pubblico "gpt4free/<id-nativo>"
+  # (es. gpt4free/auto, gpt4free/claude-sonnet-4-5,
+  # gpt4free/nvidia/nemotron-3-ultra-550b-a55b:free).
+  # Via gpt4free-gw con ID_PREFIX=gpt4free/: gli id nativi contengono "/" e
+  # ":free" e il rename di listing di litellm li corromperebbe; la capture
+  # della wildcard li riporta all'upstream intatti (il prefisso sparisce).
+  # "gpt4free/auto" e' il ROUTER AUTOMATICO di g4f
+  # (Model("auto", base_provider=AnyProvider)): primo id del listing,
+  # nessuna entry dedicata - stesso meccanismo del vecchio
+  # "inference4free/auto" (nome concreto risolto dalla wildcard).
+  # Auth: l'API di g4f pretende la G4F_API_KEY, qui c'e' solo il segnaposto
+  # "dummy": la chiave VERA la aggiunge gpt4free-gw leggendola dall'.env del
+  # progetto upstream (nessun segreto in questo repo).
+  # NIENTE reasoning_effort di default (free-proxy eterogeneo, non
+  # validabile su 250 modelli diversi) e NIENTE max_tokens di default: un
+  # tetto uguale per tutti produrrebbe 400 sui modelli con contesto piccolo;
+  # li decide il client (o il clamp di reasoning_clamp).
+  # Fallback: nessuno (come ogni altro prefisso, vedi reasoning_clamp).
+  - model_name: gpt4free/*
+    litellm_params:
+      model: openai/*
+      api_base: http://gpt4free-gw/v1
+      api_key: dummy
+    model_info:
+      # g4f NON espone il context_length nel listing (verificato 2026-11-02:
+      # solo id/owned_by/image/vision) e i modelli sono eterogenei (100k+ per
+      # i modelli OpenRouter free, molto meno per i provider keyless senza
+      # documentazione): 131072 = floor operativo conservativo, allineato a
+      # CONTEXT_BY_PREFIX "gpt4free/" di reasoning_clamp.py. Il contesto
+      # REALE per-modello non e' disponibile da nessuna fonte.
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+
+  # --- inference4free: DISATTIVATO il 2026-11-02 -------------------------
+  # inference4free e' stato spento sul rpi5 e sostituito COMPLETAMENTE da
+  # gpt4free (entry gpt4free/* qui sopra + servizio gpt4free-gw in
+  # docker-compose.yml). Il blocco storico resta come riferimento per un
+  # ripristino: togliere il commento qui e riattivare inference4free-gw.
   # --- inference4free (upstream deepseek4free, 192.168.1.13:18010) -------
   # TUTTI i modelli, dinamici. Endpoint OpenAI-compatible senza auth
   # (progetto in sviluppo, instabile): via inference4free-gw con ID_PREFIX
@@ -497,22 +542,23 @@ model_list:
   # listing (MODELS_CACHE=1) -> i modelli restano visibili anche quando
   # l'endpoint e' giu'. NIENTE reasoning_effort di default (non validabile
   # per-modello).
-  - model_name: inference4free/*
-    litellm_params:
-      model: openai/*
-      api_base: http://inference4free-gw/v1
-      api_key: dummy
-      max_tokens: 32768
-    model_info:
-      # contesti REALI (listing upstream 2026-10-06): famiglia auto (auto,
-      # deepseek/auto, google/auto, openai/auto, anthropic/auto, xai/auto)
-      # = 131072; perplexity/* e chatgptauto = 128000; copilot/* = 32000;
-      # z.ai/* = 10000; qwen3.7-plus/3.8-max/3.8-omni-flash = 1000000.
-      # 131072 = valore del nucleo operativo: NON tutti arrivano a 196608;
-      # il REALE per-modello arriva dal listing (reasoning_clamp: _DYN_CTX)
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      max_tokens: 32768
+  # - model_name: inference4free/*
+    # litellm_params:
+      # model: openai/*
+      # api_base: http://inference4free-gw/v1
+      # api_key: dummy
+      # max_tokens: 32768
+
+    # model_info:
+      # # contesti REALI (listing upstream 2026-10-06): famiglia auto (auto,
+      # # deepseek/auto, google/auto, openai/auto, anthropic/auto, xai/auto)
+      # # = 131072; perplexity/* e chatgptauto = 128000; copilot/* = 32000;
+      # # z.ai/* = 10000; qwen3.7-plus/3.8-max/3.8-omni-flash = 1000000.
+      # # 131072 = valore del nucleo operativo: NON tutti arrivano a 196608;
+      # # il REALE per-modello arriva dal listing (reasoning_clamp: _DYN_CTX)
+      # max_input_tokens: 131072
+      # max_output_tokens: 32768
+      # max_tokens: 32768
 
 litellm_settings:
   # espansione delle wildcard in /model/info e /v1/models: usa la lista
@@ -545,15 +591,15 @@ litellm_settings:
   # - synthetic/*  -> NESSUN fallback (richiesta utente 2026-10-28: local-model
   #   rimosso da ogni catena synthetic/*; restano solo le catene esatte
   #   syn:small:text, syn:small:vision e l'embedding nomic qui sotto)
-  # - synthetic/syn:small:text -> ollama/small-model -> inference4free/auto ->
+  # - synthetic/syn:small:text -> ollama/small-model -> gpt4free/auto ->
   #   openrouter/free (richiesta utente 2026-10-12: ollama/small-model e'
   #   Ollama sullo STESSO PC 192.168.1.29:11434, via ollama-gw + ollama-gate:
   #   server INDIPENDENTE da llama-swap, quindi regge quando llama-swap e'
   #   occupo o da 429; poi due cloud GRATIS: nomi concreti risolti dalle
-  #   wildcard ollama/*, inference4free/* e openrouter/* del model_list - vedi
+  #   wildcard ollama/*, gpt4free/* e openrouter/* del model_list - vedi
   #   reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
   # - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
-  #   2026-10-14): ollama/small-model -> inference4free/auto -> openrouter/free,
+  #   2026-10-14): ollama/small-model -> gpt4free/auto -> openrouter/free,
   #   stessi gradini e stesso ordine. Il target locale e' text-only: una
   #   richiesta vision puo' 400, hop sprecato, la catena prosegue.
   # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
@@ -570,7 +616,7 @@ litellm_settings:
   #   al client cosi' com'e'. Il prefisso copre tutte e quattro le wildcard
   #   media; i modelli CHAT di llama-swap non hanno prefisso)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama/*, ollama-cloud/*, inference4free/*) -> NESSUN fallback
+  #   ollama/*, ollama-cloud/*, gpt4free/*) -> NESSUN fallback
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via

@@ -2,8 +2,9 @@
 
 A personal LLM router built on **LiteLLM Proxy** with lightweight Python
 gateways: a single OpenAI-compatible endpoint (`:4000`) that aggregates local
-models (llama-swap and Ollama on a dedicated PC) and cloud providers
-(synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud, inference4free), with
+models (llama-swap and Ollama on a dedicated PC), cloud providers
+(synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud) and the local
+**gpt4free** stack (which replaced inference4free on 2026-11-02), with
 **dynamic**
 wildcard model listing, fallback policy and `reasoning_effort` handling.
 
@@ -23,7 +24,7 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
                      │      │   ├────► openrouter-gw ─┐                           │
                      │      │   ├────► groq-gw ───────┤ (via llmtrim)             │
                      │      │   ├────► gemini-gw ─────┤                           │
-                     │      │   └────► inference4free-gw ─┴──► 192.168.1.13:18010   │
+                     │      │   └────► gpt4free-gw ───┴──► gpt4free:1337 (locale)  │
                      │      │                                                      │
                      └────────────────────────────────────────────────────────────────┘
 ```
@@ -37,7 +38,8 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 | `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama's OpenAI-compatible API (`blastpc:11434`) — `GATE_TLS=0`, Ollama serves **plain HTTP** on that port, so the TLS probe is skipped; PC off → 503 in ~2s |
 | `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama local listing with `ID_PREFIX=ollama/` + `STRIP_LATEST=1`, no cache (models visible only while the PC is online; PC off → the gate 503s) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
-| `groq-gw`, `gemini-gw`, `inference4free-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
+| `groq-gw`, `gemini-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
+| `gpt4free-gw` | `provider-gw/gw.py` (generic) | gpt4free listing (`ID_PREFIX=gpt4free/`, last-good cache) — replaces `inference4free-gw` (disabled 2026-11-02); reads the upstream `G4F_API_KEY` from the gpt4free `.env` via `UPSTREAM_KEY_FILE` and **replaces** litellm's placeholder `Authorization` |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
 | `llmtrim` (external) | `/opt/docker/compose/llmtrim` | MITM proxy: tracks/compresses LLM traffic |
 
@@ -56,31 +58,42 @@ Each provider is exposed with **a single wildcard** entry in `model_list`:
   id `openai/gpt-oss-120b` (the capture strips the prefix).
 - With `litellm_settings.check_provider_endpoint: true`, `/v1/models` and
   `/model/info` expose the endpoint's **real** model list: if a provider's
-  models change, litellm stays up to date (essential for `inference4free/*`,
-  whose list is dynamic).
+  models change, litellm stays up to date (essential for `gpt4free/*`, whose
+  list is dynamic: g4f's own registry, ~250 ids on 2026-11-02, reshuffled at
+  every image update).
 
 ### Why the gateways exist
 
-LiteLLM (v1.104.0) has three behaviors the gateways work around:
+LiteLLM (v1.104.0) has four behaviors the gateways work around:
 
 1. **Listing always hits `{origin}/v1/models`**, ignoring the api_base path
    → different path schemes need `PATH_PRE` (Groq: `/openai`,
    Gemini: `/v1beta/openai`, OpenRouter: `/api`).
 2. **Rename of ids whose first segment matches a known provider**
    (`openai/...`, `deepseek/...`, ...) in the listing → the gateway prefixes
-   ids with `ID_PREFIX` (e.g. `groq/`, `inference4free/`): the rename no
-   longer fires and the capture restores the native id at runtime.
+   ids with `ID_PREFIX` (e.g. `groq/`, `gpt4free/`): the rename no
+   longer fires and the capture restores the native id at runtime
+   (`gpt4free/` is mandatory: g4f ids contain slashes and `:free`).
 3. **Single timeout** (httpx, connect included) → "PC off" cannot be
    distinguished from "PC on with a huge model loading":
    `llama-gate` solves it (503 in ~2s if the PC doesn't answer TCP/TLS,
    otherwise a transparent pipe so litellm can wait up to 30 min).
+4. **One `api_key` per deployment** → an upstream with its **own** secret
+   (gpt4free requires `G4F_API_KEY`) cannot be authenticated without
+   copying that secret into this repo. The gateway reads it from the
+   upstream project's `.env` (`UPSTREAM_KEY_FILE` + `UPSTREAM_KEY_NAME`,
+   re-read every 60s) and **replaces** litellm's placeholder
+   `Authorization: Bearer dummy`. Opt-in: without `UPSTREAM_KEY*` the
+   gateway keeps passing the client's header through (groq, gemini, ollama).
 
 ### Last-good cache (provider-gw, `MODELS_CACHE=1`)
 
-For unstable upstreams (deepseek4free is a project under development): if
-`/models` fails, the gateway serves the **last valid model list** saved on
-disk (header `X-Models-Cache: stale`). Models remain always visible in
-litellm even when the endpoint is down.
+For unstable upstreams (gpt4free is a project under development, updated and
+restarted by hand): if `/models` fails, the gateway serves the **last valid
+model list** saved on disk (header `X-Models-Cache: stale`). Models remain
+always visible in litellm even when the endpoint is down. Each gateway has
+its **own** cache file (`/cache/gpt4free-models.json`,
+`/cache/models.json` for the disabled inference4free).
 
 ## Media models (llama-swap image / video / audio)
 
@@ -141,8 +154,10 @@ untouched.
   removed from every `synthetic/*` chain, right after `small-model` on
   2026-10-25). Only the three exact chains below remain.
 - **`synthetic/syn:small:text`** → **`ollama/small-model`** →
-  **`inference4free/auto`** → **`openrouter/free`** (user request 2026-10-12;
-  since 2026-10-14 `syn:small:vision` has the *identical* chain).
+  **`gpt4free/auto`** → **`openrouter/free`** (user request 2026-10-12;
+  since 2026-10-14 `syn:small:vision` has the *identical* chain; the cloud
+  step was `inference4free/auto` until 2026-11-02, when inference4free was
+  switched off on the rpi5 and replaced by gpt4free).
   `ollama/small-model` — the Ollama model on the **same PC**
   (`192.168.1.29:11434`, via `ollama-gw` + `ollama-gate`) — comes **first**:
   an **independent server**, so it answers when llama-swap is busy or 429s (its
@@ -151,12 +166,12 @@ untouched.
   the chain continues. The name must exist in Ollama on the PC, otherwise the
   upstream 404s: also just a failed hop. The two **free cloud** models are the
   safety net for when the local PC is off. `ollama/small-model`,
-  `inference4free/auto` and `openrouter/free` are **concrete names resolved by
-  the `ollama/*`, `inference4free/*` and `openrouter/*` wildcards** in the
+  `gpt4free/auto` and `openrouter/free` are **concrete names resolved by
+  the `ollama/*`, `gpt4free/*` and `openrouter/*` wildcards** in the
   model_list (litellm `get_model_list` → `_get_wildcard_deployments` →
   `PatternMatchRouter.route`), **not** fictional prefixes.
 - **`synthetic/syn:small:vision`** → **`ollama/small-model`** →
-  **`inference4free/auto`** → **`openrouter/free`** — the *identical* chain of
+  **`gpt4free/auto`** → **`openrouter/free`** — the *identical* chain of
   `synthetic/syn:small:text` (user request 2026-10-14: same steps, same order;
   defined as an alias so the two cannot diverge again). The local target is
   text-only, so a vision request may 400 there: one wasted hop, the chain
@@ -184,7 +199,7 @@ untouched.
   **worker pool** (`_worker_pool`), where their local-hardware tier would
   otherwise rank them first as compression workers.
 - **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
-  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `inference4free/*`,
+  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, `gpt4free/*`,
   and any future prefix) → **no fallback**.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
@@ -204,7 +219,7 @@ Rule: default `xhigh` where valid, otherwise fall down (`high`, `medium`, ...).
 | `synthetic/*`, `openrouter/*`, `ollama-cloud/*` | `xhigh` (in config) | accepted |
 | `gemini/*` | `high` (callback) | `xhigh` not valid on Gemini; `none/minimal/low/medium` respected; `xhigh/max` → clamped to `high` |
 | `groq/*` | `high` (callback) | only for reasoning models (`openai/gpt-oss-*`, `qwen/*`); for the others (`allam-2-7b`, whisper, ...) the parameter is **removed** (they would 400) |
-| `inference4free/*` | none | endpoint not validable per-model |
+| `gpt4free/*` | none | free proxy, ~250 heterogeneous models: not validable per-model |
 
 The client-provided value always wins (clamped if invalid).
 
@@ -271,7 +286,9 @@ embedding) with the real per-model contexts exposed on `/v1/models`
 (`syn:large:text` 524288, `syn:small:text` 196608, `hf:openai/gpt-oss-120b`
 131072, …) — litellm's wildcard expansion propagates ids only, never context
 fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
-needs a config entry. `inference4free/*` stays a wildcard (dynamic lineup):
+needs a config entry. `gpt4free/*` stays a wildcard (dynamic lineup of ~250
+models) and g4f does **not** expose `context_length` in its listing, so its
+131072 is a static operational floor (no `_DYN_CTX` for this prefix):
 its real per-model contexts (10000–1000000) reach the clamp and the worker
 pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 `reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still
@@ -359,7 +376,8 @@ would skip B entirely and drop the request to the lossy C tier.
 **Cost-tier ordering** (2026-10-06 request: free models first, then cheap,
 then the rest — dynamically): the pool is sorted by **(cost tier,
 preference)**, so the preference lists decide only the order *inside* a
-tier. **Tier 0 — free**: `inference4free/*`, `openrouter/free`,
+tier. **Tier 0 — free**: `gpt4free/*` (brand contains `free`),
+`openrouter/free`,
 `ollama-cloud/*`, any id with the OpenRouter `:free` suffix, any model whose
 gateway/brand name contains `free`, models whose gateway `/models` listing
 declares a zero price (captured live during wildcard expansion — a provider
@@ -460,7 +478,10 @@ sudo systemctl restart docker-compose@litellm
   2026-10-02 — `llama-gate` runs with `GATE_TLS=auto`, so it also works if
   llama-swap goes back to `https` self-signed: it terminates the TLS itself;
   litellm always talks plain HTTP to the gate);
-- the `deepseek4free` service on 192.168.1.13:18010 (optional).
+- the **gpt4free** stack (`/opt/docker/compose/gpt4free`) published on
+  192.168.1.13:1337 (`G4F_PORT`, container 8080); `gpt4free-gw` mounts
+  `/opt/docker/compose/gpt4free` read-only to read `G4F_API_KEY` from its
+  `.env` — no secret is stored in this repo.
 
 All outbound HTTPS traffic from litellm and the gateways goes through
 llmtrim (`HTTPS_PROXY`/`GW_PROXY`), so provider calls are intercepted,

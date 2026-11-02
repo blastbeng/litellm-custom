@@ -41,6 +41,22 @@ Config via env:
                per-modello, come per gli altri provider. Best-effort: se
                l'endpoint non risponde o il campo manca, il listing resta
                com'e' (vale il valore statico di config.yaml).
+  UPSTREAM_KEY - chiave PROPRIA dell'upstream (opt-in). Senza questa il
+               gateway inoltra l'Authorization del client (e' cosi' che
+               funzionano groq/gemini/ollama: la chiave e' quella che litellm
+               manda). Con questa la chiave del client viene SOSTITUITA:
+               serve quando litellm ha solo un segnaposto (gpt4free: la
+               chiave vera vive nell'.env del progetto upstream e NON deve
+               essere copiata nel repo litellm).
+  UPSTREAM_KEY_FILE / UPSTREAM_KEY_NAME - alternativa a UPSTREAM_KEY: la
+               chiave si legge da un file (es. l'.env del progetto upstream,
+               montato read-only) e UPSTREAM_KEY_NAME e' la variabile da
+               estrarre (es. "G4F_API_KEY"); senza NAME vale il file intero.
+               Rilettura con TTL 60s: una chiave ruotata viene presa senza
+               riavviare il gateway.
+  UPSTREAM_AUTH_HEADER - header usato per UPSTREAM_KEY (default
+               "Authorization", inviato come "Bearer <key>"; con un nome
+               diverso la chiave va nuda).
 """
 import json
 import os
@@ -59,6 +75,10 @@ STRIP_LATEST = os.environ.get("STRIP_LATEST", "") == "1"
 MODELS_CACHE = os.environ.get("MODELS_CACHE", "") == "1"
 CACHE_FILE = os.environ.get("MODELS_CACHE_FILE", "/cache/models.json")
 CONTEXT_FROM = os.environ.get("CONTEXT_FROM", "")
+UPSTREAM_KEY = os.environ.get("UPSTREAM_KEY", "")
+UPSTREAM_KEY_FILE = os.environ.get("UPSTREAM_KEY_FILE", "")
+UPSTREAM_KEY_NAME = os.environ.get("UPSTREAM_KEY_NAME", "")
+UPSTREAM_AUTH_HEADER = os.environ.get("UPSTREAM_AUTH_HEADER", "Authorization")
 
 _client_kwargs = {"timeout": httpx.Timeout(600.0, connect=15.0)}
 if PROXY:
@@ -68,6 +88,47 @@ client = httpx.Client(**_client_kwargs)
 
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
                "accept-encoding", "keep-alive"}
+# header di autenticazione del CLIENT: vanno rimossi quando il gateway usa una
+# chiave propria (litellm manda un segnaposto, l'upstream pretende la sua)
+AUTH_HEADERS = {"authorization", "g4f-api-key", "x-api-key"}
+
+_KEY_CACHE = {"ts": 0.0, "key": None}
+_KEY_TTL = 60.0
+
+
+def _upstream_key():
+    """Chiave PROPRIA dell'upstream: None = non configurata (passthrough
+    dell'Authorization del client), stringa (anche vuota) = configurata.
+    Vedi UPSTREAM_KEY* nel docstring del modulo. Memo TTL 60s: la rilettura
+    del file non costa un open per ogni richiesta e una rotazione della
+    chiave nell'.env upstream viene vista senza riavviare il gateway."""
+    if not UPSTREAM_KEY and not UPSTREAM_KEY_FILE:
+        return None
+    now = time.time()
+    if _KEY_CACHE["key"] is not None and now - _KEY_CACHE["ts"] < _KEY_TTL:
+        return _KEY_CACHE["key"]
+    key = UPSTREAM_KEY
+    if not key and UPSTREAM_KEY_FILE:
+        try:
+            with open(UPSTREAM_KEY_FILE) as f:
+                txt = f.read()
+        except OSError as e:
+            print(f"gw: upstream key file skip: {type(e).__name__}: {e}", flush=True)
+            key = _KEY_CACHE["key"] or ""
+        else:
+            key = txt.strip()
+            if UPSTREAM_KEY_NAME:
+                key = ""
+                for line in txt.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == UPSTREAM_KEY_NAME:
+                        key = v.strip().strip('"').strip("'")
+                        break
+    _KEY_CACHE.update(ts=now, key=key)
+    return key
 
 
 _CTX_CACHE = (0.0, {})
@@ -131,9 +192,22 @@ class Handler(BaseHTTPRequestHandler):
         print("gw: " + fmt % args, flush=True)
 
     def _upstream_headers(self):
-        return {k: v for k, v in self.headers.items()
-                if k.lower() not in HOP_HEADERS} | {"Accept-Encoding": "identity",
-                                                    "Connection": "close"}
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in HOP_HEADERS}
+        key = _upstream_key()
+        if key is not None:
+            # auth PROPRIA dell'upstream (UPSTREAM_KEY*): quella del client e'
+            # un segnaposto di litellm e va SOSTITUITA, non affiancata -
+            # altrimenti l'upstream riceve due credenziali e risponde 401
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() not in AUTH_HEADERS}
+            if key:
+                headers[UPSTREAM_AUTH_HEADER] = (
+                    f"Bearer {key}"
+                    if UPSTREAM_AUTH_HEADER.lower() == "authorization" else key)
+        headers["Accept-Encoding"] = "identity"
+        headers["Connection"] = "close"
+        return headers
 
     def do_GET(self):
         self._forward("GET")

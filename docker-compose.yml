@@ -10,7 +10,7 @@ services:
       # through llmtrim (HTTPS MITM on host) so fallbacks get tracked/compressed.
       # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
       HTTPS_PROXY: http://host.docker.internal:43117
-      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw"
+      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw,gpt4free-gw"
       # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync,
       # pubblicato in trust/ - vedi volume qui sotto: directory, non file)
       SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
@@ -48,7 +48,7 @@ services:
       - openrouter-gw
       - groq-gw
       - gemini-gw
-      - inference4free-gw
+      - gpt4free-gw
       - ollama-gw
     restart: no
     healthcheck:
@@ -183,44 +183,63 @@ services:
       retries: 3
       start_period: 120s
 
-  # Gateway per inference4free (provider-gw/gw.py). ID_PREFIX=inference4free/
-  # per il listing: il rename di litellm corromperebbe gli id nativi tipo
-  # "deepseek/deepseek-chat" ("deepseek" e' un provider noto). Nessuna
-  # riscrittura path (l'endpoint vive gia' su /v1). NOTA: l'upstream e'
-  # plain-HTTP su LAN; llmtrim inoltra il traffico ma NON lo traccia (la sua
-  # pipeline MITM/tracking e' solo-TLS, LLMTRIM_EXTRA_HOSTS estende i domini
-  # HTTPS). L'hop resta per uniformita' architetturale e filtri futuri.
-  inference4free-gw:
-    container_name: inference4free-gw
+  # Gateway per gpt4free (provider-gw/gw.py), che ha SOSTITUITO
+  # inference4free-gw il 2026-11-02 (inference4free spento sul rpi5: il
+  # blocco storico e' commentato qui sotto). Upstream = stack
+  # /opt/docker/compose/gpt4free sullo STESSO host, porta host 1337
+  # (G4F_PORT nel suo .env) -> 8080 nel container: dall'host si raggiunge
+  # via LAN (192.168.1.13), come deepseek4free/blastpc.
+  # ID_PREFIX=gpt4free/: il listing upstream e' dinamico e contiene id con
+  # "/" (nvidia/nemotron-..., ovh-free/..., openrouter/free) e con ":free",
+  # che il rename di litellm corromperebbe; col prefisso la wildcard
+  # gpt4free/* li instrada 1:1 (il capture rimuove il prefisso). Nessuna
+  # riscrittura path: l'endpoint vive gia' su /v1.
+  # Il primo id del listing e' "auto": e' il router automatico di g4f
+  # (Model("auto", base_provider=AnyProvider)) -> nome pubblico
+  # "gpt4free/auto", lo stesso ruolo che aveva "inference4free/auto".
+  # AUTH: l'API di g4f pretende la sua G4F_API_KEY (Authorization: Bearer,
+  # oppure g4f-api-key) mentre litellm manda solo il segnaposto "dummy": il
+  # gateway legge la chiave VERA da /gpt4free/.env (UPSTREAM_KEY_FILE +
+  # UPSTREAM_KEY_NAME) e la SOSTITUISCE. Il .env e' gitignored e resta
+  # fuori dal repo litellm. Il mount e' della DIRECTORY (non del singolo
+  # file): un bind-mount di file resta pinned all'inode vecchio se
+  # bootstrap.sh riscrive .env con mv, e un file assente verrebbe creato da
+  # docker come DIRECTORY. La chiave e' riletta con TTL 60s: ruotarla non
+  # richiede un restart del gateway.
+  # NIENTE GW_PROXY: traffico LOCALE (stesso host), non passa da llmtrim -
+  # che comunque non lo traccerebbe (la sua pipeline MITM e' solo-TLS).
+  # GW_CA resta obbligatoria: gw.py setta SEMPRE verify=GW_CA (senza il file
+  # httpx crasha all'avvio); montaggio per DIRECTORY per la CA-rotation.
+  # MODELS_CACHE last-good: gpt4free e' in sviluppo e viene riavviato a
+  # mano; se /models fallisce il gateway serve l'ultima lista valida e i
+  # modelli restano SEMPRE visibili su litellm. File cache DIVERSO da
+  # quello di inference4free (i due gateway condividono /cache).
+  gpt4free-gw:
+    container_name: gpt4free-gw
     mem_limit: 384m
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_PROXY: http://host.docker.internal:43117
       GW_CA: /data/llmtrim/ca-bundle.pem
-      # hostname (non IP!): llmtrim riconosce SOLO host esatti in
-      # LLMTRIM_EXTRA_HOSTS e scarta gli IP -> l'Host header del gateway
-      # deve essere "deepseek4free" (nome del PROGETTO upstream, accoppiato
-      # a LLMTRIM_EXTRA_HOSTS di llmtrim: non e' il nome del gateway)
-      UPSTREAM: http://deepseek4free:18010
-      ID_PREFIX: inference4free/
-      # cache last-good del listing: l'endpoint e' instabile (progetto in
-      # sviluppo); se /models fallisce, il gateway serve l'ultima lista
-      # valida cosi' i modelli restano SEMPRE visibili su litellm
+      UPSTREAM: http://gpt4free:1337
+      ID_PREFIX: gpt4free/
       MODELS_CACHE: "1"
-      MODELS_CACHE_FILE: /cache/models.json
+      MODELS_CACHE_FILE: /cache/gpt4free-models.json
+      UPSTREAM_KEY_FILE: /gpt4free/.env
+      UPSTREAM_KEY_NAME: G4F_API_KEY
     extra_hosts:
       - "host.docker.internal:host-gateway"
-      - "deepseek4free:192.168.1.13"
+      - "gpt4free:192.168.1.13"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
       - ./provider-gw/cache:/cache
+      - /opt/docker/compose/gpt4free:/gpt4free:ro
       - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
-    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria;
-    # deepseek4free e' instabile di proposito e la cache last-good serve
-    # proprio a questo - un check HTTP sull'upstream marcarebbe "unhealthy"
-    # un gateway che sta servendo bene. start_period: "pip install httpx".
+    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
+    # gpt4free e' un progetto in sviluppo riavviato a mano - un check HTTP
+    # sul listing marcherebbe "unhealthy" un gateway che serve bene dalla
+    # cache last-good. start_period: "pip install httpx" prima di gw.py.
     healthcheck:
       test:
         [
@@ -233,6 +252,61 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+
+  # --- inference4free: DISATTIVATO il 2026-11-02 -------------------------
+  # inference4free e' stato spento sul rpi5 e sostituito COMPLETAMENTE da
+  # gpt4free (gpt4free-gw qui sopra + wildcard gpt4free/* in config.yaml).
+  # Il blocco resta come riferimento per un ripristino: togliere il commento
+  # qui e in config(.example).yaml e rimettere "inference4free-gw" in
+  # depends_on di litellm.
+  #
+  # Gateway per inference4free (provider-gw/gw.py). ID_PREFIX=inference4free/
+  # per il listing: il rename di litellm corromperebbe gli id nativi tipo
+  # "deepseek/deepseek-chat" ("deepseek" e' un provider noto). Nessuna
+  # riscrittura path (l'endpoint vive gia' su /v1). NOTA: l'upstream e'
+  # plain-HTTP su LAN; llmtrim inoltra il traffico ma NON lo traccia (la sua
+  # pipeline MITM/tracking e' solo-TLS, LLMTRIM_EXTRA_HOSTS estende i domini
+  # HTTPS). L'hop resta per uniformita' architetturale e filtri futuri.
+  # inference4free-gw:
+  #   container_name: inference4free-gw
+  #   mem_limit: 384m
+  #   image: python:3.13-slim
+  #   command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+  #   environment:
+  #     GW_PROXY: http://host.docker.internal:43117
+  #     GW_CA: /data/llmtrim/ca-bundle.pem
+  #     # hostname (non IP!): llmtrim riconosce SOLO host esatti in
+  #     # LLMTRIM_EXTRA_HOSTS e scarta gli IP -> l'Host header del gateway
+  #     # deve essere "deepseek4free" (nome del PROGETTO upstream, accoppiato
+  #     # a LLMTRIM_EXTRA_HOSTS di llmtrim: non e' il nome del gateway)
+  #     UPSTREAM: http://deepseek4free:18010
+  #     ID_PREFIX: inference4free/
+  #     # cache last-good del listing: l'endpoint e' instabile (progetto in
+  #     # sviluppo); se /models fallisce, il gateway serve l'ultima lista
+  #     # valida cosi' i modelli restano SEMPRE visibili su litellm
+  #     MODELS_CACHE: "1"
+  #     MODELS_CACHE_FILE: /cache/models.json
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #     - "deepseek4free:192.168.1.13"
+  #   volumes:
+  #     - ./provider-gw/gw.py:/app/gw.py:ro
+  #     - ./provider-gw/cache:/cache
+  #     - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
+  #   restart: no
+  #   healthcheck:
+  #     test:
+  #       [
+  #         "CMD",
+  #         "python",
+  #         "-c",
+  #         "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+  #       ]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 120s
+
 
   # Gate TCP verso llama-swap (blastpc) - vedi llama-gate/gate.py:
   # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
