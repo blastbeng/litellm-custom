@@ -523,16 +523,20 @@ model_list:
       # g4f NON espone il context_length nel listing (verificato 2026-11-02:
       # solo id/owned_by/image/vision) e i modelli sono eterogenei (100k+ per
       # i modelli OpenRouter free, molto meno per i provider keyless senza
-      # documentazione): 32768 = floor operativo conservativo, allineato a
+      # documentazione): 65536 = floor operativo, allineato a
       # CONTEXT_BY_PREFIX "gpt4free/" di reasoning_clamp.py. Il contesto
-      # REALE per-modello non e' disponibile da nessuna fonte. ERA 131072
-      # fino al 2026-11-02: con il floor alto i prompt lunghi andavano 400
-      # sui modelli piccoli del pool. Il prezzo del floor basso e' che oltre
-      # ~32k entra la cascata di compattazione (reasoning_clamp) anche
-      # quando il modello reggerebbe di piu'.
-      max_input_tokens: 32768
+      # REALE per-modello non e' disponibile da nessuna fonte. Storia: 131072
+      # fino al 2026-11-02 (prompt lunghi -> 400 sui modelli piccoli), poi
+      # 32768, poi 65536 il 2026-11-02. Il 32768 era SOTTO il costo fisso di
+      # OpenWebUI con gli MCP tool server accesi: i soli schemi di
+      # mcp-gateway (85 tool, ~90k char) valgono ~32k token e la cascata non
+      # li comprime mai -> 413 prompt_too_large su OGNI gpt4free/* anche con
+      # un messaggio di 2 token. Misurato su auto: 16.9k e 39.4k token OK,
+      # ~60k e ~90k falliscono (catena AutoFree esaurita) -> 65536 lascia
+      # ~29k di conversazione sopra i tool restando sotto il tetto pratico.
+      max_input_tokens: 65536
       max_output_tokens: 32768
-      max_tokens: 32768
+      max_tokens: 65536
       # VISION (direttiva utente 2026-11-02): il flag sta sul GRUPPO perche'
       # e' g4f a fare il routing, non litellm. Con un'immagine nel body
       # AutoFree (g4f_ext/autofree_g4f.py: _has_image) ristringe la catena ai

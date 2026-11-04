@@ -373,16 +373,23 @@ CONTEXT_BY_PREFIX = (
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    # gpt4free (dal 2026-11-02 al posto di inference4free): 32768 e' un
+    # gpt4free (dal 2026-11-02 al posto di inference4free): 65536 e' un
     # FLOOR OPERATIVO, non il minimo reale - g4f NON espone context_length
     # nel suo listing (/v1/models: solo id/owned_by/image/vision, verificato)
     # e i ~250 modelli sono eterogenei, quindi _DYN_CTX resta vuoto per
-    # questo prefisso: vale sempre questo valore statico. Era 131072 fino al
-    # 2026-11-02 (richiesta utente): con il floor alto i prompt lunghi
-    # partivano verso i modelli piccoli del pool e tornavano 400, sprecando
-    # l'hop. Il prezzo del floor basso e' che oltre ~32k parte la cascata di
-    # compattazione anche quando il modello reggerebbe di piu'.
-    ("gpt4free/", 32768),
+    # questo prefisso: vale sempre questo valore statico. Storia: 131072
+    # fino al 2026-11-02 (prompt lunghi -> 400 sui modelli piccoli del pool),
+    # poi 32768, poi 65536 il 2026-11-02. Il 32768 era sotto il costo FISSO
+    # di OpenWebUI con gli MCP tool server accesi: il solo mcp-gateway manda
+    # 85 tool / ~90k char di schemi (~32k token, contati VERBATIM da
+    # _estimate_prompt_tokens e mai comprimibili dalla cascata) -> ogni
+    # richiesta gpt4free/* andava in 413 prompt_too_large anche con un
+    # messaggio utente di 2 token. Misurato su auto: 16.9k e 39.4k token OK,
+    # ~60k e ~90k falliscono (catena AutoFree esaurita), quindi 65536 e' il
+    # compromesso: lascia ~29k di conversazione sopra i tool e resta sotto il
+    # tetto pratico del pool. Da rivedere quando g4f esporra' context_length
+    # per-modello (allora questo floor sparisce a favore di _DYN_CTX).
+    ("gpt4free/", 65536),
     ("local-model", 196608),
     ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)

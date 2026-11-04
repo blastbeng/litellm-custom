@@ -340,10 +340,16 @@ embedding) with the real per-model contexts exposed on `/v1/models`
 fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
 needs a config entry. `gpt4free/*` stays a wildcard (dynamic lineup of ~250
 models) and g4f does **not** expose `context_length` in its listing, so its
-32768 is a static operational floor (no `_DYN_CTX` for this prefix; lowered
-from 131072 on 2026-11-02 because long prompts kept 400ing on the small
-models of the pool, at the cost of running the compaction cascade above
-~32k even for the models that would have coped):
+65536 is a static operational floor (no `_DYN_CTX` for this prefix; history:
+131072 until 2026-11-02, then 32768 because long prompts kept 400ing on the
+small models of the pool, then 65536 the same day: 32768 sat **below the fixed
+cost of OpenWebUI with its MCP tool servers enabled** — `mcp-gateway` alone
+ships 85 tool schemas, ~90k chars ≈ 32k tokens, counted verbatim and never
+compressible by the cascade, so every `gpt4free/*` request 413'd even with a
+2-token user message. Measured on `auto`: 16.9k and 39.4k tokens OK, ~60k and
+~90k fail with the AutoFree chain exhausted, so 65536 leaves ~29k of
+conversation above the tool block and stays under the pool's practical
+ceiling):
 its real per-model contexts (10000–1000000) reach the clamp and the worker
 pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 `reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still
