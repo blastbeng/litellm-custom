@@ -288,7 +288,7 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` has no fallback since 2026-10-28; 196608 for the locals, 131072
+(`synthetic/*` has no fallback since 2026-10-28; 163840 for the locals, 131072
 floor for the synthetic wildcard — real per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
@@ -331,10 +331,10 @@ prompt alone saturates the context the clamp is useless — there is no room
 left for the answer — and the **overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
-aligned with `model_info.max_input_tokens` in `config.yaml`** (196608 since
-2026-10-06 for `local-model`/`small-model` — previously 131072, capped by the
-local hardware). **synthetic is 13 explicit entries** (12 chat + the nomic
-embedding) with the real per-model contexts exposed on `/v1/models`
+aligned with `model_info.max_input_tokens` in `config.yaml`** (163840 since
+2026-11-04 for `local-model`/`small-model` — 196608 from 2026-10-06 to
+2026-11-03, previously 131072, capped by the local hardware). **synthetic is
+13 explicit entries** (12 chat + the nomic embedding) with the real per-model contexts exposed on `/v1/models`
 (`syn:large:text` 524288, `syn:small:text` 196608, `hf:openai/gpt-oss-120b`
 131072, …) — litellm's wildcard expansion propagates ids only, never context
 fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
@@ -570,10 +570,10 @@ without restarting anything. `trust/` contains **only** the public bundle —
 ### Note on llama-server (local model)
 
 The context reported by `llama-server` is **`--ctx-size / -np`**: each slot
-exposes `--ctx-size / -np` tokens (since 2026-10-06 **196608** per slot, was
-131072 before — the local hardware cap that forced every chain-aligned
-context down), and the upstream rejects oversized requests with its own 400
-(see **Context clamp** above), consistent with `model_info` in config. A
+exposes `--ctx-size / -np` tokens (since 2026-11-04 **163840** per slot,
+196608 from 2026-10-06 to 2026-11-03, 131072 before — the local hardware cap
+that forced every chain-aligned context down), and the upstream rejects
+oversized requests with its own 400 (see **Context clamp** above), consistent with `model_info` in config. A
 context flip must be kept in sync in **three** places: `config.yaml`
 (`model_info`), `config.example.yaml`, and `CONTEXT_BY_PREFIX` in
 `reasoning_clamp.py`.

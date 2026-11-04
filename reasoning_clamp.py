@@ -365,8 +365,9 @@ LLAMA_SWAP_MEDIA_PREFIX = "llama-swap/"
 # limite lo impone l'upstream. Valori ALLINEATI a config(.example).yaml:
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
-    # locali: 196608 dal 2026-10-06 (prima 131072: cappati a 128k lato
-    # llama-server). synthetic: i 13 modelli sono entry ESPLICITE in config
+    # locali: 163840 dal 2026-11-04 (prima 196608 dal 2026-10-06, prima
+    # 131072: cappati a 128k lato llama-server). synthetic: i 13 modelli sono
+    # entry ESPLICITE in config
     # dal 2026-10-06 -> qui sotto i contesti REALI per-modello (misurati sui
     # listing di api.synthetic.new). INCIDENTE 2026-10-06: GLM-5.3-Flash
     # valeva 131072 (floor di gruppo) mentre il reale e' 524288 -> cascata
@@ -390,8 +391,8 @@ CONTEXT_BY_PREFIX = (
     # tetto pratico del pool. Da rivedere quando g4f esporra' context_length
     # per-modello (allora questo floor sparisce a favore di _DYN_CTX).
     ("gpt4free/", 65536),
-    ("local-model", 196608),
-    ("small-model", 196608),
+    ("local-model", 163840),
+    ("small-model", 163840),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
     # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti

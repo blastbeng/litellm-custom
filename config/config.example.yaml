@@ -55,10 +55,10 @@ model_list:
       timeout: 1800
     model_info:
       id: local-qwen-backend
-      # contesto lato llama-server: 196608 dal 2026-10-06 (prima 131072,
-      # prima ancora 262144 ridotto per RAM/VRAM): litellm deve dichiararlo
-      # ai client
-      max_input_tokens: 196608
+      # contesto lato llama-server: 163840 dal 2026-11-04 (prima 196608 dal
+      # 2026-10-06, prima 131072, prima ancora 262144 ridotto per RAM/VRAM):
+      # litellm deve dichiararlo ai client
+      max_input_tokens: 163840
       max_output_tokens: 32768
       max_tokens: 32768
 
@@ -76,9 +76,9 @@ model_list:
       timeout: 1800
     model_info:
       id: local-small-backend
-      # assumo lo stesso contesto di local-model (196608): aggiornare se
-      # small-model dichiara un contesto diverso su llama-swap
-      max_input_tokens: 196608
+      # assumo lo stesso contesto di local-model (163840 dal 2026-11-04):
+      # aggiornare se small-model dichiara un contesto diverso su llama-swap
+      max_input_tokens: 163840
       max_output_tokens: 32768
       max_tokens: 32768
 
