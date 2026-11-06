@@ -2425,6 +2425,38 @@ class ReasoningClamp(CustomLogger):
 
     def _apply(self, data):
         model = str(data.get("model") or "")
+        # --- toggle semantic cache per-request (DOPPIA POLITICA) ------------
+        # DEFAULT = cache SPENTA: senza header la richiesta NON legge e NON
+        # scrive la semantic cache (gli agent coding non mandano nulla -> OFF).
+        # Si ACCENDE solo con header esplicito "Cache-Control: cache" oppure
+        # "Cache-Control: store" (token ESATTI, split sulla virgola: "no-store"
+        # NON accende). Unico punto di controllo REALE: litellm legge l'header
+        # standard "Cache-Control" SOLO per s-maxage -> ttl
+        # (litellm_pre_call_utils.py), quindi qui lo traduciamo nelle chiavi
+        # che litellm riconosce a livello per-request (caching_handler:
+        # kwargs["cache"]["no-cache"] salta la LETTURA, ["no-store"] salta la
+        # SCRITTURA). Resta un semplice header, senza key dedicate ne' DB.
+        #   agent coding -> nessun header              -> OFF (default)
+        #   altri client -> "Cache-Control: cache"     -> ON
+        # (richiesta utente 2026-11-06). Gli header del client sono in
+        # proxy_server_request/http metadata (dict di header "logging safe").
+        opt_in = False
+        hdrs = ((data.get("proxy_server_request") or {}).get("headers")
+                or (data.get("metadata") or {}).get("headers")
+                or (data.get("litellm_metadata") or {}).get("headers")
+                or {})
+        if isinstance(hdrs, dict):
+            cc = ""
+            for hk, hv in hdrs.items():
+                if isinstance(hk, str) and hk.lower() == "cache-control" and hv:
+                    cc = str(hv).lower()
+                    break
+            tokens = {t.strip() for t in cc.split(",") if t.strip()}
+            opt_in = "cache" in tokens or "store" in tokens
+        if opt_in:
+            data["cache"] = {"no-cache": False, "no-store": False}
+        else:
+            data["cache"] = {"no-cache": True, "no-store": True}
         # --- immagini con URL che il PROVIDER non puo' risolvere ---
         # OpenWebUI manda le immagini come data: URL (base64) e le converte
         # solo se il file esiste. Quando la conversione fallisce (file

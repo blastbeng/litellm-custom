@@ -599,7 +599,35 @@ litellm_settings:
   # hanno timeout: 1800: qui il tetto diventa uniforme (30 min). I client
   # httpx condivisi mantengono connect=5s.
   request_timeout: 1800
-  cache: false
+  # Semantic caching (richieste utente 2026-11-06): DEFAULT SPENTA su TUTTI i
+  # modelli; si ACCENDE per-request solo con l'header esplicito
+  # "Cache-Control: cache" (oppure "store"), tradotto nella callback
+  # reasoning_clamp: litellm da solo usa quell'header solo per s-maxage->ttl.
+  # Due politiche: agent coding = nessun header -> semantic OFF (default);
+  # altri progetti con richieste ripetitive = header -> semantic ON.
+  # Backend: il redis esterno di /opt/docker/compose/redis (modulo search di
+  # Redis 8), DB 0, indice litellm_semantic_cache. DEVE essere il DB 0:
+  # RediSearch/RedisVL rifiuta FT.CREATE su qualunque db != 0 ("Cannot create
+  # index on db != 0") e l'indice e' comunque globale al db 0. L'isolamento
+  # dai dati altrui lo da' il PREFISSO delle chiavi (redisvl usa il nome
+  # dell'indice, "litellm_semantic_cache:", come prefisso) + il ttl.
+  # Embedding: SOLO embedding-model (Qwen3-Embedding-0.6b locale via
+  # llama-gate), NESSUN fallback (richiesta utente 2026-11-06). L'embedding
+  # INTERNO della cache non passa da reasoning_clamp e un fallback su un
+  # modello con spazio vettoriale diverso (nomic=768 vs embedding-model=1024)
+  # darebbe similarita' incoerenti / falsi hit. ttl OBBLIGATORIO: quel redis
+  # gira con --maxmemory-policy volatile-lru, che evince SOLO chiavi con TTL.
+  # supported_call_types: solo /chat/completions (niente embeddings/media).
+  cache: true
+  cache_params:
+    type: redis-semantic
+    redis_url: redis://host.docker.internal:6379/0
+    redis_semantic_cache_index_name: litellm_semantic_cache
+    redis_semantic_cache_embedding_model: embedding-model
+    similarity_threshold: 0.85
+    ttl: 86400
+    supported_call_types:
+      - acompletion
   drop_params: false
 
   # Fallback (richiesta utente 2026-10-25): small-model NON e' piu' un
