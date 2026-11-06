@@ -524,6 +524,70 @@ litellm's own `INTERNAL_CALL_ORIGIN_METADATA_KEY`, which is the recursion
 guard (a compaction call must never be compacted again) and keeps them out of
 spend logs, rate limits and cooldowns.
 
+## Semantic caching (opt-in)
+
+An optional **semantic cache** (Redis + vector similarity, similar prompts
+share a cached answer) is wired into the proxy. It is **OFF by default** and
+that default applies to **every** model, so coding agents — which must always
+see a fresh answer — are unaffected unless they ask for it. It turns **ON
+per-request**, with no extra keys and no second endpoint, only when the client
+sends an explicit header:
+
+```
+Cache-Control: cache
+```
+
+`store` works too. Tokens are matched **exactly** (comma-separated), so
+`no-store`/`no-cache` do **not** enable it. The header is translated by
+`reasoning_clamp._apply()` into litellm's per-request `cache` flags
+(`no-cache` skips the read, `no-store` the write): litellm on its own only
+understands `Cache-Control` for `s-maxage` → `ttl`.
+
+Two policies for the same proxy, same key:
+
+| Client | Header | Semantic cache |
+|---|---|---|
+| coding agent / normal chat | *(none)* | **OFF** (default) |
+| project with repetitive requests | `Cache-Control: cache` | **ON** |
+
+```bash
+# OFF (default) -> a perfectly normal, uncached call
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer $LITELLM_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"synthetic/syn:small:text","messages":[{"role":"user","content":"hi"}]}'
+
+# ON -> this request reads AND writes the semantic cache
+curl http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer $LITELLM_KEY" -H "Content-Type: application/json" \
+  -H "Cache-Control: cache" \
+  -d '{"model":"synthetic/syn:small:text","messages":[{"role":"user","content":"hi"}]}'
+```
+
+With the OpenAI SDK, just add the header to the client's default headers. On a
+hit litellm returns `x-litellm-cache-key` and `x-litellm-semantic-similarity`
+(a miss reports `0.0`); look for them to confirm the cache is live.
+
+Details / constraints:
+
+- **Backend**: the shared Redis at `/opt/docker/compose/redis` (Redis 8 with
+  the `search` module), **DB 0**, index `litellm_semantic_cache`, key prefix
+  `litellm_semantic_cache:`, `ttl: 86400`. DB 0 is **mandatory**: RediSearch /
+  RedisVL refuses `FT.CREATE` on any `db != 0` and the index is db0-global;
+  isolation from other data is by key prefix. The `ttl` is mandatory too — that
+  Redis runs with `--maxmemory-policy volatile-lru`, which evicts **only** keys
+  that have a TTL.
+- **Embedding**: only `embedding-model` (Qwen3-Embedding-0.6b, 1024-dim, local
+  via llama-gate), with **no fallback** — a different embedding model lives in
+  a different vector space and would yield false hits. If `embedding-model` is
+  down the cache simply misses (never a wrong answer).
+- **Scope**: `supported_call_types: [acompletion]` → `/chat/completions` only
+  (not embeddings/media). `similarity_threshold: 0.85` is strict: identical or
+  near-identical prompts hit, looser paraphrases miss.
+- Caching applies only to requests litellm is willing to cache at all (e.g.
+  ≤ `max_messages`, default 4 messages).
+- To disable semantic caching **entirely**, set `cache: false` in
+  `config/config.yaml` (then `sudo systemctl restart docker-compose@litellm`).
+
 ## Deployment
 
 ```bash
