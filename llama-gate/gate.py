@@ -52,6 +52,11 @@ LISTEN_PORT = int(os.environ.get("GATE_PORT", "80"))
 # SEMPRE la connessione, cosi' un PC appena riacceso non prende 503 finti.
 OFFLINE_COOLDOWN = float(os.environ.get("GATE_OFFLINE_COOLDOWN", "5"))
 _OFFLINE_UNTIL = [0.0]
+# Stato dell'upstream per il LOG: si stampa SOLO alla transizione
+# online<->offline, MAI per singola richiesta. Prima ogni connect fallito
+# stampava "upstream connect failed ..." (una riga ogni ~30s per il polling
+# di /v1/models: spam inutile, il PC spento non e' una novita').
+_UP_STATE = ["unknown"]        # unknown | online | offline
 _OFFLINE_LOCK = threading.Lock()
 
 _BODY_EMPTY_MODELS = b'{"object":"list","data":[]}\n'
@@ -174,6 +179,10 @@ class Handler(threading.Thread):
             self.conn.settimeout(None)
             with _OFFLINE_LOCK:
                 _OFFLINE_UNTIL[0] = 0.0
+                recovered = _UP_STATE[0] == "offline"
+                _UP_STATE[0] = "online"
+            if recovered:
+                print(f"gate: upstream {UP_HOST}:{UP_PORT} online", flush=True)
             threading.Thread(target=_pipe, args=(up, self.conn), daemon=True).start()
             _pipe(self.conn, up)
         except OSError as e:
@@ -181,7 +190,12 @@ class Handler(threading.Thread):
             # WARNING a litellm), tutto il resto -> 503 subito.
             with _OFFLINE_LOCK:
                 _OFFLINE_UNTIL[0] = time.monotonic() + OFFLINE_COOLDOWN
-            print(f"gate: upstream connect failed in {time.time()-t:.2f}s: {e}", flush=True)
+                transition = _UP_STATE[0] != "offline"
+                _UP_STATE[0] = "offline"
+            if transition:
+                print(f"gate: upstream {UP_HOST}:{UP_PORT} offline "
+                      f"(connect failed in {time.time()-t:.2f}s: {e}) - "
+                      f"loggo solo le transizioni", flush=True)
             try:
                 if _is_models_listing(self.conn):
                     self.conn.sendall(_200_EMPTY_MODELS)
