@@ -312,6 +312,11 @@ services:
   # PC spento -> 503 in ~2s (health-connect), PC acceso -> tubo trasparente
   # cosi' litellm puo' avere un timeout LUNGO (modelli enormi: 10-20 min)
   # senza restare appeso quando il PC e' spento.
+  # Eccezione LISTING: GET /v1/models a PC spento -> 200 con lista vuota.
+  # Un 503 qui faceva loggare a litellm un WARNING per ogni wildcard a ogni
+  # /v1/models dei client; GATE_OFFLINE_COOLDOWN (5s) evita di ripetere il
+  # probe TCP (2s) per ogni wildcard dello stesso listing. L'inferenza
+  # (chat/immagini/audio) resta 503 e prova SEMPRE la connessione.
   # GATE_TLS=auto: la gate PROVA il TLS e, se l'upstream risponde in HTTP
   # in chiaro (llama-swap senza ssl, dal 2026-10-02), riparte su TCP pulito:
   # funziona con https self-signed E con http senza toccare la config quando
@@ -392,7 +397,8 @@ services:
   # "deepseek-r1:14b" -> "deepseek/..."); col prefisso la wildcard ollama/*
   # li cattura e li instrada 1:1 (il capture rimuove il prefisso). NIENTE
   # MODELS_CACHE: i modelli devono apparire SOLO quando il PC e' online
-  # (listing dinamico reale; PC spento -> la gate risponde 503).
+  # (listing dinamico reale; PC spento -> la gate risponde 200 con lista
+  # vuota, cosi' litellm non logga un WARNING per ogni /v1/models).
   ollama-gw:
     container_name: ollama-gw
     mem_limit: 384m

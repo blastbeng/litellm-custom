@@ -244,8 +244,12 @@ class Handler(BaseHTTPRequestHandler):
         nell'entry (mappato per nome NATIVO, prima dello strip/prefix)."""
         try:
             j = json.loads(data)
-            ctxs = _native_contexts()
-            for m in j.get("data", []):
+            entries = j.get("data", [])
+            # listing VUOTO (es. gate con upstream offline: 200 + data[])
+            # non ha contesti da arricchire: niente fetch di CONTEXT_FROM,
+            # che fallirebbe a ogni /v1/models sporcando il log del gateway.
+            ctxs = _native_contexts() if entries else {}
+            for m in entries:
                 if "id" not in m:
                     continue
                 mid = str(m["id"])

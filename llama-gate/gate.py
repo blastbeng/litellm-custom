@@ -10,6 +10,11 @@ Se il TCP/TLS verso llama-swap non si stabilisce entro HEALTH_TIMEOUT, la gate
 risponde 503 in fretta (il PC e' spento/non raggiungibile). Se si stabilisce,
 fa da tubo bidirezionale (HTTP e SSE passano invariati).
 
+Eccezione: `GET /v1/models` a PC spento risponde 200 con lista vuota. Un 503
+sul listing farebbe loggare a litellm un WARNING per ogni espansione wildcard
+a ogni /v1/models dei client; il catalogo vuoto e' corretto e l'inferenza
+resta 503 (vedi OFFLINE_COOLDOWN).
+
 UPSTREAM TLS o HTTP - GATE_TLS=auto (default): la gate PROVA il TLS verso
 l'upstream; se l'handshake fallisce perche' l'upstream parla HTTP in chiaro
 (SSL: WRONG_VERSION_NUMBER / EOF), riparte su una connessione TCP NUOVA in
@@ -35,6 +40,48 @@ UP_HOST = os.environ.get("GATE_UP_HOST", "192.168.1.29")
 UP_PORT = int(os.environ.get("GATE_UP_PORT", "11435"))
 HEALTH_TIMEOUT = float(os.environ.get("GATE_HEALTH_TIMEOUT", "2"))
 LISTEN_PORT = int(os.environ.get("GATE_PORT", "80"))
+
+# LISTING /v1/models a PC SPENTO: un 503 fa loggare a litellm un WARNING per
+# OGNI espansione wildcard ("Error getting valid models: ... blastpc
+# offline"), ripetuto a ogni /v1/models dei client -> spam. Il listing NON e'
+# inferenza: un catalogo vuoto e' la risposta corretta ("nessun modello
+# disponibile"), mentre chat/immagini/audio restano 503. Le connessioni
+# consecutive entro OFFLINE_COOLDOWN saltano il probe TCP (2s l'una): una
+# /v1/models con 5 wildcard passa da ~10s a ~2s e non genera altre righe.
+# Il cooldown vale SOLO per il listing: le richieste di inferenza provano
+# SEMPRE la connessione, cosi' un PC appena riacceso non prende 503 finti.
+OFFLINE_COOLDOWN = float(os.environ.get("GATE_OFFLINE_COOLDOWN", "5"))
+_OFFLINE_UNTIL = [0.0]
+_OFFLINE_LOCK = threading.Lock()
+
+_BODY_EMPTY_MODELS = b'{"object":"list","data":[]}\n'
+_200_EMPTY_MODELS = (b"HTTP/1.1 200 OK\r\n"
+                     b"Content-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(_BODY_EMPTY_MODELS)).encode() + b"\r\n"
+                     b"X-Gate-Upstream: offline\r\n"
+                     b"Connection: close\r\n\r\n"
+                     + _BODY_EMPTY_MODELS)
+
+
+def _is_models_listing(conn: socket.socket) -> bool:
+    """True se la richiesta gia' nel buffer e' `GET /v1/models` (query ok).
+
+    MSG_PEEK non consuma i byte: se la richiesta e' per l'upstream il tubo
+    riparte dal primo byte. Timeout breve: un client che non ha ancora
+    scritto viene trattato come non-listing (-> 503, comportamento storico).
+    """
+    try:
+        conn.settimeout(0.2)
+        data = conn.recv(4096, socket.MSG_PEEK)
+    except OSError:
+        return False
+    line = data.split(b"\r\n", 1)[0]
+    parts = line.split()
+    if len(parts) < 2 or parts[0] != b"GET":
+        return False
+    path = parts[1].split(b"?", 1)[0].rstrip(b"/")
+    return path == b"/v1/models"
+
 
 # auto (default): prova TLS, poi chiaro | 1: solo TLS | 0: solo chiaro
 _TLS_RAW = os.environ.get("GATE_TLS", "auto").strip().lower()
@@ -112,19 +159,34 @@ class Handler(threading.Thread):
                                             timeout=remaining), "plain"
 
     def run(self):
+        t = time.time()
         try:
-            t = time.time()
+            # PC offline da poco: il listing risponde subito, senza riprovare
+            # il TCP per ogni wildcard (vedi OFFLINE_COOLDOWN).
+            with _OFFLINE_LOCK:
+                cooling = time.monotonic() < _OFFLINE_UNTIL[0]
+            if cooling and _is_models_listing(self.conn):
+                self.conn.sendall(_200_EMPTY_MODELS)
+                return
             up, _mode = self._connect(t)
             # disattiva il timeout di health-check per il tubo (attese lunghe ok)
             up.settimeout(None)
             self.conn.settimeout(None)
+            with _OFFLINE_LOCK:
+                _OFFLINE_UNTIL[0] = 0.0
             threading.Thread(target=_pipe, args=(up, self.conn), daemon=True).start()
             _pipe(self.conn, up)
         except OSError as e:
-            # PC spento / non raggiungibile: 503 subito
+            # PC spento / non raggiungibile: listing -> catalogo vuoto (niente
+            # WARNING a litellm), tutto il resto -> 503 subito.
+            with _OFFLINE_LOCK:
+                _OFFLINE_UNTIL[0] = time.monotonic() + OFFLINE_COOLDOWN
             print(f"gate: upstream connect failed in {time.time()-t:.2f}s: {e}", flush=True)
             try:
-                self.conn.sendall(_503)
+                if _is_models_listing(self.conn):
+                    self.conn.sendall(_200_EMPTY_MODELS)
+                else:
+                    self.conn.sendall(_503)
             except OSError:
                 pass
         finally:
