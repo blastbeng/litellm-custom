@@ -690,6 +690,24 @@ router_settings:
 
 general_settings:
   master_key: sk-YOUR_LITELLM_MASTER_KEY
-  # Senza DB postgres gli spend log si accumulano in RAM per ogni richiesta:
-  # disattivali se non usi spend/budget tracking.
-  disable_spend_logs: true
+  # Con DATABASE_URL impostata (docker-compose.yml, servizio litellm-db) gli
+  # spend log vanno su postgres: disable_spend_logs va LASCIATO TOGLIERE,
+  # altrimenti il DB non registra nulla. Senza DB invece va messo a true, o i
+  # log si accumulano in RAM a ogni richiesta.
+  # Pool piccolo: ogni connessione postgres costa ~1MB + work_mem.
+  database_connection_pool_limit: 5
+  # Retention spend logs eseguita da litellm (job interno, nessun cron):
+  # regola di eta' + regola di spazio, la piu' stringente vince.
+  maximum_spend_logs_retention_period: "30d"
+  maximum_spend_logs_size: "2GB"
+  maximum_spend_logs_cleanup_target_size: "1GB"
+  maximum_spend_logs_cleanup_batch_size: 1000
+  maximum_spend_logs_cleanup_max_batches: 20
+  maximum_spend_logs_cleanup_run_budget: "1m"
+  maximum_spend_logs_cleanup_batch_timeout: "30s"
+  # Cadenza dei due job interni: cleanup per eta' ogni giorno, controllo di
+  # spazio ogni ora (default 1d per entrambi).
+  maximum_spend_logs_retention_interval: "1d"
+  maximum_spend_logs_size_check_interval: "1h"
+  # Il model_list di questo file resta la fonte unica dei modelli.
+  store_model_in_db: false

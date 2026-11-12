@@ -20,6 +20,14 @@ services:
       # - LITELLM_LOG WARNING: meno stringhe di log retenute/stampate
       MALLOC_ARENA_MAX: "2"
       LITELLM_LOG: WARNING
+      # Postgres locale (servizio litellm-db qui sotto): spend logs, virtual
+      # keys e UI funzionano SOLO con un DB. La password vive in .env
+      # (gitignored): la sintassi ":?" fa fallire `docker compose up` se manca,
+      # invece di avviare litellm con un DB irraggiungibile.
+      # Le migrazioni prisma le applica il proxy da solo al primo avvio
+      # (run_server(--skip_server_startup) + prisma generate): nessuno step
+      # manuale. Il primo start e' piu' lento: aspettare il healthcheck.
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@litellm-db:5432/litellm
     # Tetto ALTO: litellm non deve essere OOM-killed (ogni kill tronca gli
     # stream in corso -> TransferEncodingError lato OpenWebUI), quindi 2g di
     # RAM + 1g di swap. Base osservata ~600MB; il vecchio 1g/1g moriva a
@@ -45,11 +53,20 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - openrouter-gw
-      - groq-gw
-      - gemini-gw
-      - gpt4free-gw
-      - ollama-gw
+      # litellm-db healthy (non solo started): il proxy apre il pool prisma
+      # subito e senza DB pronto entrerebbe in un loop di errori di connessione.
+      litellm-db:
+        condition: service_healthy
+      openrouter-gw:
+        condition: service_started
+      groq-gw:
+        condition: service_started
+      gemini-gw:
+        condition: service_started
+      gpt4free-gw:
+        condition: service_started
+      ollama-gw:
+        condition: service_started
     restart: no
     healthcheck:
       test:
@@ -63,6 +80,78 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+  # PostgreSQL per litellm - spend logs, virtual keys, /ui.
+  # TUNING LIGHTWEIGHT (host RPi5 8GB, molta RAM gia' occupata): il default
+  # di postgres (shared_buffers 128MB + work_mem 4MB x connessione) spinge
+  # l'RSS oltre i 150MB; qui misurati ~20-35MB (shared_buffers 32MB compresi).
+  # Ogni flag e' scelto
+  # per quello, non per throughput:
+  # - shared_buffers 32MB: cache condivisa, il resto lo fa la page cache
+  # - max_connections 20: litellm apre al massimo un pool piccolo
+  #   (database_connection_pool_limit in config.yaml) + healthcheck/migrazioni
+  # - work_mem 1MB / maintenance_work_mem 16MB: sort/hash piccoli; i cleanup
+  #   dei log sono a batch, non fanno sort enormi
+  # - effective_cache_size 128MB: solo una stima per il planner (non alloca)
+  # - jit=off: la compilazione JIT allocava decine di MB per query analitiche
+  #   (cleanup/aggregati UI) per guadagni irrilevanti a questo volume
+  # - max_wal_size 192MB / min_wal_size 48MB / checkpoint_timeout 15min:
+  #   meno checkpoint (meno scritture su disco) senza WAL illimitato
+  # - fsync/full_page_writes/synchronous_commit LASCIATI AI DEFAULT: sono la
+  #   garanzia di non corrompere i dati su un host con swap pesante. Il
+  #   guadagno di disattivarli non vale il rischio.
+  # NESSUNA porta pubblicata: il DB e' raggiungibile solo dalla rete compose
+  # (litellm-db:5432). Volume NAMED e non bind-mount: l'immagine alpine gira
+  # come uid 70 e un bind-mount richiederebbe un chown manuale.
+  # Retention: NON e' un cron esterno, la fa litellm stesso (general_settings:
+  # maximum_spend_logs_retention_period + maximum_spend_logs_size).
+  litellm-db:
+    container_name: litellm-db
+    image: postgres:17-alpine
+    mem_limit: 192m
+    # /dev/shm condiviso tra i worker: il default docker (64MB) basta per il
+    # volume di questo DB, ma lo dichiariamo per non dipendere dal default.
+    shm_size: 64m
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: litellm
+      # PGDATA in sottocartella: il volume resta "inizializzato" solo se il
+      # cluster c'e' davvero (evita il caso volume con lost+found).
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - shared_buffers=32MB
+      - -c
+      - max_connections=20
+      - -c
+      - work_mem=1MB
+      - -c
+      - maintenance_work_mem=16MB
+      - -c
+      - effective_cache_size=128MB
+      - -c
+      - jit=off
+      - -c
+      - max_wal_size=192MB
+      - -c
+      - min_wal_size=48MB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - log_min_messages=warning
+    volumes:
+      - litellm_pgdata:/var/lib/postgresql/data
+    restart: no
+    healthcheck:
+      # pg_isready e' il check nativo: risponde quando il server accetta
+      # connessioni, non prima (le migrazioni prisma di litellm partono dopo).
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # Gateway OpenRouter per litellm (vedi openrouter-gw/gw.py):
   # - riscrive /v1/* -> /api/v1/* (litellm si aspetta /v1 sull'host)
@@ -443,3 +532,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+
+volumes:
+  # Dati di litellm-db (spend logs, chiavi, utenti). Named volume: sopravvive
+  # a `docker compose down` (muore solo con `down -v`).
+  litellm_pgdata:

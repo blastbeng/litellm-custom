@@ -606,7 +606,53 @@ sudo systemctl restart docker-compose@litellm
 - the **gpt4free** stack (`/opt/docker/compose/gpt4free`) published on
   192.168.1.13:1337 (`G4F_PORT`, container 8080); `gpt4free-gw` mounts
   `/opt/docker/compose/gpt4free` read-only to read `G4F_API_KEY` from its
-  `.env` — no secret is stored in this repo.
+  `.env` — no secret is stored in this repo;
+- a `.env` in this directory with `POSTGRES_PASSWORD` (gitignored, created
+  once: `printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 24)" > .env`).
+  `docker compose up` fails loudly if it is missing.
+
+### PostgreSQL (`litellm-db`)
+
+`litellm` runs with `DATABASE_URL` pointing at the `litellm-db` service
+(`postgres:17-alpine`, **no published port**, named volume `litellm_pgdata`).
+Without a DB, spend logs have to be disabled (`disable_spend_logs: true`) or
+they pile up in RAM; with a DB they are persisted and virtual keys, users,
+teams and `/ui` work.
+
+- Migrations: the proxy applies them itself on startup (`run_server` →
+  `prisma migrate deploy` + `prisma generate`). The **first** boot with an
+  empty DB is slow (minutes, ~224 migrations) — wait for `healthy`, do not
+  restart in the middle. `depends_on: litellm-db: service_healthy` keeps the
+  proxy from opening its pool against a DB that is not listening yet.
+- Tuning is deliberately lightweight (host is an 8GB RPi5):
+  `shared_buffers=32MB`, `max_connections=20`, `work_mem=1MB`,
+  `maintenance_work_mem=16MB`, `jit=off`, `mem_limit: 192m`. Observed after
+  the first migration: ~20-35MB for the DB (the `shared_buffers` 32MB are
+  most of it) and ~+15MB in litellm (the prisma query-engine child, 11MB).
+  `fsync`/`full_page_writes`/`synchronous_commit` stay at their defaults on
+  purpose (host swap is heavily used — durability is not worth the risk).
+- `database_connection_pool_limit: 5` in `general_settings`: every Postgres
+  connection costs a backend process plus `work_mem`.
+
+**Retention** is done by litellm's own scheduler — no cron, no extra
+container, no partitioning. Two independent rules, whichever matches first
+deletes the row:
+
+| setting | value | meaning |
+| --- | --- | --- |
+| `maximum_spend_logs_retention_period` | `30d` | delete rows older than 30 days (job runs every `maximum_spend_logs_retention_interval`, default `1d`) |
+| `maximum_spend_logs_size` | `2GB` | hard cap on `LiteLLM_SpendLogs` real size (heap + indexes + TOAST) |
+| `maximum_spend_logs_cleanup_target_size` | `1GB` | when the cap is exceeded, delete oldest rows down to this |
+| `maximum_spend_logs_size_check_interval` | `1h` | how often the size rule is evaluated (`pg_total_relation_size`) |
+| `maximum_spend_logs_cleanup_batch_size` / `_max_batches` | `1000` / `20` | rows per `DELETE`, max statements per run |
+| `maximum_spend_logs_cleanup_run_budget` / `_batch_timeout` | `1m` / `30s` | wall-clock budget and per-batch `statement_timeout`, so cleanup never monopolises the small pool |
+
+`store_model_in_db` stays **false**: `config/config.yaml` remains the single
+source of truth for models (a UI-created model would bypass the wildcard
+expansion and the clamp in `reasoning_clamp.py`).
+
+Backup: `docker exec litellm-db pg_dump -U litellm litellm | gzip > dump.sql.gz`
+(the volume survives `docker compose down`, and dies with `down -v`).
 
 All outbound HTTPS traffic from litellm and the gateways goes through
 llmtrim (`HTTPS_PROXY`/`GW_PROXY`), so provider calls are intercepted,
@@ -661,6 +707,7 @@ reasoning_clamp.py        # litellm callback (reasoning + fallbacks + clamp + ov
 llama-gate/gate.py
 openrouter-gw/gw.py
 provider-gw/gw.py         # generic gateway (ID_PREFIX / PATH_PRE / cache)
+.env                      # POSTGRES_PASSWORD for litellm-db — NOT committed
 ```
 
 ## Security
