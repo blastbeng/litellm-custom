@@ -69,6 +69,41 @@ _LOG_MIN_CHARS = 2000
 _LOG_LINE_RATIO = 0.5
 
 
+def _force_estimation_without_transformers():
+    """Usa la stima dei token quando transformers non e' installato.
+
+    headroom 0.41.0 importa transformers FUORI dal try in
+    ``tokenizers/huggingface.py::_load_tokenizer``. Per i modelli che mappano
+    al backend HuggingFace (qwen, deepseek, llama, ...) l'ImportError risale
+    fino a ``compress()`` e la richiesta NON viene compressa affatto:
+
+        Compression failed, returning original messages: No module named
+        'transformers'
+
+    (verificato il 2026-11-14: DeepSeek/Qwen/llama -> before=0 after=0, mentre
+    un modello che usa la stima, es. synthetic/syn:large:text, comprime
+    3209 -> 1154 token). Il backend HF prevede gia' il fallback alla stima
+    quando il tokenizer non si carica: qui lo si registra a monte via API
+    pubblica ``TokenizerRegistry.register_backend``, senza toccare il pacchetto
+    ne' installare torch/transformers (nessuna AI locale).
+
+    Silenzioso e non-fatale: se l'API interna cambia in un aggiornamento di
+    headroom, il proxy parte comunque (si torna al comportamento upstream).
+    """
+    try:
+        from headroom.tokenizers import huggingface
+        from headroom.tokenizers.estimator import EstimatingTokenCounter
+        from headroom.tokenizers.registry import TokenizerRegistry
+
+        if huggingface.HuggingFaceTokenizer.is_available():
+            return
+        TokenizerRegistry.register_backend(
+            "huggingface", lambda model: EstimatingTokenCounter()
+        )
+    except Exception:
+        pass
+
+
 def _text_of(message):
     content = message.get("content")
     if isinstance(content, str):
@@ -163,6 +198,8 @@ class HeadroomUserClamp(HeadroomCallback):
             "compression_ratio": result.compression_ratio,
         }
 
+
+_force_estimation_without_transformers()
 
 # min_tokens=500: default upstream. In headroom-ai 0.41.0 il valore e' solo
 # memorizzato (nessun gate): la soglia reale per-messaggio e'
