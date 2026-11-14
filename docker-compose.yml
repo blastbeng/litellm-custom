@@ -38,6 +38,13 @@ services:
       # Headroom (Dockerfile.litellm + callback in config.yaml): beacon
       # anonimo spento, nessun dato esce dall'host.
       HEADROOM_BEACON: "off"
+      # /v1/messages (rotta Anthropic): di default litellm 1.109 manda i
+      # deployment "openai/..." alla Responses API (/openai/v1/responses).
+      # synthetic e i gateway NON servono quella rotta -> 404 ("API route not
+      # found: '/openai/v1/responses'"), mascherato dal fallback su
+      # openrouter/free. Con questo flag la rotta Anthropic passa da
+      # chat/completions, che tutti gli upstream qui supportano.
+      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "True"
       # Postgres locale (servizio litellm-db qui sotto): spend logs, virtual
       # keys e UI funzionano SOLO con un DB. La password vive in .env
       # (gitignored): la sintassi ":?" fa fallire `docker compose up` se manca,

@@ -426,6 +426,40 @@ CONTEXT_BY_PREFIX = (
     ("groq/", 262144),
     ("gemini/", 262144),
 )
+
+# --- reasoning_effort SUPPORTATI per-modello (synthetic) ---
+# Direttiva utente 2026-11-14: default "xhigh" SOLO se il modello lo supporta;
+# altrimenti si ripiega su "high" (o "max": i due sono equivalenti, direttiva
+# utente); se nessuno dei due e' supportato il parametro NON viene inviato.
+# Prima di questa tabella xhigh era un default STATICO in litellm_params su
+# TUTTI i modelli synthetic, anche su quelli che non lo elencano (syn:small:
+# text, syn:large:vision, GLM-5.3*, Kimi-K3, ...): comportamento sbagliato e,
+# sulla rotta /v1/messages (bridge OpenAI Responses), 400 secco perche' li'
+# litellm valida `reasoning.effort` contro il cost map (drop_params: false).
+# Valori dal listing api.synthetic.new (campo reasoning_parameters.efforts,
+# verificato il 2026-11-14); _DYN_EFFORTS li rilegge DAL VIVO e ha la
+# precedenza, questa tabella e' il fallback quando il listing non risponde.
+EFFORTS_BY_MODEL = (
+    ("synthetic/syn:large:text", ("none", "low", "high", "xhigh", "max")),
+    ("synthetic/syn:small:text", ("none", "low", "medium", "high")),
+    ("synthetic/syn:large:vision", ("low", "high", "max")),
+    ("synthetic/syn:small:vision", ("none", "low", "high", "xhigh", "max")),
+    ("synthetic/hf:openai/gpt-oss-120b", ("none", "low", "medium", "high")),
+    ("synthetic/hf:zai-org/GLM-5.3", ("low", "high", "max")),
+    ("synthetic/hf:zai-org/GLM-5.3-Flash", ("low", "high", "max")),
+    ("synthetic/hf:deepseek-ai/DeepSeek-V4.1-Flash",
+     ("none", "low", "high", "xhigh", "max")),
+    ("synthetic/hf:moonshotai/Kimi-K3", ("low", "high", "max")),
+    ("synthetic/hf:Qwen/Qwen3.8-27B", ("low", "medium", "xhigh")),
+    ("synthetic/hf:zai-org/GLM-4.7-Flash", ("none", "low", "medium", "high")),
+    # embedding: nessun reasoning_effort (lista VUOTA = parametro sempre
+    # rimosso). Prima aveva un xhigh copiato per inerzia dagli entry chat.
+    ("synthetic/hf:nomic-ai/nomic-embed-text-v1.5", ()),
+    # NVIDIA Nemotron: non compare nel listing chat -> SCONOSCIUTO; il ramo
+    # synthetic/ lascia allora il default storico (xhigh).
+)
+# Direttive equivalenti, in ordine di preferenza (direttiva utente 2026-11-14).
+EFFORT_HIGH_FAMILY = ("high", "max")
 DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
 MIN_OUTPUT_TOKENS = 1024  # sotto questo una risposta reasoning non e' utile
 SAFETY_MARGIN = 1024      # margine per l'errore della stima
@@ -471,7 +505,10 @@ MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 # il percorso normale non sceglie piu' un compattatore lato server.
 COMPACTOR_MODELS = (
     "groq/openai/gpt-oss-120b",
-    "gemini/models/gemini-2.5-flash-lite",
+    # gemini-3.5-flash-lite: gemini-2.5-flash-lite e' stato RITIRATO da
+    # Google (404 "no longer available to new users", verificato il
+    # 2026-11-14) -> voce morta nella pool dei compattatori/riassuntori.
+    "gemini/models/gemini-3.5-flash-lite",
     # "openrouter/auto" RIMOSSO (utente 2026-10-07: mai modelli costosi tra
     # gli operari): auto instrada a MODELLI QUALSIASI, scelta non controllabile
     # - puo' atterrare su un flagship costoso. "openrouter/free" (solo gratis)
@@ -508,7 +545,10 @@ COMPRESS_TARGET_RATIO = 0.55   # C: target = 55% del contesto (margine risposta)
 SUMMARIZER_PREFERRED = (
     "small-model",
     "groq/openai/gpt-oss-20b",
-    "gemini/models/gemini-2.5-flash-lite",
+    # gemini-3.5-flash-lite: gemini-2.5-flash-lite e' stato RITIRATO da
+    # Google (404 "no longer available to new users", verificato il
+    # 2026-11-14) -> voce morta nella pool dei compattatori/riassuntori.
+    "gemini/models/gemini-3.5-flash-lite",
     "synthetic/syn:small:text",
     "openrouter/free",
     "gpt4free/",
@@ -826,6 +866,7 @@ _PROXY_MODELS_STARTED = [False]
 # listing litellm /v1/models NON porta i campi contesto per questi provider
 # (get_valid_models espande solo gli id): il clamp e il pool leggono QUI.
 _DYN_CTX = {}                  # id pubblico -> finestra (int)
+_DYN_EFFORTS = {}              # id pubblico -> tuple(esforzi supportati)
 _SWEEP_SEEN = [False]          # primo sweep contesti riuscito (log una volta)
 
 
@@ -933,7 +974,18 @@ def _fetch_explicit_contexts(deployments):
             pr = m.get("pricing")
             if isinstance(pr, dict):
                 price = _price_usd_per_token(pr.get("prompt"))
-            if ctx is None and price is None:
+            # reasoning_parameters.efforts: i valori di reasoning_effort che
+            # il modello accetta (synthetic li espone; altri provider no).
+            efforts = None
+            rp = m.get("reasoning_parameters")
+            if isinstance(rp, dict):
+                raw = rp.get("efforts")
+                if isinstance(raw, (list, tuple)):
+                    vals = tuple(str(x).strip().lower() for x in raw
+                                 if isinstance(x, str) and str(x).strip())
+                    if vals:
+                        efforts = vals
+            if ctx is None and price is None and efforts is None:
                 continue
             for name in names:
                 if name == uid or name.endswith("/" + uid):
@@ -941,6 +993,60 @@ def _fetch_explicit_contexts(deployments):
                         _DYN_CTX[name] = ctx
                     if price is not None:
                         _TIER_HINTS[name] = price
+                    if efforts is not None:
+                        _DYN_EFFORTS[name] = efforts
+
+
+def _efforts_for(model):
+    """reasoning_effort supportati per ``model``, o None se sconosciuto.
+
+    Prima il listing DAL VIVO (_DYN_EFFORTS, vedi _fetch_explicit_contexts),
+    poi la tabella statica EFFORTS_BY_MODEL: match ESATTO prima, poi prefisso
+    (stessa regola di _context_for: "synthetic/hf:zai-org/GLM-5.3" non deve
+    catturare "...GLM-5.3-Flash" per startswith).
+    """
+    found = _DYN_EFFORTS.get(model)
+    if found:
+        return found
+    for name, effs in EFFORTS_BY_MODEL:
+        if model == name:
+            return effs
+    for name, effs in EFFORTS_BY_MODEL:
+        if model.startswith(name):
+            return effs
+    return None
+
+
+def _pick_effort(requested, supported):
+    """Applica la direttiva utente 2026-11-14 sul reasoning_effort.
+
+    - default (client silenzioso): xhigh se supportato, altrimenti high/max,
+      altrimenti NIENTE parametro;
+    - client esplicito: il valore resta se supportato; xhigh/max scivolano su
+      high/max disponibili, altrimenti il parametro viene DROPPATO (meglio
+      nessun reasoning che un 400);
+    - high e max sono equivalenti: se manca uno dei due vale l'altro.
+    """
+    if not requested:
+        if "xhigh" in supported:
+            return "xhigh"
+        for e in EFFORT_HIGH_FAMILY:
+            if e in supported:
+                return e
+        return None
+    eff = str(requested).strip().lower()
+    if eff in supported:
+        return eff
+    if eff in ("xhigh", "max"):
+        for e in EFFORT_HIGH_FAMILY:
+            if e in supported:
+                return e
+        return None
+    if eff == "high":
+        for e in EFFORT_HIGH_FAMILY:
+            if e in supported:
+                return e
+    return eff
 
 
 def _refresher_proxy_models():
@@ -2563,6 +2669,29 @@ class ReasoningClamp(CustomLogger):
             if not eff:
                 eff = "high"
             data["reasoning_effort"] = eff
+        elif model.startswith("synthetic/"):
+            # Direttiva utente 2026-11-14: xhigh di default SOLO dove il
+            # modello lo supporta, altrimenti high/max, altrimenti niente
+            # parametro. La lista arriva dal listing (reasoning_parameters.
+            # efforts) con fallback statico; se il modello e' SCONOSCIUTO
+            # (nomic/nemotron, o listing non ancora letto) resta il default
+            # storico xhigh. Il default sta QUI e non piu' in litellm_params
+            # perche' i default di litellm_params vengono uniti DOPO l'hook:
+            # uno statico xhigh avrebbe sovrascritto questo clamp e mandato
+            # xhigh anche a syn:small:text / syn:large:vision che non lo
+            # elencano (e sulla rotta /v1/messages faceva 400).
+            supported = _efforts_for(model)
+            if supported is None:
+                # sconosciuto: comportamento storico, solo xhigh se il client
+                # non ha chiesto nulla
+                if not eff:
+                    data["reasoning_effort"] = "xhigh"
+            else:
+                eff = _pick_effort(eff, supported)
+                if eff:
+                    data["reasoning_effort"] = eff
+                else:
+                    data.pop("reasoning_effort", None)
         # --- clamp max_tokens sul contesto del modello di QUESTO tentativo ---
         self._clamp_output(data, model)
         return data

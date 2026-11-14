@@ -278,12 +278,28 @@ Rule: default `xhigh` where valid, otherwise fall down (`high`, `medium`, ...).
 
 | Provider | Default | Notes |
 |---|---|---|
-| `synthetic/*`, `openrouter/*`, `ollama-cloud/*` | `xhigh` (in config) | accepted |
+| `synthetic/*` | `xhigh` **only if the model supports it** (callback) | supported values come from the live listing (`reasoning_parameters.efforts`, `_DYN_EFFORTS`) with the static `EFFORTS_BY_MODEL` fallback. If `xhigh` is not listed: `high`, else `max` (`high`/`max` are treated as equivalent); if neither is supported the parameter is **not sent**. Unknown models keep the historical `xhigh`. Example: `syn:small:text` gets `high`, `syn:large:vision` gets `high`, `nomic-embed-text` gets nothing |
+| `openrouter/*`, `ollama-cloud/*` | `xhigh` (in config) | accepted by the endpoint (heterogeneous pools: not validable per-model) |
 | `gemini/*` | `high` (callback) | `xhigh` not valid on Gemini; `none/minimal/low/medium` respected; `xhigh/max` → clamped to `high` |
 | `groq/*` | `high` (callback) | only for reasoning models (`openai/gpt-oss-*`, `qwen/*`); for the others (`allam-2-7b`, whisper, ...) the parameter is **removed** (they would 400) |
 | `gpt4free/*` | none | free proxy, ~250 heterogeneous models: not validable per-model |
 
-The client-provided value always wins (clamped if invalid).
+The client-provided value always wins (clamped if invalid). The synthetic
+default **cannot** live in `litellm_params`: litellm merges those defaults
+*after* the callback hook, so a static `xhigh` overrides the per-model clamp
+and makes `/v1/messages` fail (see below).
+
+### `/v1/messages` (Anthropic route)
+
+litellm 1.109 routes `openai/...` deployments through the **Responses API**
+(`{api_base}/responses`) for this route, which synthetic and the local gateways
+do not serve: the request dies with `API route not found: '/openai/v1/responses'`
+(and is silently masked by a fallback chain, e.g. `syn:small:text` answering
+from `openrouter/free`). `LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "True"`
+in the `litellm` environment keeps that route on chat/completions, which every
+upstream here supports (verified: `syn:large:text`, `syn:small:text`,
+`GLM-5.3`, `groq/openai/gpt-oss-120b`, `openrouter/free`, `gemini/*` all 200,
+served by the requested model).
 
 ## Context clamp (`max_tokens`)
 

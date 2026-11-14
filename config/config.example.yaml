@@ -219,6 +219,11 @@ model_list:
   # dal listing (reasoning_clamp: _DYN_CTX via _fetch_explicit_contexts):
   # un context_length cambiato lato synthetic viene visto senza toccare la
   # config. La policy fallback per synthetic/* resta in reasoning_clamp.
+  # NESSUN reasoning_effort statico qui (direttiva utente 2026-11-14): il
+  # default xhigh lo mette la callback reasoning_clamp SOLO se il modello lo
+  # supporta (reasoning_parameters.efforts del listing), altrimenti high/max,
+  # altrimenti niente parametro. Un default statico qui verrebbe unito DOPO
+  # l'hook (sovrascrivendo il clamp) e sulla rotta /v1/messages faceva 400.
 
   - model_name: synthetic/syn:large:text
     litellm_params:
@@ -229,7 +234,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -244,7 +248,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 196608
       max_output_tokens: 65536
@@ -259,7 +262,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -274,7 +276,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 262144
       max_output_tokens: 65536
@@ -289,7 +290,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 131072
       max_output_tokens: 65536
@@ -304,7 +304,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -319,7 +318,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -334,7 +332,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -349,7 +346,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 524288
       max_output_tokens: 65536
@@ -364,7 +360,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 262144
       max_output_tokens: 65536
@@ -379,7 +374,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 196608
       max_output_tokens: 65536
@@ -394,7 +388,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 262144
       max_output_tokens: 65536
@@ -409,7 +402,6 @@ model_list:
       # starci nel modello DI PARTENZA (la catena non riduce piu' il
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
-      reasoning_effort: xhigh
     model_info:
       max_input_tokens: 8192
       # embedding: contesto nomic-embed-text-v1.5
