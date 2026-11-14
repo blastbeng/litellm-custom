@@ -27,7 +27,11 @@ CA = os.environ.get("GW_CA", "/data/ca-bundle.pem")
 _client_kwargs = {"timeout": httpx.Timeout(600.0, connect=15.0)}
 if PROXY:
     _client_kwargs["proxy"] = PROXY
-_client_kwargs["verify"] = CA
+# GW_CA SOLO se il file esiste davvero: httpx.Client(verify=<path>) solleva
+# se il file manca, e il gateway crashava all'avvio (2026-11-14: CA di llmtrim
+# sparita col proxy -> stack litellm giu' per --abort-on-container-exit).
+if CA and os.path.exists(CA):
+    _client_kwargs["verify"] = CA
 client = httpx.Client(**_client_kwargs)
 
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",

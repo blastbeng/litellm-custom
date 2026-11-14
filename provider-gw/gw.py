@@ -83,7 +83,13 @@ UPSTREAM_AUTH_HEADER = os.environ.get("UPSTREAM_AUTH_HEADER", "Authorization")
 _client_kwargs = {"timeout": httpx.Timeout(600.0, connect=15.0)}
 if PROXY:
     _client_kwargs["proxy"] = PROXY
-_client_kwargs["verify"] = CA
+# GW_CA SOLO se il file esiste davvero. httpx.Client(verify=<path>) solleva
+# se il file manca, e questo crashava il gateway all'avvio (2026-11-14: la
+# CA di llmtrim e' sparita insieme al proxy -> stack litellm giu' per
+# --abort-on-container-exit). Senza GW_CA si usa lo store del sistema
+# (certifi + root OS), che e' cio' che serve ora che si esce diretti.
+if CA and os.path.exists(CA):
+    _client_kwargs["verify"] = CA
 client = httpx.Client(**_client_kwargs)
 
 HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",

@@ -183,14 +183,14 @@ services:
     image: python:3.13-slim
     command: ["sh", "-c", "pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      # GW_CA obbligatoria: gw.py usa SEMPRE verify=GW_CA (senza il file httpx
-      # crasha all'avvio). Il bundle esiste su disco anche a llmtrim spento.
-      GW_CA: /data/llmtrim/ca-bundle.pem
+      # GW_CA = store di sistema dell'immagine (llmtrim non c'e' piu'): gw.py
+      # usa GW_CA solo se il file esiste, altrimenti verify resta il default
+      # httpx/certifi. Un GW_CA mancante NON fa piu' crashare il gateway.
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./openrouter-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
     # Healthcheck a livello TCP: il gateway e' "vivo" quando il suo server
     # HTTP ascolta. NON si fa una richiesta HTTP sul listing perche'
@@ -225,7 +225,9 @@ services:
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_CA: /data/llmtrim/ca-bundle.pem
+      # store di sistema dell'immagine (llmtrim non c'e' piu'): gw.py usa
+      # GW_CA solo se il file esiste, quindi questo e' il default sano
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
       UPSTREAM: https://api.groq.com
       PATH_PRE: /openai
       ID_PREFIX: groq/
@@ -233,7 +235,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
     # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
     # l'upstream groq.com no - un check HTTP sul listing dipenderebbe da
@@ -263,14 +264,15 @@ services:
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_CA: /data/llmtrim/ca-bundle.pem
+      # store di sistema dell'immagine (llmtrim non c'e' piu'): gw.py usa
+      # GW_CA solo se il file esiste, quindi questo e' il default sano
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
       UPSTREAM: https://generativelanguage.googleapis.com
       PATH_PRE: /v1beta/openai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
     # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
     # l'upstream generativelanguage no - un check HTTP sul listing dipenderebbe
@@ -326,7 +328,9 @@ services:
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_CA: /data/llmtrim/ca-bundle.pem
+      # store di sistema dell'immagine (llmtrim non c'e' piu'): gw.py usa
+      # GW_CA solo se il file esiste, quindi questo e' il default sano
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
       UPSTREAM: http://gpt4free:1337
       ID_PREFIX: gpt4free/
       MODELS_CACHE: "1"
@@ -340,7 +344,6 @@ services:
       - ./provider-gw/gw.py:/app/gw.py:ro
       - ./provider-gw/cache:/cache
       - /opt/docker/compose/gpt4free:/gpt4free:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     restart: no
     # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
     # gpt4free e' un progetto in sviluppo riavviato a mano - un check HTTP
@@ -523,14 +526,12 @@ services:
       # cosi' reasoning_clamp (_DYN_CTX) usa il contesto REALE per-modello
       # (stessa logica dinamica degli altri provider).
       CONTEXT_FROM: /api/tags
-      # gw.py setta SEMPRE verify=GW_CA: il bundle va montato anche se
-      # l'upstream e' plain-HTTP (non usato, ma senza il file httpx crasha
-      # all'avvio). Montaggio per DIRECTORY: una CA-rotation e' visibile
-      # subito (un bind-mount di singolo file resta pinned al vecchio inode).
-      GW_CA: /data/llmtrim/ca-bundle.pem
+      # gw.py usa GW_CA solo se il file esiste (upstream plain-HTTP: verify
+      # non serve, ma un GW_CA mancante non fa piu' crashare il gateway).
+      # store di sistema dell'immagine: llmtrim non c'e' piu'.
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
     volumes:
       - ./provider-gw/gw.py:/app/gw.py:ro
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/llmtrim:ro
     depends_on:
       - ollama-gate
     restart: no
