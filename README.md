@@ -11,22 +11,30 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 ```
                      ┌────────────────────────── host (blast) ──────────────────────────┐
  client (AiderDesk   │                                                                  │
- / curl / any        │   ┌─────────────┐   CONNECT    ┌──────────────────────────┐     │
- OpenAI SDK) ────────┼──►│  litellm    │─────────────►│  llmtrim (MITM :43117)   │─────┼──► internet
- localhost:4000      │   │  :4000      │              │  tracks/compresses LLM   │     │   (api.groq.com,
-                     │   └──┬───┬───┬──┘              └──────────────────────────┘     │   openrouter.ai,
-                     │      │   │   │                                                  │   generativelanguage,
-                     │      │   │   ├────────────► llama-gate ──► blastpc:11435      │   api.synthetic.new,
-                     │      │   │   │        (TCP gate, http|https auto, PC off → 503)│  ollama.com)
-                     │      │   │   └────────────► ollama-gw ──► ollama-gate ──► 11434│
-                     │      │   │        (TCP gate, plain HTTP, PC off → 503)        │
-                     │      │   │                                                  │
-                     │      │   ├────► openrouter-gw ─┐                           │
-                     │      │   ├────► groq-gw ───────┤ (via llmtrim)             │
-                     │      │   ├────► gemini-gw ─────┤                           │
-                     │      │   └────► gpt4free-gw ───┴──► gpt4free:1337 (locale)  │
-                     │      │                                                      │
+ / curl / any        │   ┌──────────────────────────────┐                               │
+ OpenAI SDK) ────────┼──►│  litellm  :4000              │──────────────► internet       │
+ localhost:4000      │   │  + headroom callback         │   diretto     (api.groq.com,   │
+                     │   │    (compressione in-process) │               openrouter.ai,     │
+                     │   └──┬───┬───┬───────────────────┘               generativelanguage,│
+                     │      │   │   │                                   api.synthetic.new,│
+                     │      │   │   ├────────────► llama-gate ──► blastpc:11435          │
+                     │      │   │   │      (TCP gate, http|https auto, PC off → 503)      │
+                     │      │   │   └────────────► ollama-gw ──► ollama-gate ──► 11434    │
+                     │      │   │        (TCP gate, plain HTTP, PC off → 503)             │
+                     │      │   │                                                      │
+                     │      │   ├────► openrouter-gw ─┐                               │
+                     │      │   ├────► groq-gw ───────┤ (diretto: nessun proxy)        │
+                     │      │   ├────► gemini-gw ─────┤                               │
+                     │      │   └────► gpt4free-gw ───┴──► gpt4free:1337 (locale)        │
+                     │      │                                                          │
                      └────────────────────────────────────────────────────────────────┘
+```
+
+`llmtrim` (MITM proxy su :43117) e' stato **disattivato** il 2026-11-14: non
+esiste piu' un hop proxy tra litellm e i provider (`HTTPS_PROXY`/`SSL_CERT_FILE`
+e i `GW_PROXY` dei gateway sono stati rimossi — con il proxy spento ogni
+chiamata cloud falliva con `OpenAIError: Connection error`). La compressione
+del contesto ora la fa **headroom** dentro litellm (vedi sotto).
 ```
 
 ## Components
@@ -41,7 +49,9 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
 | `groq-gw`, `gemini-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `gpt4free-gw` | `provider-gw/gw.py` (generic) | gpt4free listing (`ID_PREFIX=gpt4free/`, last-good cache) — replaces `inference4free-gw` (disabled 2026-11-02); reads the upstream `G4F_API_KEY` from the gpt4free `.env` via `UPSTREAM_KEY_FILE` and **replaces** litellm's placeholder `Authorization` |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
-| `llmtrim` (external) | `/opt/docker/compose/llmtrim` | MITM proxy: tracks/compresses LLM traffic |
+| `headroom_callback.py` | litellm callback | istanza `HeadroomCallback` (headroom-ai) che comprime tool output JSON/codice **in-process**, fail-open (un errore logga un warning e la richiesta prosegue invariata). litellm 1.109 rifiuta il path alla classe: serve un'istanza, come `rclamp` |
+| `Dockerfile.litellm` | build di `litellm-headroom:local` | litellm upstream **+ headroom-ai** nel venv `/app/.venv`. litellm resta pinnato alla versione del base image (headroom-ai lo aggiornerebbe: senza constraint pip passa 1.109.0 → 1.109.1). Buildata da `manage-docker` (e a mano con `docker compose build litellm`) |
+| `llmtrim` (external) | `/opt/docker/compose/llmtrim` | **disattivato il 2026-11-14** — nessun hop proxy tra litellm e i provider |
 
 ## How wildcard routing works
 
@@ -596,9 +606,13 @@ sudo systemctl restart docker-compose@litellm
 ```
 
 `docker-compose.yml` expects:
-- `llmtrim` listening on `:43117`, publishing its CA bundle at
-  `/opt/docker/compose/llmtrim/data/.llmtrim/trust/ca-bundle.pem`
-  (system root CA store + the llmtrim CA, kept in sync by `llmtrim-ca-sync`);
+- l'immagine **`litellm-headroom:local`** (build di `Dockerfile.litellm`):
+  `docker compose build litellm` prima del primo `up`, oppure lascia che
+  `up` la costruisca quando manca. `manage-docker` la ricostruisce da sola
+  quando cambia il base image o esce una nuova `headroom-ai` su PyPI;
+- **llmtrim non e' piu' richiesto** (disattivato il 2026-11-14): il suo CA
+  bundle resta montato SOLO nei gateway (`GW_CA`, che `gw.py` richiede
+  all'avvio) e non e' piu' usato da litellm;
 - llama-swap on `blastpc` (192.168.1.29, port 11435, **plain HTTP** since
   2026-10-02 — `llama-gate` runs with `GATE_TLS=auto`, so it also works if
   llama-swap goes back to `https` self-signed: it terminates the TLS itself;
@@ -654,10 +668,18 @@ expansion and the clamp in `reasoning_clamp.py`).
 Backup: `docker exec litellm-db pg_dump -U litellm litellm | gzip > dump.sql.gz`
 (the volume survives `docker compose down`, and dies with `down -v`).
 
-All outbound HTTPS traffic from litellm and the gateways goes through
+> **2026-11-14 — llmtrim disattivato.** Il testo sotto descrive il setup
+> *storico* e vale solo se llmtrim viene riacceso. Oggi litellm e i gateway
+> escono **diretti** (nessun `HTTPS_PROXY`, nessun `GW_PROXY`, nessun
+> `SSL_CERT_FILE`); la compressione del contesto la fa `headroom_callback.py`
+> dentro litellm. Con il proxy spento e `HTTPS_PROXY` ancora impostato ogni
+> chiamata cloud falliva con `OpenAIException - Connection error` e litellm
+> rispondeva 500 su quasi tutti i modelli.
+
+~~All outbound HTTPS traffic from litellm and the gateways goes through
 llmtrim (`HTTPS_PROXY`/`GW_PROXY`), so provider calls are intercepted,
 tracked and compressed just like direct client traffic. The local model is
-in `NO_PROXY` (LAN traffic).
+in `NO_PROXY` (LAN traffic).~~
 
 ### CA trust: mount the **directory**, never the file
 

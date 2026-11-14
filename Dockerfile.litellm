@@ -1,0 +1,38 @@
+# litellm + headroom-ai: compressione del contesto IN-PROCESS via callback
+# (headroom.integrations.litellm_callback.HeadroomCallback, abilitata in
+# config.yaml). L'immagine base e' la stessa usata finora; l'unica aggiunta e'
+# headroom-ai nel venv /app/.venv.
+#
+# PERCHE' UNA IMMAGINE DERIVATA E NON "pip install" NEL command (come fanno i
+# *-gw):
+# 1) headroom-ai dichiara "litellm" come dipendenza NON pinnata: senza
+#    constraint pip AGGIORNA litellm (verificato il 2026-11-14: 1.109.0 ->
+#    1.109.1). Sarebbe un cambio di versione del proxy a ogni recreate,
+#    silenzioso e invisibile nel compose. Il constraint generato dal base
+#    image blocca litellm alla versione GIA' presente (1.109.0) e pip risolve
+#    headroom sulla release compatibile (0.41.0 invece di 0.44.0).
+# 2) un pip install all'avvio renderebbe il BOOT di litellm dipendente da
+#    PyPI: con restart: no + systemd Restart=always un PyPI irraggiungibile
+#    sarebbe un loop di riavvii del proxy. Nell'immagine l'install e' un
+#    layer, quindi il boot non tocca la rete.
+#
+# NON serve ONNX Runtime / extras ML: senza di essi la content detection usa
+# il path pure-Python (log: "using pure-Python detection") e la compressione
+# JSON/AST funziona (misurato: 56.5% su un tool output JSON ripetuto, ~9ms a
+# regime). La compressione del testo in prosa resta spenta (richiede il
+# modello Kompress), quindi niente download da HuggingFace dentro litellm.
+# Nome di stage "headroom": permette a manage-docker di rifare SOLO questo
+# stage (docker compose build --no-cache-filter headroom) quando su PyPI esce
+# una nuova headroom-ai, lasciando in cache i layer del base image.
+FROM ghcr.io/berriai/litellm:main-latest AS headroom
+
+# ensurepip: il venv dell'immagine e' creato con uv e NON contiene pip.
+RUN /app/.venv/bin/python -m ensurepip --upgrade \
+ && /app/.venv/bin/python -c "import importlib.metadata as m; print('litellm==' + m.version('litellm'))" > /tmp/constraints.txt \
+ && /app/.venv/bin/python -m pip install --no-cache-dir -c /tmp/constraints.txt "headroom-ai" \
+ && rm -f /tmp/constraints.txt \
+ # pre-compila i .pyc di headroom: il primo import costa ~4s (misurato),
+ # questo lo riduce e non ha effetti collaterali.
+ && /app/.venv/bin/python -m compileall -q /app/.venv/lib/python3.13/site-packages/headroom \
+ && /app/.venv/bin/python -c "from headroom.integrations.litellm_callback import HeadroomCallback; print('headroom callback OK')" \
+ && /app/.venv/bin/python -m pip uninstall -y pip

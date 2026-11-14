@@ -2,24 +2,42 @@ services:
 
   litellm:
     container_name: litellm
-    image: ghcr.io/berriai/litellm:main-latest
+    # IMMAGINE DERIVATA (Dockerfile.litellm) = litellm upstream + headroom-ai
+    # nel venv /app/.venv. NON si usa "pip install nel command" come per i
+    # *-gw: headroom-ai dipende da litellm senza pin e pip aggiornerebbe il
+    # proxy a ogni recreate (verificato: 1.109.0 -> 1.109.1), inoltre il boot
+    # diventerebbe dipendente da PyPI (Restart=always -> loop di riavvii).
+    # NIENTE pull_policy: build: il build lo fa manage-docker (e a mano
+    # `docker compose build litellm`), non il boot. Un `up` ricostruisce solo
+    # se l'immagine MANCA (host nuovo); i restart di systemd usano l'immagine
+    # gia' costruita -> niente dipendenza da registry/PyPI all'avvio.
+    # manage-docker confronta la versione headroom-ai installata nell'immagine
+    # con quella su PyPI e rifa' il build quando cambia (o quando cambia il
+    # base image upstream, via --pull).
+    image: litellm-headroom:local
+    build:
+      context: .
+      dockerfile: Dockerfile.litellm
     ports:
       - "4000:4000"
     environment:
-      # Route litellm's OUTBOUND provider calls (synthetic.new, openrouter.ai, ...)
-      # through llmtrim (HTTPS MITM on host) so fallbacks get tracked/compressed.
-      # Local models (blastpc llama-swap) must bypass the proxy: NO_PROXY.
-      HTTPS_PROXY: http://host.docker.internal:43117
-      NO_PROXY: "localhost,127.0.0.1,blastpc,192.168.1.29,blastrpi,host.docker.internal,llama-gate,ollama-gate,ollama-gw,gpt4free-gw"
-      # ca-bundle.pem = system roots + llmtrim CA (kept in sync by llmtrim-ca-sync,
-      # pubblicato in trust/ - vedi volume qui sotto: directory, non file)
-      SSL_CERT_FILE: /data/.llmtrim/ca-bundle.pem
+      # NIENTE HTTPS_PROXY / SSL_CERT_FILE (llmtrim DISATTIVATO il 2026-11-14,
+      # direttiva utente): il proxy MITM su host.docker.internal:43117 non
+      # ascolta piu', e con HTTPS_PROXY impostato OGNI chiamata ai provider
+      # cloud muore subito con "OpenAIException - Connection error" (httpx non
+      # raggiunge il proxy) -> 500 su quasi tutti i modelli dopo i retry.
+      # Senza le due variabili litellm esce diretto con i root CA del sistema.
+      # Per ripristinare llmtrim: rimettere HTTPS_PROXY+NO_PROXY+SSL_CERT_FILE
+      # e il volume trust/ qui sotto (vedi README, sezione llmtrim).
       # RAM ottimizzazione (RPi5 8GB):
       # - MALLOC_ARENA_MAX: glibc crea un'arena per thread e l'RSS di Python
       #   cresce per frammentazione; con 2 arene la crescita e' molto piu' lenta
       # - LITELLM_LOG WARNING: meno stringhe di log retenute/stampate
       MALLOC_ARENA_MAX: "2"
       LITELLM_LOG: WARNING
+      # Headroom (Dockerfile.litellm + callback in config.yaml): beacon
+      # anonimo spento, nessun dato esce dall'host.
+      HEADROOM_BEACON: "off"
       # Postgres locale (servizio litellm-db qui sotto): spend logs, virtual
       # keys e UI funzionano SOLO con un DB. La password vive in .env
       # (gitignored): la sintassi ":?" fa fallire `docker compose up` se manca,
@@ -38,15 +56,13 @@ services:
     volumes:
       - ./config/config.yaml:/app/config.yaml
       - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
-      # trust/ = SOLO ca-bundle.pem (pubblicato da llmtrim-ca-sync). Montare la
-      # DIRECTORY e non il singolo file e' la fix della CA drift: il sync
-      # sostituisce il bundle con `cat ... > bundle.tmp && mv` (NUOVO inode) e
-      # un bind-mount di SINGOLO FILE resta pinned al vecchio inode per tutta
-      # la vita del container -> CA ruotata = CERTIFICATE_VERIFY_FAILED
-      # ("unable to get local issuer certificate") finche' il container non
-      # viene ricreato. ca.key (0600) resta FUORI dal mount: non finisce nel
-      # container.
-      - /opt/docker/compose/llmtrim/data/.llmtrim/trust:/data/.llmtrim:ro
+      # istanza del callback headroom (vedi headroom_callback.py): litellm
+      # rifiuta il path alla CLASSE, serve un'istanza come rclamp
+      - ./headroom_callback.py:/app/headroom_callback.py:ro
+      # Il volume trust/ di llmtrim (CA MITM) e' stato RIMOSSO con il proxy:
+      # non serve piu' a litellm, che parla direttamente con i provider.
+      # (Era montato per DIRECTORY, non per file, per non restare pinned al
+      # vecchio inode dopo una rotazione della CA.)
     command:
       - "--config"
       - "/app/config.yaml"
@@ -158,16 +174,17 @@ services:
   # - /v1/models: prefixa gli id con "openrouter/" cosi' la wildcard
   #   openrouter/* di litellm li mostra tutti e li instrada 1:1 senza che la
   #   sua logica di rename corrompa gli id (openai/..., anthropic/...)
-  # - l'upstream verso openrouter.ai esce ATTRAVERSO llmtrim (GW_PROXY), cosi'
-  #   il traffico openrouter di litellm e' intercettato/tracciato/compresso
-  #   come quello di AiderDesk diretto
+  # - l'upstream verso openrouter.ai esce DIRETTO (nessun GW_PROXY dal
+  #   2026-11-14: llmtrim disattivato dall'utente; con GW_PROXY verso un proxy
+  #   morto ogni chiamata falliva con "ConnectError: Connection refused"),
   openrouter-gw:
     container_name: openrouter-gw
     mem_limit: 384m
     image: python:3.13-slim
     command: ["sh", "-c", "pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_PROXY: http://host.docker.internal:43117
+      # GW_CA obbligatoria: gw.py usa SEMPRE verify=GW_CA (senza il file httpx
+      # crasha all'avvio). Il bundle esiste su disco anche a llmtrim spento.
       GW_CA: /data/llmtrim/ca-bundle.pem
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -200,14 +217,14 @@ services:
   # {origin}/v1 ignorando il path dell'api_base) e prefixa gli id di /models
   # con "groq/" cosi' la logica di rename di litellm non corrompe gli id
   # nativi (openai/gpt-oss-120b, ...).
-  # Upstream verso api.groq.com ATTRAVERSO llmtrim (GW_PROXY).
+  # Upstream verso api.groq.com DIRETTO (nessun GW_PROXY: llmtrim disattivato
+  # il 2026-11-14; GW_CA resta obbligatoria per l'avvio di gw.py).
   groq-gw:
     container_name: groq-gw
     mem_limit: 384m
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_PROXY: http://host.docker.internal:43117
       GW_CA: /data/llmtrim/ca-bundle.pem
       UPSTREAM: https://api.groq.com
       PATH_PRE: /openai
@@ -238,14 +255,14 @@ services:
   # /v1beta/openai/* (l'endpoint OpenAI-compatible di Gemini vive li', ma
   # litellm chiama sempre {origin}/v1). Nessun ID_PREFIX: gli id nativi
   # "models/gemini-2.5-flash" non collidono con provider noti di litellm e
-  # sono accettati cosi' come sono dall'endpoint. Upstream ATTRAVERSO llmtrim.
+  # sono accettati cosi' come sono dall'endpoint. Upstream DIRETTO (nessun
+  # GW_PROXY: llmtrim disattivato il 2026-11-14).
   gemini-gw:
     container_name: gemini-gw
     mem_limit: 384m
     image: python:3.13-slim
     command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
     environment:
-      GW_PROXY: http://host.docker.internal:43117
       GW_CA: /data/llmtrim/ca-bundle.pem
       UPSTREAM: https://generativelanguage.googleapis.com
       PATH_PRE: /v1beta/openai

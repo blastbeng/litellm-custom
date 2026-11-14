@@ -588,7 +588,15 @@ litellm_settings:
   # Callback reasoning_clamp: cascata/clamp reasoning per provider
   # (xhigh->high->...) e policy fallback per-modello via
   # litellm_params.fallbacks per-request (vedi reasoning_clamp.py)
-  callbacks: reasoning_clamp.rclamp
+  # ORDINE: rclamp PRIMA (calcola clamp/saturazione sul body originale),
+  # Headroom DOPO (comprime tool output JSON/codice in-process, fail-open:
+  # un errore logga un warning e la richiesta prosegue invariata).
+  # Vedi Dockerfile.litellm per l'installazione di headroom-ai.
+  # litellm 1.109 rifiuta il path alla CLASSE: headroom_callback.py espone
+  # l'istanza hr_compress (stessa forma di reasoning_clamp.rclamp).
+  callbacks:
+    - reasoning_clamp.rclamp
+    - headroom_callback.hr_compress
   # 50MB (default litellm 500MB): ogni body viene bufferizzato in RAM; su
   # host con poca RAM (es. RPi5) il limite basso evita picchi in OOM.
   max_request_size: 50
