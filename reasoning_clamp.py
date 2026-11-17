@@ -35,13 +35,12 @@ self.fallbacks)):
 - synthetic/*            -> [] (NESSUN fallback: local-model rimosso il
   2026-10-28; restano solo i rami esatti qui sotto - syn:small:text,
   syn:small:vision, embedding nomic)
-- synthetic/syn:small:text -> ["ollama/small-model",
-  "gpt4free/auto","openrouter/free"] (richiesta utente 2026-10-12:
-  ollama/small-model (Ollama sullo STESSO PC: server INDIPENDENTE da
-  llama-swap, regge dove llama-swap da 429/serializza), poi due cloud GRATIS
-  come rete di sicurezza col PC spento. ollama/small-model, gpt4free/auto
-  e openrouter/free sono nomi concreti risolti dalle wildcard ollama/*,
-  gpt4free/* e openrouter/* del model_list - vedi la definizione di
+- synthetic/syn:small:text -> ["ollama/small-model","openrouter/free"]
+  (richiesta utente 2026-10-12: ollama/small-model (Ollama sullo STESSO PC:
+  server INDIPENDENTE da llama-swap, regge dove llama-swap da
+  429/serializza), poi il cloud GRATIS come rete di sicurezza col PC spento.
+  ollama/small-model e openrouter/free sono nomi concreti risolti dalle
+  wildcard ollama/* e openrouter/* del model_list - vedi la definizione di
   SYN_SMALL_TEXT_FALLBACKS)
 - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
   2026-10-14): stessi gradini, stesso ordine. syn:small:VISION su
@@ -69,7 +68,7 @@ self.fallbacks)):
   modelli CHAT di llama-swap hanno nomi senza prefisso e restano nelle
   catene qui sopra. Vedi LLAMA_SWAP_MEDIA_PREFIX)
 - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  ollama/*, ollama-cloud/*, gpt4free/* e QUALSIASI prefisso futuro)
+  ollama/*, ollama-cloud/* e QUALSIASI prefisso futuro)
   -> []: nessun fallback (richiesta utente 2026-10-25). La catch-all
   "*": ["small-model"] e' stata RIMOSSA da config.yaml; questo override
   per-request rende comunque esplicito il vuoto su ogni modello.
@@ -193,7 +192,7 @@ UNRESOLVABLE_IMAGE_NOTE = (
 )
 
 # Avviso di THROTTLING servito come CONTENUTO di una risposta 200.
-# Caso reale 2026-11-02: gpt4free -> provider free (Yqcloud) che risponde
+# Caso reale 2026-11-02: un provider free (Yqcloud) che risponde
 # "该ip请求过多已被暂时限流 ... (目前限制了每小时60次)" come messaggio
 # assistant. Non c'e' nessun 429: litellm lo tratta come un successo (niente
 # retry, niente fallback) e il client riceve quel testo al posto della
@@ -211,8 +210,8 @@ UPSTREAM_NOTICE_SCAN_CHARS = 300
 # le header SSE (200) sono gia' partite, l'unica cosa utile e' dirlo.
 UPSTREAM_NOTICE_STREAM_TEXT = (
     "[provider free temporaneamente limitato (quota per IP): la risposta non "
-    "e' stata generata. Riprova tra qualche minuto oppure usa un id "
-    "provider-qualified, es. gpt4free/<provider>/<modello>.]"
+    "e' stata generata. Riprova tra qualche minuto oppure usa un modello "
+    "di un altro provider.]"
 )
 
 
@@ -303,17 +302,12 @@ def _upstream_notice(text):
 #      sprecato, non fatale). Il nome DEVE esistere in Ollama sul PC: se manca
 #      l'upstream da 404, anche quello e' un fallimento d'hop e la catena
 #      prosegue)
-#   2) gpt4free/auto (cloud, GRATIS; dal 2026-11-02: inference4free e'
-#      stato spento sul rpi5 e SOSTITUITO da gpt4free. "auto" e' il router
-#      automatico di g4f, Model("auto", base_provider=AnyProvider): primo id
-#      del suo listing, quindi raggiungibile per nome concreto senza entry
-#      dedicata in config.yaml)
-#   3) openrouter/free (cloud, GRATIS)
-# I nomi cloud sono CONCRETI risolti dalle wildcard "gpt4free/*" e
-# "openrouter/*" del model_list (litellm: get_model_list -> _get_wildcard_
-# deployments -> PatternMatchRouter.route: "gpt4free/auto" matcha
-# "gpt4free/.*" e instrada col model "openai/auto" verso il gateway
-# omonimo) - verificati sul listing del proxy, NON prefissi fittizi.
+#   2) openrouter/free (cloud, GRATIS)
+# Il nome cloud e' CONCRETO, risolto dalla wildcard "openrouter/*" del
+# model_list (litellm: get_model_list -> _get_wildcard_deployments ->
+# PatternMatchRouter.route: "openrouter/free" matcha "openrouter/.*" e
+# instrada verso il gateway openrouter-gw) - verificato sul listing del
+# proxy, NON un prefisso fittizio.
 # "ollama/small-model" segue la STESSA meccanica con la wildcard "ollama/*"
 # (il capture toglie "ollama/" e a Ollama arriva il nome nativo "small-model"):
 # la wildcard instrada ANCHE col PC spento perche' PatternMatchRouter matcha il
@@ -322,8 +316,7 @@ def _upstream_notice(text):
 # ~2s col PC spento, quindi i cloud restano raggiungibili subito), i cloud
 # gratis come rete di sicurezza.
 SYN_SMALL_TEXT = "synthetic/syn:small:text"
-SYN_SMALL_TEXT_FALLBACKS = ["ollama/small-model",
-                            "gpt4free/auto", "openrouter/free"]
+SYN_SMALL_TEXT_FALLBACKS = ["ollama/small-model", "openrouter/free"]
 
 # synthetic/syn:small:vision (richiesta utente 2026-10-14): catena IDENTICA a
 # syn:small:text - stessi gradini, stesso ordine. Definiti per ALIAS su
@@ -374,23 +367,6 @@ CONTEXT_BY_PREFIX = (
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    # gpt4free (dal 2026-11-02 al posto di inference4free): 65536 e' un
-    # FLOOR OPERATIVO, non il minimo reale - g4f NON espone context_length
-    # nel suo listing (/v1/models: solo id/owned_by/image/vision, verificato)
-    # e i ~250 modelli sono eterogenei, quindi _DYN_CTX resta vuoto per
-    # questo prefisso: vale sempre questo valore statico. Storia: 131072
-    # fino al 2026-11-02 (prompt lunghi -> 400 sui modelli piccoli del pool),
-    # poi 32768, poi 65536 il 2026-11-02. Il 32768 era sotto il costo FISSO
-    # di OpenWebUI con gli MCP tool server accesi: il solo mcp-gateway manda
-    # 85 tool / ~90k char di schemi (~32k token, contati VERBATIM da
-    # _estimate_prompt_tokens e mai comprimibili dalla cascata) -> ogni
-    # richiesta gpt4free/* andava in 413 prompt_too_large anche con un
-    # messaggio utente di 2 token. Misurato su auto: 16.9k e 39.4k token OK,
-    # ~60k e ~90k falliscono (catena AutoFree esaurita), quindi 65536 e' il
-    # compromesso: lascia ~29k di conversazione sopra i tool e resta sotto il
-    # tetto pratico del pool. Da rivedere quando g4f esporra' context_length
-    # per-modello (allora questo floor sparisce a favore di _DYN_CTX).
-    ("gpt4free/", 65536),
     ("local-model", 163840),
     ("small-model", 163840),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
@@ -551,7 +527,6 @@ SUMMARIZER_PREFERRED = (
     "gemini/models/gemini-3.5-flash-lite",
     "synthetic/syn:small:text",
     "openrouter/free",
-    "gpt4free/",
     "groq/openai/gpt-oss-120b",
     "gemini/",
     "synthetic/",
@@ -580,9 +555,8 @@ CHEAP_PRICE_USD_PER_TOKEN = 5e-7  # soglia "economico" dal listing (~$0.50/M
 # c'e' (hint), dalla convenzione ':free' e dal brand del provider, e dal nome
 # per gli economici noti. _worker_pool ordina per (tier, preferenza): le
 # liste preferred di B e T/E decidono solo l'ordine DENTRO ogni tier.
-TIER_FREE = 0    # gratis: provider con "free" nel brand (gpt4free/*),
-                 # openrouter/free, id ":free", listing a prezzo zero,
-                 # ollama-cloud (quota gratuita), hardware locale
+TIER_FREE = 0    # gratis: openrouter/free, id ":free", listing a prezzo
+                 # zero, ollama-cloud (quota gratuita), hardware locale
 TIER_CHEAP = 1   # economici: gpt-oss, flash/flash-lite, gemma, qwen, llama,
                  # deepseek, haiku, glm, kimi, small/mini/nano, phi...
 TIER_PAID = 2    # tutto il resto (gemini-pro, claude sonnet/opus, gpt-5...)
@@ -815,19 +789,16 @@ def _worker_too_expensive(model):
 # Il model_list di litellm contiene pattern ("groq/*"): per una chiamata
 # interna serve un NOME CONCRETO ("groq/openai/gpt-oss-120b"), altrimenti
 # l'upstream riceve model="*" e risponde 400/404. Il listing di ogni
-# gateway (openrouter-gw, groq-gw, gpt4free-gw prefigissano gia' gli
-# id; synthetic/ollama sono upstream diretti -> prefisso aggiunto qui) e'
+# gateway (openrouter-gw, groq-gw prefigissano gia' gli id;
+# synthetic/ollama sono upstream diretti -> prefisso aggiunto qui) e'
 # la stessa fonte usata dall'import automatico dei modelli in config.
 WILDCARD_LIST_TIMEOUT_S = 8
 WILDCARD_CACHE_TTL_S = 600
 # tetto per-pattern: il vecchio 40 TRONCAVA i listing da ~50 id (caso storico
 # del proxy inference4free, ora spento: gli id ai margini della lista
 # perdevano il contesto reale 10000 -> floor statico 131072 -> prompt
-# oversize spediti e fallback a monte). 300 (era 200 fino al 2026-11-02,
-# richiesta utente) copre TUTTO il listing di gpt4free che al 2026-11-02 e'
-# ~250 id: prima gli ultimi ~53 restavano fuori dal pool di operari e non
-# potevano mai essere scelti. Resta un tetto per i listing enormi
-# (openrouter: centinaia).
+# oversize spediti e fallback a monte). 300 resta un tetto per i listing
+# enormi (openrouter: centinaia); nessun provider attuale lo raggiunge.
 WILDCARD_MAX_MODELS = 300
 _WILDCARD_CACHE = {}           # "groq/*" -> (monotonic, [nomi concreti])
 
@@ -861,8 +832,8 @@ _PROXY_MODELS_STARTED = [False]
 # _fetch_pattern_models: context_length/max_model_len/context_window =
 # finestra TOTALE, max_input_tokens = cap input, conservativo). Serve perche'
 # i gruppi wildcard ETEROGENEI non possono dichiarare un unico contesto vero
-# in config.yaml (synthetic: 131k..512k; gpt4free: ignoto, g4f non espone
-# context_length -> resta il floor statico 131072) e il
+# in config.yaml (synthetic: 131k..512k; groq/gemini: valori diversi per
+# modello) e il
 # listing litellm /v1/models NON porta i campi contesto per questi provider
 # (get_valid_models espande solo gli id): il clamp e il pool leggono QUI.
 _DYN_CTX = {}                  # id pubblico -> finestra (int)
@@ -1140,7 +1111,7 @@ _ensure_proxy_models_refresher()
 #    si spaccano troppo spesso o vanno in ratelimit, cosi' un provider
 #    esterno non li 'vede' momentaneamente".
 # Stesso stato, stesso contatore. L'id e' il NOME PUBBLICO del modello
-# (es. gpt4free/xxx), alimentato da tre sorgenti:
+# (es. groq/openai/gpt-oss-120b), alimentato da tre sorgenti:
 #  - i tentativi interni della cascata (eccezione o risposta vuota),
 #  - i fallimenti delle richieste dei CLIENT (async_post_call_failure_hook:
 #    429, 5xx, timeout, errore di connessione; NON 400/401/404/context),
@@ -1160,9 +1131,8 @@ _ensure_proxy_models_refresher()
 #    e' bloccare): cosi' un modello tornato sano si riabilita al primo
 #    successo, senza aspettare il TTL.
 # MAI in quarantena i router automatici (`auto`, `*/auto`): sono il ripiego
-# per definizione, nasconderli svuoterebbe la lista dei ripieghi (richiesta
-# utente 2026-11-02: "non escludiamo mai il router Auto e il provider Auto di
-# gpt4free"). Restano contati? No: non si contano nemmeno i loro falli.
+# per definizione, nasconderli svuoterebbe la lista dei ripieghi. Restano
+# contati? No: non si contano nemmeno i loro falli.
 QUAR_FAIL_WINDOW_S = 600        # finestra dei falli (10 min)
 QUAR_FAIL_THRESHOLD = 3         # falli nella finestra -> quarantena
 QUAR_BASE_S = 900               # prima quarantena: 15 min
@@ -1349,8 +1319,8 @@ def _fetch_pattern_models(name):
                 if p is not None:
                     _TIER_HINTS[full] = p
             # contesto REALE per-modello (vedi _DYN_CTX): campo per provider -
-            # synthetic/gpt4free/openrouter "context_length", groq
-            # "context_window", llama.cpp "max_model_len"; "max_input_tokens"
+            # synthetic/openrouter "context_length", groq "context_window",
+            # llama.cpp "max_model_len"; "max_input_tokens"
             # (cap input) solo come ultima scelta, conservativo
             for f in ("context_length", "max_model_len", "context_window",
                       "max_input_tokens"):
@@ -1586,7 +1556,7 @@ class ReasoningClamp(CustomLogger):
         """Finestra TOTALE utilizzabile (prompt + output) di `model`,
         PER-MODELLO quando possibile: 1) listing gateway/upstream (_DYN_CTX:
         context_length/max_model_len/context_window - synthetic, groq,
-        gpt4free...), 2) listing litellm /v1/models (max_input_tokens
+        openrouter...), 2) listing litellm /v1/models (max_input_tokens
         del registro: openrouter e simili; usato da solo perche' per i
         locali e' la finestra intera e nel registro e' <= finestra reale),
         3) mappa statica (minimo vero del gruppo). Cosi' syn:large:text
@@ -1945,13 +1915,12 @@ class ReasoningClamp(CustomLogger):
         configurato su litellm che puo' contenere
         `needed_tokens` di input (+ output + margine), ordinato per
         (tier di costo, preferenza): prima i modelli GRATIS
-        (gpt4free, openrouter/:free, listing a prezzo zero, locali),
+        (openrouter/:free, listing a prezzo zero, locali),
         poi gli ECONOMICI (gpt-oss, flash-lite, gemma, syn:small...),
         per ultimi i costosi - richiesta utente 2026-10-06. La lista
         `preferred` ordina solo DENTRO il tier. Richiesta utente
         2026-10-06: "cascade model selection, exploit ANY possible
-        litellm configured model, even the ones hosted by
-        gpt4free" - niente piu' liste chiude di operari.
+        litellm configured model" - niente piu' liste chiuse di operari.
         I WILDCARD della model_list (groq/*, gemini/*, ...) vengono ESPASI
         nei nomi concreti richiedibili via listing del gateway (cache TTL):
         chiamare acompletion col nome letterale "groq/*" manderebbe
@@ -2597,8 +2566,8 @@ class ReasoningClamp(CustomLogger):
         elif model == SYN_SMALL_TEXT:
             # richiesta utente 2026-10-12: syn:small:TEXT parte da
             # ollama/small-model (gemello Ollama sullo STESSO PC, server
-            # indipendente: regge quando llama-swap e' occupo o da 429), poi i
-            # cloud GRATIS gpt4free/auto e openrouter/free. Dal 2026-10-14
+            # indipendente: regge quando llama-swap e' occupo o da 429), poi il
+            # cloud GRATIS openrouter/free. Dal 2026-10-14
             # syn:small:vision ha la stessa identica catena (ramo seguente,
             # alias sul medesimo costante). Ramo esatto PRIMA del ramo generico
             # synthetic/*: la callback sovrascrive i fallback di OGNI richiesta
@@ -2608,9 +2577,9 @@ class ReasoningClamp(CustomLogger):
             # richiesta utente 2026-10-14: syn:small:VISION ha la STESSA catena
             # di syn:small:text (alias su SYN_SMALL_TEXT_FALLBACKS) - prima
             # ollama/small-model (gemello Ollama sullo STESSO PC, server
-            # indipendente), poi i cloud GRATIS gpt4free/auto e
-            # openrouter/free. Il target locale e' text-only: una richiesta
-            # vision puo' 400, hop sprecato, la catena prosegue.
+            # indipendente), poi il cloud GRATIS openrouter/free. Il target
+            # locale e' text-only: una richiesta vision puo' 400, hop
+            # sprecato, la catena prosegue.
             # Ramo esatto PRIMA del ramo generico synthetic/*.
             data["fallbacks"] = list(SYN_SMALL_VISION_FALLBACKS)
         elif model == SYN_EMBED:
@@ -2643,8 +2612,8 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = []
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
-            # openrouter/free, ollama/*, ollama-cloud/*, gpt4free/* e
-            # qualunque prefisso futuro): NESSUN fallback (richiesta utente
+            # openrouter/free, ollama/*, ollama-cloud/* e qualunque prefisso
+            # futuro): NESSUN fallback (richiesta utente
             # 2026-10-25: la catch-all "*": ["small-model"] e' stata rimossa).
             data["fallbacks"] = []
         # --- reasoning_effort per-provider ---
@@ -2754,7 +2723,7 @@ class ReasoningClamp(CustomLogger):
         """Avviso di throttling travestito da risposta 200 -> errore 429.
 
         Un provider free puo' rispondere 200 mettendo il messaggio di quota
-        nel CONTENUTO (gpt4free/Yqcloud, richiesta utente 2026-11-02): per
+        nel CONTENUTO (Yqcloud, richiesta utente 2026-11-02): per
         litellm e' un successo, quindi niente retry/fallback e il client
         riceve testo inutilizzabile al posto della risposta. Qui la risposta
         viene ispezionata PRIMA di uscire e trasformata in un 429 esplicito,
@@ -2782,8 +2751,8 @@ class ReasoningClamp(CustomLogger):
             detail=(
                 "provider free temporaneamente limitato (quota per IP) per "
                 f"'{model}': l'upstream ha restituito l'avviso come contenuto "
-                "di un 200. Riprova tra qualche minuto oppure usa un id "
-                "provider-qualified (es. gpt4free/<provider>/<modello>)."
+                "di un 200. Riprova tra qualche minuto oppure usa un modello "
+                "di un altro provider."
             ),
         )
 
@@ -2810,7 +2779,7 @@ class ReasoningClamp(CustomLogger):
 
         In piu' (2026-11-02) guarda i PRIMI UPSTREAM_NOTICE_SCAN_CHARS
         caratteri di testo: se l'upstream ha spedito l'avviso di throttling
-        come contenuto di un 200 (gpt4free/Yqcloud), il testo-spazzatura non
+        come contenuto di un 200 (Yqcloud), il testo-spazzatura non
         arriva al client: al suo posto un chunk esplicito. Le header SSE sono
         gia' partite (200), quindi non si puo' piu' cambiare lo status.
         """

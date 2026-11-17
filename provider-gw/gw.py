@@ -45,13 +45,14 @@ Config via env:
                gateway inoltra l'Authorization del client (e' cosi' che
                funzionano groq/gemini/ollama: la chiave e' quella che litellm
                manda). Con questa la chiave del client viene SOSTITUITA:
-               serve quando litellm ha solo un segnaposto (gpt4free: la
-               chiave vera vive nell'.env del progetto upstream e NON deve
-               essere copiata nel repo litellm).
+               serve quando litellm ha solo un segnaposto e la chiave vera
+               vive nell'.env del progetto upstream, dove NON deve essere
+               copiata nel repo litellm.
   UPSTREAM_KEY_FILE / UPSTREAM_KEY_NAME - alternativa a UPSTREAM_KEY: la
                chiave si legge da un file (es. l'.env del progetto upstream,
                montato read-only) e UPSTREAM_KEY_NAME e' la variabile da
-               estrarre (es. "G4F_API_KEY"); senza NAME vale il file intero.
+               estrarre (es. "MY_UPSTREAM_KEY"); senza NAME vale il file
+               intero.
                Rilettura con TTL 60s: una chiave ruotata viene presa senza
                riavviare il gateway.
   UPSTREAM_AUTH_HEADER - header usato per UPSTREAM_KEY (default
@@ -96,7 +97,7 @@ HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection",
                "accept-encoding", "keep-alive"}
 # header di autenticazione del CLIENT: vanno rimossi quando il gateway usa una
 # chiave propria (litellm manda un segnaposto, l'upstream pretende la sua)
-AUTH_HEADERS = {"authorization", "g4f-api-key", "x-api-key"}
+AUTH_HEADERS = {"authorization", "x-api-key"}
 
 _KEY_CACHE = {"ts": 0.0, "key": None}
 _KEY_TTL = 60.0
