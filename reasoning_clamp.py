@@ -12,6 +12,12 @@ xhigh/max vengono ridotti al massimo valore supportato dal provider.
 - gemini/* : valori validi high/medium/low/minimal/none ("xhigh" non
   esiste) -> xhigh/max clamped a "high"; default "high" se il client non
   passa nulla (gemini e gemma lo accettano tutti).
+- cloudflare/* (Workers AI) : la validazione e' PER-MODELLO e il 400 e'
+  secco -> il parametro si manda SOLO se il listing (cloudflare-gw) espone
+  supported_efforts e il valore e' tra quelli (xhigh/max scivolano su
+  high/max); senza lista pubblica viene RIMOSSO e vale il default
+  Cloudflare (verificato 2026-11-18: qwen3.8-27b rifiuta "high",
+  gpt-oss-120b rifiuta "xhigh", glm-4.7-flash rifiuta none/max/xhigh).
 - Gli altri modelli (synthetic/*, openrouter/*, ollama/*, ollama-cloud/*,
   locale) non vengono toccati: il loro default xhigh sta gia' in config.yaml.
 
@@ -401,6 +407,16 @@ CONTEXT_BY_PREFIX = (
     ("groq/openai/gpt-oss-20b", 131072),
     ("groq/", 262144),
     ("gemini/", 262144),
+    # Cloudflare Workers AI: floor = MINIMO vero del gruppo LISTATO dopo i
+    # filtri di cloudflare-gw (llama-3.3-70b-instruct-fp8-fast = 24000;
+    # clef-flash 24576, eurollm 32000, ...). Il contesto REALE per-modello
+    # arriva dal listing del gateway (context_length -> _DYN_CTX) e ha la
+    # precedenza: questo valore conta solo finche' il listing non e' stato
+    # letto (startup/gateway irraggiungibile), dove un valore generoso
+    # (262144, il tetto del gruppo) manderebbe un prompt enorme a un modello
+    # da 24k -> 400. Allineato a model_info.max_input_tokens di config.yaml
+    # (quello e' il TETTO, questo il pavimento).
+    ("cloudflare/", 24000),
 )
 
 # --- reasoning_effort SUPPORTATI per-modello (synthetic) ---
@@ -1328,6 +1344,20 @@ def _fetch_pattern_models(name):
                 if isinstance(v, (int, float)) and v > 0:
                     _DYN_CTX[full] = int(v)
                     break
+            # reasoning_effort supportati dal modello, quando il GATEWAY li
+            # espone nel listing (cloudflare-gw li ricava da supported_efforts
+            # di Workers AI). Prima questo campo veniva letto solo per le
+            # entry ESPLICITE (_fetch_explicit_contexts): cosi' anche i
+            # modelli di una WILDCARD hanno la lista autorevole e il ramo
+            # per-provider puo' validare invece di indovinare.
+            rp = m.get("reasoning_parameters") if isinstance(m, dict) else None
+            if isinstance(rp, dict):
+                raw_eff = rp.get("efforts")
+                if isinstance(raw_eff, (list, tuple)):
+                    vals = tuple(str(x).strip().lower() for x in raw_eff
+                                 if isinstance(x, str) and str(x).strip())
+                    if vals:
+                        _DYN_EFFORTS[full] = vals
             if len(out) >= WILDCARD_MAX_MODELS:
                 break
         return out
@@ -2658,6 +2688,28 @@ class ReasoningClamp(CustomLogger):
             else:
                 eff = _pick_effort(eff, supported)
                 if eff:
+                    data["reasoning_effort"] = eff
+                else:
+                    data.pop("reasoning_effort", None)
+        elif model.startswith("cloudflare/"):
+            # Workers AI valida reasoning_effort PER-MODELLO e risponde 400
+            # secco (nessun default silenzioso come Groq/Gemini): il
+            # parametro si manda SOLO se il listing dichiara la lista
+            # (supported_efforts -> _DYN_EFFORTS via _fetch_pattern_models) e
+            # il valore e' tra quelli. Verificato 2026-11-18: qwen3.8-27b
+            # accetta xhigh/medium/low e RIFIUTA high; gpt-oss-120b accetta
+            # high/medium/low e RIFIUTA xhigh; glm-4.7-flash (lista NON
+            # pubblicata) accetta low/medium/high e RIFIUTA none/max/xhigh.
+            # Senza lista pubblica il parametro viene RIMOSSO (vale il
+            # default Cloudflare, default_enabled:true): un default nostro
+            # sarebbe una scommessa, e la direttiva utente 2026-11-14 dice
+            # "default SOLO dove il modello lo supporta".
+            supported = _efforts_for(model)
+            if supported is None:
+                data.pop("reasoning_effort", None)
+            else:
+                eff = _pick_effort(eff, supported)
+                if eff and eff in supported:
                     data["reasoning_effort"] = eff
                 else:
                     data.pop("reasoning_effort", None)

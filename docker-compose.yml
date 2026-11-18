@@ -88,6 +88,8 @@ services:
         condition: service_started
       ollama-gw:
         condition: service_started
+      cloudflare-gw:
+        condition: service_started
     restart: no
     healthcheck:
       test:
@@ -283,6 +285,57 @@ services:
     # l'upstream generativelanguage no - un check HTTP sul listing dipenderebbe
     # da proxy + upstream + auth. start_period: "pip install httpx" prima di
     # gw.py.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # Gateway per Cloudflare Workers AI (cloudflare-gw/gw.py, DEDICATO: nessun
+  # altro provider ha un listing in questa forma). Workers AI non espone un
+  # /v1/models OpenAI-compatible (GET /ai/v1/models -> 7001 "GET not
+  # supported"), il catalogo vive solo su /ai/models/search (REST, con i
+  # metadati in properties[]): il gateway traduce, filtra i modelli NON
+  # usabili su questo account e conserva una cache last-good del listing.
+  # - account su Workers FREE (verificato 2026-11-18): require_workers_paid
+  #   -> 403 "not available on the Workers Free plan" quindi DROP_PAID=1
+  #   (default) li toglie dal listing invece di mostrarli rotti
+  # - planned_deprecation_date passata -> 5028 "Model has been deprecated"
+  # - "-lora" = basi LoRA, non modelli general purpose (DROP_LORA=1)
+  # L'account id NON e' un segreto (il token si'); il TOKEN vive in
+  # config/config.yaml e arriva qui come Authorization del client.
+  cloudflare-gw:
+    container_name: cloudflare-gw
+    mem_limit: 384m
+    image: python:3.13-slim
+    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
+    environment:
+      # store di sistema dell'immagine (come groq-gw/gemini-gw): gw.py usa
+      # GW_CA solo se il file esiste
+      GW_CA: /etc/ssl/certs/ca-certificates.crt
+      UPSTREAM: https://api.cloudflare.com/client/v4/accounts/fd6407a8e1ec0dfdc96c923e624ace8b/ai
+      # id pubblici "cloudflare/@cf/vendor/model": la capture della wildcard
+      # toglie "cloudflare/" e a Workers AI arriva l'id NATIVO "@cf/..."
+      ID_PREFIX: cloudflare/
+      # cache last-good: un 5xx Cloudflare non deve far sparire TUTTI i
+      # modelli da litellm fino al refresh successivo
+      MODELS_CACHE_FILE: /cache/models.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./cloudflare-gw/gw.py:/app/gw.py:ro
+      - ./cloudflare-gw/cache:/cache
+    restart: no
+    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
+    # api.cloudflare.com no - un check HTTP sul listing dipenderebbe da
+    # upstream + auth. start_period: "pip install httpx" prima di gw.py.
     healthcheck:
       test:
         [

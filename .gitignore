@@ -1,6 +1,7 @@
 .aider*
 config/config.yaml
 provider-gw/cache/
+cloudflare-gw/cache/
 *.sub
 __pycache__/
 .env

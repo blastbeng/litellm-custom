@@ -3,7 +3,7 @@
 A personal LLM router built on **LiteLLM Proxy** with lightweight Python
 gateways: a single OpenAI-compatible endpoint (`:4000`) that aggregates local
 models (llama-swap and Ollama on a dedicated PC), cloud providers
-(synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud), with **dynamic**
+(synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud, Cloudflare Workers AI), with **dynamic**
 wildcard model listing, fallback policy and `reasoning_effort` handling.
 
 ```
@@ -22,7 +22,8 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
                      │      │   │                                                      │
                      │      │   ├────► openrouter-gw ─┐                               │
                      │      │   ├────► groq-gw ───────┤ (diretto: nessun proxy)        │
-                     │      │   └────► gemini-gw ─────┴──► internet (api.*)             │
+                     │      │   ├────► gemini-gw ─────┤                               │
+                     │      │   └────► cloudflare-gw ─┴──► internet (api.*)             │
                      │      │                                                          │
                      └────────────────────────────────────────────────────────────────┘
 ```
@@ -44,6 +45,7 @@ del contesto ora la fa **headroom** dentro litellm (vedi sotto).
 | `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama local listing with `ID_PREFIX=ollama/` + `STRIP_LATEST=1`, no cache (models visible only while the PC is online; PC off → the gate 503s) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
 | `groq-gw`, `gemini-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
+| `cloudflare-gw` | `cloudflare-gw/gw.py` (dedicated) | Workers AI listing from the REST search endpoint, rewritten as OpenAI `/v1/models`: id prefix `cloudflare/`, property mapping (`context_length`, `pricing`, `reasoning_parameters`), free-plan / deprecated / `-lora` filters, last-good cache |
 | `reasoning_clamp.py` | litellm callback | `reasoning_effort` cascade/clamp per provider + fallback policy |
 | `headroom_callback.py` | litellm callback | `HeadroomUserClamp` (headroom-ai): comprime **in-process** tool output e messaggi utente strutturati (JSON/CSV) con `compress_user_messages=True`, fail-open (un errore logga un warning e la richiesta prosegue invariata). I messaggi `user` che sembrano dump di log sono protetti dal veto `ProtectUserLogs` (la compressione dei log e' lossy); prosa e codice restano intatti e **Kompress/ML non e' installato** (nessuna AI locale). litellm 1.109 rifiuta il path alla classe (serve un'istanza, come `rclamp`) e invoca l'hook solo se `async_pre_call_hook` e' definito nella classe concreta: per questo la sottoclasse lo ri-dichiara. Senza `transformers` il callback registra la **stima** come backend tokenizer HuggingFace (`_force_estimation_without_transformers`): headroom 0.41.0 importa `transformers` fuori dal `try` e per i modelli qwen/deepseek/llama l'eccezione annullava l'intera compressione ("Compression failed … No module named 'transformers'") |
 | `Dockerfile.litellm` | build di `litellm-headroom:local` | litellm upstream **+ headroom-ai** nel venv `/app/.venv`. litellm resta pinnato alla versione del base image (headroom-ai lo aggiornerebbe: senza constraint pip passa 1.109.0 → 1.109.1). Buildata da `manage-docker` (e a mano con `docker compose build litellm`) |
@@ -99,6 +101,52 @@ gateway serves the **last valid model list** saved on disk (header
 `X-Models-Cache: stale`). Models remain visible in litellm even when the
 endpoint is down. Each gateway has its **own** cache file
 (`/cache/<id-prefix>-models.json`).
+
+### Cloudflare Workers AI (`cloudflare-gw`)
+
+Workers AI is the one upstream whose listing cannot be proxied by the
+generic gateway:
+
+- **No OpenAI-compatible listing.** `GET /ai/v1/models` answers
+  `7001 "GET not supported for requested URI"`; chat (`/ai/v1/chat/completions`)
+  is OpenAI-compatible (streaming included), the *catalogue* is not. It only
+  exists at `GET /ai/models/search`, REST + paginated, with metadata nested in
+  `properties[]`.
+- **Requested path.** `cloudflare-gw` rewrites `GET /v1/models` (and
+  `/models`) into the search call, then maps the result to the same shape
+  litellm and `reasoning_clamp` already consume from every other provider:
+
+  | Workers AI property | Listing field |
+  |---|---|
+  | `id` (native `@cf/vendor/model`) | `id` with `ID_PREFIX` prepended |
+  | `properties.context_window` | `context_length` |
+  | `properties.price` (per-M USD, list of `{unit, price}`) | `pricing.prompt/completion` (USD per token) |
+  | `properties.reasoning_effort.supported_efforts` | `reasoning_parameters.efforts` |
+
+  Because the listing carries `context_length`, the per-model context window
+  reaches `_DYN_CTX` on the litellm side: the `model_info` ceiling on the
+  `cloudflare/*` wildcard is only a pre-sweep fallback.
+- **Passthrough.** Everything except the listing is forwarded untouched (body,
+  query string, SSE): the wildcard capture strips `cloudflare/` and litellm
+  strips the provider prefix `openai/`, so Workers AI receives the native
+  `@cf/vendor/model` id. `@cf/...` does not collide with any known litellm
+  provider, so no rename corruption (unlike OpenRouter).
+- **Filters (account-dependent).** `cloudflare-gw` drops from the listing:
+  models with `require_workers_paid=true` (a Workers **Free** account gets
+  `403 "not available on the Workers Free plan"`), models whose
+  `planned_deprecation_date` is already past (`5028 "Model has been
+  deprecated"`), and `-lora` deployments (LoRA bases, not general purpose
+  models). Knobs: `DROP_PAID`, `DROP_DEPRECATED`, `DROP_LORA` (`0` disables).
+  On a paid account set `DROP_PAID=0`.
+- **`reasoning_effort` is validated per model and the 400 is hard.**
+  `gpt-oss-120b` rejects `xhigh`, `qwen3.8-27b` rejects `high`, models without
+  `supported_efforts` still accept a varying set. `reasoning_clamp` therefore
+  sends the parameter **only** when the listing exposes `supported_efforts`
+  and the value is in it, otherwise removes it and lets the Cloudflare default
+  apply; no static `reasoning_effort` is set in `litellm_params`.
+- **Cache.** Last-good listing is written *after* the mapping (ids already in
+  public form) and served with `X-Models-Cache: stale` when Cloudflare is
+  unreachable (`MODELS_CACHE=0` disables).
 
 ### Quota notices served as a 200
 
@@ -248,7 +296,7 @@ untouched.
   The same prefix check keeps these models out of the context-cascade
   **worker pool** (`_worker_pool`), where their local-hardware tier would
   otherwise rank them first as compression workers.
-- **Everything else** (`groq/*`, `gemini/*`, `openrouter/*`,
+- **Everything else** (`groq/*`, `gemini/*`, `cloudflare/*`, `openrouter/*`,
   `openrouter/free`, `ollama/*`, `ollama-cloud/*`, and any future prefix)
   → **no fallback**.
 
@@ -270,6 +318,7 @@ Rule: default `xhigh` where valid, otherwise fall down (`high`, `medium`, ...).
 | `openrouter/*`, `ollama-cloud/*` | `xhigh` (in config) | accepted by the endpoint (heterogeneous pools: not validable per-model) |
 | `gemini/*` | `high` (callback) | `xhigh` not valid on Gemini; `none/minimal/low/medium` respected; `xhigh/max` → clamped to `high` |
 | `groq/*` | `high` (callback) | only for reasoning models (`openai/gpt-oss-*`, `qwen/*`); for the others (`allam-2-7b`, whisper, ...) the parameter is **removed** (they would 400) |
+| `cloudflare/*` | per-model (callback), no static default | Workers AI validates **per model** and the 400 is hard (`gpt-oss-120b` rejects `xhigh`, `qwen3.8-27b` rejects `high`): sent **only** if the listing exposes `supported_efforts` and the value is in it, otherwise **removed** and the Cloudflare default applies |
 
 The client-provided value always wins (clamped if invalid). The synthetic
 default **cannot** live in `litellm_params`: litellm merges those defaults
@@ -717,6 +766,7 @@ docker-compose.yml
 reasoning_clamp.py        # litellm callback (reasoning + fallbacks + clamp + overflow cascade)
 llama-gate/gate.py
 openrouter-gw/gw.py
+cloudflare-gw/gw.py       # Workers AI gateway (REST listing -> /v1/models, filters, cache)
 provider-gw/gw.py         # generic gateway (ID_PREFIX / PATH_PRE / cache)
 .env                      # POSTGRES_PASSWORD for litellm-db — NOT committed
 ```

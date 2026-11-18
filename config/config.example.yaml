@@ -462,6 +462,31 @@ model_list:
       max_output_tokens: 65536
       max_tokens: 262144
 
+  # --- Modelli Cloudflare Workers AI: importati in automatico ------------
+  # Nome pubblico "cloudflare/<id-nativo>" (es.
+  # cloudflare/@cf/openai/gpt-oss-120b): la capture della wildcard toglie
+  # "cloudflare/" e a Workers AI arriva l'id NATIVO "@cf/...".
+  # Workers AI NON ha un listing OpenAI-compatible (GET /ai/v1/models ->
+  # 7001 "GET not supported"): il catalogo vive su /ai/models/search e
+  # cloudflare-gw lo traduce in /v1/models, aggiungendo context_length
+  # per-modello, pricing e reasoning_parameters.efforts.
+  # L'account dell'ambiente e' su Workers FREE: il gateway NON lista i
+  # modelli require_workers_paid (403), i deprecati e le basi "-lora"
+  # (DROP_PAID/DROP_DEPRECATED/DROP_LORA su cloudflare-gw).
+  # model_info = tetto del gruppo; il contesto REALE per-modello arriva dal
+  # listing (reasoning_clamp: _DYN_CTX) e il floor statico sta in
+  # CONTEXT_BY_PREFIX ("cloudflare/", 24000). NIENTE reasoning_effort
+  # statico: lo valida la callback (supported_efforts del listing).
+  - model_name: cloudflare/*
+    litellm_params:
+      model: openai/*
+      api_base: http://cloudflare-gw/v1
+      api_key: YOUR_CLOUDFLARE_API_TOKEN
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 32768
+      max_tokens: 262144
+
   # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
   # Nome pubblico "ollama-cloud/<model>": il prefisso "-cloud" marca che sono
   # i modelli di ollama.com (cloud), NON locali - l'Ollama LOCALE (blastpc)
@@ -604,7 +629,7 @@ litellm_settings:
   #   al client cosi' com'e'. Il prefisso copre tutte e quattro le wildcard
   #   media; i modelli CHAT di llama-swap non hanno prefisso)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama/*, ollama-cloud/*) -> NESSUN fallback
+  #   ollama/*, ollama-cloud/*, cloudflare/*) -> NESSUN fallback
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via
