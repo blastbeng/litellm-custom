@@ -58,9 +58,9 @@ model_list:
       # contesto lato llama-server: 163840 dal 2026-11-04 (prima 196608 dal
       # 2026-10-06, prima 131072, prima ancora 262144 ridotto per RAM/VRAM):
       # litellm deve dichiararlo ai client
-      max_input_tokens: 163840
-      max_output_tokens: 32768
-      max_tokens: 32768
+      max_input_tokens: 262144
+      max_output_tokens: 131072
+      max_tokens: 131072
 
   # --- Secondo modello locale (PC 192.168.1.29, llama-swap): modello autonomo,
   # invocabile direttamente; e' l'ULTIMO ricorso di fallback di TUTTI i
@@ -78,9 +78,9 @@ model_list:
       id: local-small-backend
       # assumo lo stesso contesto di local-model (163840 dal 2026-11-04):
       # aggiornare se small-model dichiara un contesto diverso su llama-swap
-      max_input_tokens: 163840
-      max_output_tokens: 32768
-      max_tokens: 32768
+      max_input_tokens: 262144
+      max_output_tokens: 131072
+      max_tokens: 131072
 
   # --- Modello embedding locale (PC 192.168.1.29, llama-swap) ---
   # Invocabile direttamente; e' il FALLBACK di
@@ -545,8 +545,12 @@ litellm_settings:
   # (xhigh->high->...) e policy fallback per-modello via
   # litellm_params.fallbacks per-request (vedi reasoning_clamp.py)
   # ORDINE: rclamp PRIMA (calcola clamp/saturazione sul body originale),
-  # Headroom DOPO (comprime tool output JSON/codice in-process, fail-open:
+  # Headroom DOPO (comprime tool output JSON/CSV e log in-process, fail-open:
   # un errore logga un warning e la richiesta prosegue invariata).
+  # TRE STRATI contro la perdita dei tool output (2026-11-19): ultimi
+  # HR_PROTECT_LAST messaggi (default 6) verbatim; tool di lettura
+  # (*file_read*, *grep*, *glob*, ...) esclusi dal path lossy (HR_EXCLUDE_TOOLS
+  # per cambiare la lista); dump di log incollati dall'utente protetti.
   # Vedi Dockerfile.litellm per l'installazione di headroom-ai.
   # litellm 1.109 rifiuta il path alla CLASSE: headroom_callback.py espone
   # l'istanza hr_compress (stessa forma di reasoning_clamp.rclamp).
