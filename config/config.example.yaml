@@ -55,9 +55,9 @@ model_list:
       timeout: 1800
     model_info:
       id: local-qwen-backend
-      # contesto lato llama-server: 163840 dal 2026-11-04 (prima 196608 dal
-      # 2026-10-06, prima 131072, prima ancora 262144 ridotto per RAM/VRAM):
-      # litellm deve dichiararlo ai client
+      # contesto lato engine: 262144, allineato a llama-swap
+      # (capabilities.context e Strata --context). Deve restare il contesto
+      # VERO: reasoning_clamp dimensiona su questo la cascata di compattazione.
       max_input_tokens: 262144
       max_output_tokens: 131072
       max_tokens: 131072
@@ -76,9 +76,11 @@ model_list:
       timeout: 1800
     model_info:
       id: local-small-backend
-      # assumo lo stesso contesto di local-model (163840 dal 2026-11-04):
-      # aggiornare se small-model dichiara un contesto diverso su llama-swap
-      max_input_tokens: 262144
+      # 229376 = il piu' largo --ctx-size che carica sulla RTX 3060 12GB senza
+      # OOM (262144 non carica, 245760 lascia solo 1148 MiB). Deve restare
+      # ALLINEATO a llama-swap: se small-model muore la cascata di
+      # reasoning_clamp resta senza operaio e va in 413.
+      max_input_tokens: 229376
       max_output_tokens: 131072
       max_tokens: 131072
 

@@ -364,17 +364,24 @@ LLAMA_SWAP_MEDIA_PREFIX = "llama-swap/"
 # limite lo impone l'upstream. Valori ALLINEATI a config(.example).yaml:
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
-    # locali: 163840 dal 2026-11-04 (prima 196608 dal 2026-10-06, prima
-    # 131072: cappati a 128k lato llama-server). synthetic: i 13 modelli sono
-    # entry ESPLICITE in config
+    # locali: 262144 dal 2026-11-20, ALLINEATI a
+    # /home/blast/.config/llama-swap/config.yaml su 192.168.1.29 (verificato
+    # il 2026-11-20). local-model (Strata, RX 7800 XT): --context 262144
+    # --kv k8v4 --vram-reserve-mib 2048. small-model (llama-server, RTX 3060
+    # 12GB): --ctx-size 229376 --cache-type-k/v q4_0 -ngl all --fit off,
+    # MISURATO: 262144 NON carica (CUDA OOM nel warm-up di load), 245760
+    # carica, 229376 con ~2GB di margine -> dichiarato 229376. Il valore
+    # 163840 usato fino a ieri era solo una riduzione per RAM/VRAM rimasta
+    # qui a mano: il clamp lavorava con 98k di stanza in meno. synthetic: i
+    # 13 modelli sono entry ESPLICITE in config
     # dal 2026-10-06 -> qui sotto i contesti REALI per-modello (misurati sui
     # listing di api.synthetic.new). INCIDENTE 2026-10-06: GLM-5.3-Flash
     # valeva 131072 (floor di gruppo) mentre il reale e' 524288 -> cascata
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    ("local-model", 163840),
-    ("small-model", 163840),
+    ("local-model", 262144),
+    ("small-model", 229376),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
     # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti
@@ -488,6 +495,15 @@ IMAGE_TOKEN_COST = 1500
 # rimasta (400 "exceeds the context" + catena fallback morta). 3% copre
 # l'errore osservato con margine 2x.
 PROMPT_ERR_PCT = 0.03
+# MARGINE DI COMPATTAZIONE: T/T2/T3 non si fermano al PRIMO token utile, si
+# fermano a ctx*(1-headroom). Il motivo e' misurato: la stima puo' restare
+# qualche % sotto il conteggio del motore (pretokenizer del modello), e un
+# payload compattato "a filo" del contesto (es. 251309 su 262144) resta
+# sopra il vero limite e l'upstream risponde 400 "prompt ... leaves no room"
+# anche se il 413 e' stato evitato (incidente 2026-11-20: T2 -> stima 214439,
+# motore 301397). 5% di un contesto da 262144 = ~13k token di cuscinetto:
+# costo trascurabile, e copre l'errore residuo dello stimatore.
+COMPACTION_HEADROOM_PCT = 0.05
 MAX_TOKEN_KEYS = ("max_tokens", "max_completion_tokens")
 
 # --- cascata overflow: B -> C -> T -> E -> F ---
@@ -1392,11 +1408,75 @@ def _expand_wildcards(names):
             seen.add(n)
             res.append(n)
     return res
-MAP_OUTPUT_TOKENS = 1024
+# Budget della SINTESI (chunk di T/T2/E). Non e' solo "quanto puo' essere
+# lungo il brief": su un modello con --reasoning attivo il ragionamento esce
+# dallo STESSO budget, e un chunk grande lo consuma tutto prima di scrivere
+# una riga di risposta. MISURATO 2026-11-20 su small-model: chunk da 48k token
+# con max_tokens 1024 -> finish=length, 962 token di reasoning e brief
+# TRONCATO; chunk piu' grandi -> content VUOTO ("empty"), che vale uno strike
+# di quarantena e uccide la cascata (incidente: 471k token di prompt ->
+# "T:small-model:empty" -> 413). MISURATO: il brief reale di un chunk da 136k
+# token e' ~1025 token TOTALI (reasoning + testo) con finish=stop, ma su un
+# chunk LARGO (185k) il ragionamento da solo supera i 2048 e il content torna
+# VUOTO - misurato: con 2048 il primo chunk e' andato in "empty" e il retry a
+# 8192 ha bruciato tutto il budget del livello (413 con T2/T3 "no-post-user").
+# 4096 e' il primo tentativo che regge anche i chunk larghi (la generazione
+# reale resta ~1000 token, quindi non costa tempo: ~40 s a 23 tok/s).
+MAP_OUTPUT_TOKENS = 4096
+BRIEF_RETRY_TOKENS = 8192
 MAP_CHUNK_INPUT_TOKENS = 90000  # + output < contesto dei piu' piccoli (131072)
 MAP_MAX_CHUNKS = 8
-MAP_TIMEOUT_S = 180
+# Timeout di UNA chiamata di riassunto. Con i chunk larghi di un compattatore
+# LOCALE (fino a COMPACTOR_INPUT_TOKENS) il prefill da solo costa: misurato
+# 2026-11-20 su small-model (RTX 3060, ~700-1178 tok/s su codice denso) -> un
+# chunk da 163840 tok impiega ~230-290 s di prefill + sintesi: con i vecchi
+# 180 s andrebbe SEMPRE in timeout (strike di quarantena -> cascata senza
+# operaio).
+# Il tetto per livello resta WORKER_TIME_BUDGET_S: qui basta non tagliare una
+# singola chiamata legittima.
+MAP_TIMEOUT_S = 420
 MAP_ORIGIN = "context_map_reduce"
+
+# TETTO di INPUT per un compattatore LOCALE. Il contesto DICHIARATO non e'
+# quello che il motore riesce a TENERE: un chunk da 90k token e' dimensionato
+# sui contesti cloud, non su una scheda da 12GB.
+#
+# MISURATO 2026-11-20 (llama-swap su 192.168.1.29, config.yaml aggiornato):
+#   small-model (RTX 3060 12GB, Ornith-1.5-9B Q4_K_M + mmproj Q8, KV q4_0,
+#   --fit off): --ctx-size 262144 NON CARICA (CUDA OOM dentro
+#   server_context_impl::load_model -> il warm-up decodifica l'intero
+#   contesto), 245760 carica con 1148 MiB liberi, 229376 con ~1.3 GiB liberi
+#   (desktop incluso). Scelto 229376: e' il piu' largo che lascia margine
+#   vero a un browser/Xorg che cresce (ogni 16k di ctx costa ~215 MiB).
+#   Prefill: 1178 tok/s su codice denso -> 196k tok in ~167 s.
+#   local-model (RX 7800 XT 16GB, Strata, --vram-reserve-mib 2048): 262144
+#   regge, 15.0 GiB usati / 2.1 GiB liberi.
+# Conseguenza del valore sbagliato: small-model moriva a OGNI richiesta
+# (84 crash CUDA in un giorno), la cascata restava senza operaio e finiva in
+# 413 "T2:no-gain" (incidente 2026-11-20 17:23, prompt 265182 tok).
+#
+# Il tetto NON e' il contesto del motore (la KV e' preallocata al load: un
+# chunk piu' corto non risparmia VRAM) e va scelto sul COMPORTAMENTO.
+#
+# Storia delle misure (llama-swap, 2026-11-20):
+#   - 185k token con thinking ON: il ragionamento mangia 4096 token, content
+#     VUOTO, e anche il retry a 8192 resta VUOTO (misurato: finish=length).
+#     E' il motivo per cui il tetto era stato abbassato a 131072.
+#   - da allora _brief_call spegne il thinking sui compattatori locali
+#     (chat_template_kwargs.enable_thinking=false): stessa macchina, chunk da
+#     163307 token -> finish=stop, brief da 4533 char, 294 s TOTALI (prefill
+#     ~700-900 tok/s + 1187 token di sintesi a ~23 tok/s). Il tetto a 131072
+#     non serve piu'.
+#   - 163840 = 20 x 8192: il piu' largo che resta dentro UNA chiamata
+#     (MAP_TIMEOUT_S 420 s) con margine; il contesto del motore (229376)
+#     lascia ~65k token per output + template, e la richiesta FINALE (non il
+#     chunk) resta li'.
+# Oltre: un chunk da 196k costa ~350 s di solo prefill e sfonda il budget di
+# livello (WORKER_TIME_BUDGET_S) al primo chunk -> riassunti parziali.
+COMPACTOR_INPUT_TOKENS = {
+    "small-model": 163840,
+    "local-model": 163840,
+}
 
 # T (split+compress della coda): la massa spesso e' nell'ultimo messaggio
 # user (il prompt compilato dall'agente), che B/C/E tengono verbatim
@@ -1421,6 +1501,23 @@ T2_HEADER = (
     "stato COMPRESSO dal proxy per rientrare nel contesto: qui sotto un "
     "riassunto fedele del contenuto originale]\n"
 )
+# T3: TRONCAMENTO deterministico (nessun modello). Ultimo livello prima del
+# 413: quando T/T2 non possono lavorare (operaio di compattazione giu'/in
+# quarantena/OOM o troppo lento per il budget) serve un livello che GUADAGNA
+# SEMPRE. Incidente 2026-11-20 17:23: coda 260578 tok, ultimo user 536,
+# small-model morto -> T skip, T2 "no-gain", 413. Taglia testa+coda (inizio e
+# fine sono la parte utile di un tool result) dei messaggi DOPO l'ultimo user
+# e, per ultimo, il MEZZO dell'ultimo user lasciando le ancore verbatim (li'
+# nessun altro livello deterministico arriva: T dipende dall'operaio).
+T3_HEADER = (
+    "[NOTA: contenuto TRONCATO dal proxy per rientrare nel contesto: "
+    "restano inizio e fine VERBATIM, il centro e' stato rimosso]\n"
+)
+T3_MIN_KEEP_CHARS = 2000   # sotto questo tagliare non ha piu' senso: si passa
+                           # al messaggio successivo (o al 413)
+T3_TRIM_SLACK_TOKENS = 512  # arrotondamento token->char: senza slack il
+                            # taglio resta 1-2 token sopra il target
+T3_HEAD_RATIO = 0.35       # quota di testa del testo che resta (il resto coda)
 
 COMPACT_SYSTEM_PROMPT = (
     "You compress conversation context for a coding agent. Rewrite the "
@@ -1471,35 +1568,113 @@ CJK_RE = re.compile(
 PROSE_CHARS_PER_TOKEN = 4.6   # inglese col tokenizer llama (misurato)
 MIXED_CHARS_PER_TOKEN = 3.6
 CJK_CHARS_PER_TOKEN = 1.5     # peggior caso: ~1 token ogni 1.5 char
+# JSON/numeri: sopra EXTREME_DENSITY il ratio scende ancora. MISURATO
+# 2026-11-20 (llama-server, /tokenize, small-model) su ~50k numeri dentro
+# JSON denso: 2.04 char/token reali contro 2.41 stimati con il floor 2.8.
+EXTREME_DENSITY = 0.35
+EXTREME_CHARS_PER_TOKEN = 2.2
 DENSE_DENSITY = 0.20          # >= 20% simboli/non-parole: codice/JSON
 MIXED_DENSITY = 0.10
+DIGITS = "0123456789"
+# Correzione delle cifre sul conteggio tiktoken (vedi _tiktoken_corrected):
+# cl100k le fonde, il pretokenizer llama le spezza. MISURATO 2026-11-20.
+DIGIT_TOKEN_EXTRA = 0.6
 TIKTOKEN_MIN_CHARS = 150000   # tiktoken solo sui prompt grossi (~30k+ token)
 _TIKTOKEN_ENC = None
 _TIKTOKEN_FAILED = False
 
 
-def _chars_per_token(text):
-    """Ratio caratteri/token di UN pezzo di testo, dalla densita' dei
-    simboli: codice/JSON (denso) -> 2.8, conservativo come prima; prosa
-    pura -> 4.6; CJK -> 1.5. Il ratio piu' basso (piu' token stimati) vale
-    per il testo denso: si sovrastima la prosa, non si sottostima mai il
-    codice."""
-    n = len(text)
-    if not n:
-        return PROSE_CHARS_PER_TOKEN
-    if len(CJK_RE.findall(text)) / n > 0.15:
+def _ratio_from_density(density, cjk, long_alnum):
+    """caratteri/token attesi da una densita' di simboli."""
+    if cjk:
         return CJK_CHARS_PER_TOKEN
-    density = len(NON_WORD_RE.findall(text)) / n
+    if density >= EXTREME_DENSITY:
+        # numeri+punteggiatura (JSON compatto, log, tabelle): interpolazione
+        # fino a EXTREME_CHARS_PER_TOKEN invece di fermarsi a 2.8
+        t = min(1.0, (density - DENSE_DENSITY)
+                / (EXTREME_DENSITY - DENSE_DENSITY))
+        return CHARS_PER_TOKEN - t * (CHARS_PER_TOKEN - EXTREME_CHARS_PER_TOKEN)
     if density >= DENSE_DENSITY:
         return CHARS_PER_TOKEN
     if density <= MIXED_DENSITY:
         # prosa con base64/hash/sha dentro: resta prudente
-        return (PROSE_CHARS_PER_TOKEN
-                if len(LONG_ALNUM_RE.findall(text)) < 3
+        return (PROSE_CHARS_PER_TOKEN if long_alnum < 3
                 else MIXED_CHARS_PER_TOKEN)
     # misto: interpolazione lineare tra prosa e denso
     t = (density - MIXED_DENSITY) / (DENSE_DENSITY - MIXED_DENSITY)
     return MIXED_CHARS_PER_TOKEN + t * (CHARS_PER_TOKEN - MIXED_CHARS_PER_TOKEN)
+
+
+def _text_stats(text):
+    """(char/token, cifre) di UN testo, in un solo giro.
+
+    Il ratio e' calcolato sui caratteri NON cifra: il pretokenizer di
+    llama.cpp spezza i numeri (~1 token per cifra), quindi le cifre non
+    vanno diluite nella densita' di simboli - vanno contate a parte.
+    MISURATO 2026-11-20 con /tokenize su small-model (Ornith-1.5-9b):
+      log con date e contatori  213200 char, 24% cifre -> 98800 tok (2.16)
+      JSON con indici           358836 char, 14% cifre -> 176171 tok (2.04)
+      codice Python             200000 char,  2% cifre ->  57316 tok (3.49)
+      prosa                     200000 char,  0% cifre ->  37989 tok (5.26)
+    La vecchia stima dava 70200 e 149001: 29% e 15% SOTTO il motore, cioe'
+    esattamente il buco che faceva finire la compattazione ~90k token oltre
+    il contesto (incidente 2026-11-20: stima 214439, motore 301397 -> 400).
+    """
+    n = len(text)
+    if not n:
+        return PROSE_CHARS_PER_TOKEN, 0
+    digits = 0
+    for d in DIGITS:
+        digits += text.count(d)
+    nd = n - digits
+    if not nd:
+        return PROSE_CHARS_PER_TOKEN, digits
+    cjk = len(CJK_RE.findall(text)) / n > 0.15
+    density = len(NON_WORD_RE.findall(text)) / nd
+    long_alnum = len(LONG_ALNUM_RE.findall(text))
+    return _ratio_from_density(density, cjk, long_alnum), digits
+
+
+def _chars_per_token(text):
+    """Ratio caratteri/token dell'intero testo (calcolato sui caratteri
+    NON cifra, vedi _text_stats). Resta per i chiamanti che vogliono solo
+    un ordine di grandezza; per le STIME usare _ratio_estimate."""
+    return _text_stats(text)[0]
+
+
+def _ratio_estimate(text):
+    """Token stimati di un testo: cifre a 1 token l'una (peggior caso del
+    pretokenizer llama) + resto al ratio della sua classe di densita'."""
+    n = len(text)
+    if not n:
+        return 0
+    ratio, digits = _text_stats(text)
+    nd = n - digits
+    return digits + (int(nd / ratio) if nd else 0)
+
+
+def _digit_count(text):
+    """Quante CIFRE contiene il testo (scan in C, una per decina)."""
+    n = 0
+    for d in DIGITS:
+        n += text.count(d)
+    return n
+
+
+def _tiktoken_corrected(texts):
+    """tiktoken + correzione per le CIFRE.
+
+    cl100k fonde i numeri (un "2026" e' un token, "123456" magari due),
+    il pretokenizer di llama.cpp li spezza: misurato 2026-11-20 su
+    small-model, la differenza e' 0.5-0.55 token per cifra su log/JSON
+    numerici. 0.6 e' la stessa misura con un pelo di margine. Sui testi
+    senza cifre (prosa, codice, base64) non cambia nulla.
+    """
+    tk = _tiktoken_estimate(texts)
+    if tk is None:
+        return None
+    extra = int(sum(_digit_count(t) for t in texts if t) * DIGIT_TOKEN_EXTRA)
+    return tk + extra
 
 
 def _tiktoken_estimate(texts):
@@ -1600,6 +1775,21 @@ class ReasoningClamp(CustomLogger):
             return mit
         return self._context_for(model)
 
+    @staticmethod
+    def _estimate_text_tokens(text):
+        """Token stimati di UN testo: stessa regola di
+        _estimate_prompt_tokens (ratio per densita' e, per i testi grandi,
+        tiktoken se piu' alto). Serve a T3 per convertire in caratteri il
+        deficit di token con il ratio REALE di quel testo."""
+        if not isinstance(text, str) or not text:
+            return 0
+        est = _ratio_estimate(text)
+        if len(text) >= TIKTOKEN_MIN_CHARS:
+            tk = _tiktoken_corrected([text])
+            if tk and tk > est:
+                est = tk
+        return est
+
     def _estimate_prompt_tokens(self, data):
         """Stima CONSERVATIVA (mai sottostimare: l'upstream conta col
         tokenizer reale e un max_tokens oltre la stanza e' un 400 che
@@ -1624,10 +1814,18 @@ class ReasoningClamp(CustomLogger):
                 j = str(t)
             tool_texts.append(j)
         fixed = TOOL_FIXED_TOKENS * len(tool_texts)
-        tool_tokens = (sum(int(len(j) / TOOLS_CHARS_PER_TOKEN)
-                           for j in tool_texts) + fixed)
+        tool_tokens = sum(_ratio_estimate(j) for j in tool_texts) + fixed
+        # tiktoken (cachato sha1) quando disponibile: e' il conteggio piu'
+        # fedele anche sui grandi schemi MCP (misurato 2026-11-20: 20251 su
+        # 20891 reali contro 30256 del modello a densita'), corretto per le
+        # cifre come i messaggi. Il ratio resta solo fallback: prima qui
+        # c'era un MIN(tiktoken, ratio) che sottostimava del 30% i tool
+        # result numerici (log, JSON con indici: 3 x 98800 reali contati
+        # 70200 -> payload compattato 90k token OLTRE il contesto).
         tk = _tools_tiktoken(tool_texts)
-        if tk is not None and tk + fixed < tool_tokens:
+        if tk is not None:
+            tk += int(sum(_digit_count(j) for j in tool_texts)
+                      * DIGIT_TOKEN_EXTRA)
             tool_tokens = tk + fixed
         texts = []
         images = 0
@@ -1658,10 +1856,10 @@ class ReasoningClamp(CustomLogger):
                     texts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
                 except Exception:
                     texts.append(str(m["tool_calls"]))
-        est = sum(int(len(t) / _chars_per_token(t)) for t in texts)
+        est = sum(_ratio_estimate(t) for t in texts)
         chars = sum(len(t) for t in texts)
         if chars >= TIKTOKEN_MIN_CHARS:
-            tk = _tiktoken_estimate(texts)
+            tk = _tiktoken_corrected(texts)
             if tk and tk > est:
                 est = tk
         return (est + PER_MESSAGE_OVERHEAD * len(msgs)
@@ -1689,6 +1887,14 @@ class ReasoningClamp(CustomLogger):
         """Il prompt da solo lascia meno di MIN_OUTPUT_TOKENS: il clamp non
         puo' aiutare, serve ridurre il PROMPT (cascata)."""
         return est + MIN_OUTPUT_TOKENS + self._margin(est) > ctx
+
+    @staticmethod
+    def _settled(est, ctx):
+        """True quando un livello di compattazione puo' SMETTERE: la stima
+        sta sotto ctx*(1-COMPACTION_HEADROOM_PCT). Piu' stretto di
+        _saturated: la compattazione deve lasciare il cuscinetto per
+        l'errore residuo dello stimatore (vedi la costante)."""
+        return est <= int(ctx * (1.0 - COMPACTION_HEADROOM_PCT))
 
     def _serialize(self, msgs):
         """Trascrizione testuale dei messaggi, per compattazione/riassunto."""
@@ -1872,30 +2078,18 @@ class ReasoningClamp(CustomLogger):
             if time.monotonic() >= deadline:
                 failures.append(f"time-budget:{WORKER_TIME_BUDGET_S}s")
                 break
-            try:
-                resp = await asyncio.wait_for(
-                    llm_router.acompletion(
-                        model=comp,
-                        messages=[{"role": "system",
-                                   "content": COMPACT_SYSTEM_PROMPT},
-                                  {"role": "user", "content": body}],
-                        max_tokens=COMPACT_OUTPUT_TOKENS,
-                        num_retries=0,
-                        fallbacks=[],
-                        drop_params=True,
-                        metadata={INTERNAL_CALL_ORIGIN_KEY: COMPACT_ORIGIN},
-                    ),
-                    timeout=(COMPACTOR_OVERRIDE_TIMEOUT_S if comp != model
-                             else COMPACTOR_TIMEOUT_S),
-                )
-                brief = (resp.choices[0].message.content or "").strip()
-            except Exception as e:
-                failures.append(f"{comp}:{type(e).__name__}:{str(e)[:120]}")
-                _quar_note_fail(comp, f"{type(e).__name__}: {e}")
+            brief, err = await self._brief_call(
+                comp, COMPACT_SYSTEM_PROMPT, body, COMPACT_OUTPUT_TOKENS,
+                (COMPACTOR_OVERRIDE_TIMEOUT_S if comp != model
+                 else COMPACTOR_TIMEOUT_S), COMPACT_ORIGIN, deadline=deadline)
+            if err:
+                failures.append(f"{comp}:{err}")
+                if not err.startswith("level-budget"):
+                    _quar_note_fail(comp, err)
                 continue
             if len(brief) < MIN_BRIEF_CHARS:
-                failures.append(f"{comp}:empty-brief")
-                _quar_note_fail(comp, "empty-brief")
+                failures.append(f"{comp}:brief-too-short:{len(brief)}")
+                _quar_note_fail(comp, "brief-too-short")
                 continue
             _quar_note_ok(comp)
             print(f"[reasoning_clamp] B {model}: compattato da {comp} "
@@ -2059,6 +2253,82 @@ class ReasoningClamp(CustomLogger):
         # livello (vedi _cascade), non si ripesca il quarantenato.
         return ordered
 
+    async def _brief_call(self, worker, system_prompt, text, max_tokens,
+                          timeout, origin, deadline=None):
+        """UNA sintesi dal worker, con UN retry a budget maggiore quando il
+        modello spende tutto il budget nel ragionamento e restituisce content
+        vuoto (vedi MAP_OUTPUT_TOKENS: misurato su small-model il 2026-11-20).
+        Un "empty" non retry-ato era uno strike di quarantena e uccideva la
+        cascata. Ritorna (testo, errore): testo None = worker inutilizzabile.
+
+        `deadline` (monotonic) limita il TEMPO TOTALE dei due tentativi al
+        budget del livello, cosi' un retry non raddoppia l'attesa del client."""
+        from litellm.proxy.proxy_server import llm_router
+        if llm_router is None:
+            return None, "no-router"
+        # RAGIONAMENTO SPENTO sui compattatori LOCALI (chat_template_kwargs
+        # passa intatto: litellm -> llama-gate -> llama-swap -> llama-server,
+        # verificato 2026-11-20). MISURATO sullo stesso chunk da ~163k token:
+        # thinking ON -> content VUOTO a 4096 E anche a 8192 (finish=length,
+        # il ragionamento mangia tutto il budget); thinking OFF -> finish=stop
+        # con brief da 4533 char in 294 s. Il retry a 8192 non salvava il caso
+        # largo, quindi senza questo un chunk > ~150k andava perso a ogni
+        # richiesta. Solo per i modelli locali: `chat_template_kwargs` e' un
+        # campo di llama.cpp, i provider cloud lo rifiuterebbero.
+        extra = {}
+        if worker in COMPACTOR_INPUT_TOKENS:
+            extra["extra_body"] = {"chat_template_kwargs":
+                                   {"enable_thinking": False}}
+        last = None
+        for mt in (max_tokens, max(max_tokens, BRIEF_RETRY_TOKENS)):
+            t0 = time.monotonic()
+            wait = timeout
+            if deadline is not None:
+                wait = min(wait, deadline - time.monotonic())
+                if wait <= 0:
+                    return None, last or f"time-budget:{WORKER_TIME_BUDGET_S}s"
+            try:
+                resp = await asyncio.wait_for(
+                    llm_router.acompletion(
+                        model=worker,
+                        messages=[{"role": "system", "content": system_prompt},
+                                  {"role": "user", "content": text}],
+                        max_tokens=mt,
+                        num_retries=0,
+                        fallbacks=[],
+                        drop_params=True,
+                        metadata={INTERNAL_CALL_ORIGIN_KEY: origin},
+                        **extra,
+                    ),
+                    timeout=wait,
+                )
+            except Exception as e:
+                if deadline is not None and wait < timeout:
+                    # Il tempo e' finito per il LIVELLO (deadline), non per
+                    # colpa del worker: non e' una sua failure -> niente
+                    # strike di quarantena (altrimenti un prompt enorme
+                    # disabilita small-model per 15 minuti).
+                    return None, f"level-budget:{type(e).__name__}"
+                return None, f"{type(e).__name__}: {str(e)[:120]}"
+            s = (resp.choices[0].message.content or "").strip()
+            if s:
+                return s, None
+            fr = resp.choices[0].finish_reason
+            last = f"empty-brief@{mt}(finish={fr})"
+            if mt >= BRIEF_RETRY_TOKENS:
+                break
+            # Il retry raddoppia l'attesa di QUESTO chunk: si fa solo se il
+            # budget del livello puo' permetterselo, altrimenti il tempo
+            # residuo serve agli altri chunk (meglio riassunti PARZIALI che
+            # nessuno, e T3 copre comunque il buco).
+            if deadline is not None and \
+                    (deadline - time.monotonic()) < (time.monotonic() - t0):
+                return None, f"{last};retry-skipped:no-budget"
+            print(f"[reasoning_clamp] {worker}: brief VUOTO a max_tokens={mt} "
+                  f"(finish={fr}) - retry a {max(max_tokens, BRIEF_RETRY_TOKENS)}",
+                  flush=True)
+        return None, last
+
     async def _summarize_chunks(self, chunks, origin, model):
         """Riassume i chunk con l'operario = MODELLO DELLA RICHIESTA
         (richiesta utente 2026-10-28: niente piu' pool dinamico di modelli
@@ -2074,10 +2344,13 @@ class ReasoningClamp(CustomLogger):
         from litellm.proxy.proxy_server import llm_router
         if llm_router is None:
             return None, "no-router"
-        # chunk misurato col ratio denso: la stima del CHUNK deve stare
-        # bassa (non sovrastimare) per non escludere operari validi; il
-        # margine del pool copre il residuo
-        chunk_est = max(int(len(c) / CHARS_PER_TOKEN) for c in chunks)
+        # Chunk misurato con la STESSA stima del taglio (_estimate_text_tokens,
+        # ratio per densita' + tiktoken sui grossi): deve stare bassa - non
+        # sovrastimare - per non escludere operari validi, ma con il ratio
+        # denso fisso (2.8 char/token) un chunk di prosa a 196k token vero
+        # risultava ~323k e il pool lo rifiutava ("no-worker-fits") proprio
+        # quando il tetto largo serviva. Il margine del pool copre il residuo.
+        chunk_est = max(self._estimate_text_tokens(c) for c in chunks)
         # SOLO il modello della richiesta (richiesta utente 2026-10-28): i
         # livelli T/T2/E riassumono col modello che il client ha chiamato;
         # per i single-slot di llama-swap vale COMPACTOR_OVERRIDE (small-model)
@@ -2097,30 +2370,13 @@ class ReasoningClamp(CustomLogger):
                     failures.append(f"time-budget:{WORKER_TIME_BUDGET_S}s")
                     break
                 w = pool[wi]
-                try:
-                    resp = await asyncio.wait_for(
-                        llm_router.acompletion(
-                            model=w,
-                            messages=[{"role": "system",
-                                       "content": MAP_SYSTEM_PROMPT},
-                                      {"role": "user", "content": chunk}],
-                            max_tokens=MAP_OUTPUT_TOKENS,
-                            num_retries=0,
-                            fallbacks=[],
-                            drop_params=True,
-                            metadata={INTERNAL_CALL_ORIGIN_KEY: origin},
-                        ),
-                        timeout=MAP_TIMEOUT_S,
-                    )
-                    s = (resp.choices[0].message.content or "").strip()
-                except Exception as e:
-                    failures.append(f"{w}:{type(e).__name__}")
-                    _quar_note_fail(w, f"{type(e).__name__}: {e}")
-                    wi += 1
-                    continue
-                if not s:
-                    failures.append(f"{w}:empty")
-                    _quar_note_fail(w, "empty")
+                s, err = await self._brief_call(
+                    w, MAP_SYSTEM_PROMPT, chunk, MAP_OUTPUT_TOKENS,
+                    MAP_TIMEOUT_S, origin, deadline=deadline)
+                if err:
+                    failures.append(f"{w}:{err}")
+                    if not err.startswith("level-budget"):
+                        _quar_note_fail(w, err)
                     wi += 1
                     continue
                 _quar_note_ok(w)
@@ -2165,7 +2421,7 @@ class ReasoningClamp(CustomLogger):
         if not isinstance(c, str) or not c:
             # content list (vision/parts): non riscriverlo qui
             return None, "tail-not-text"
-        tail_est = int(len(c) / _chars_per_token(c))
+        tail_est = self._estimate_text_tokens(c)
         if tail_est < TAIL_SPLIT_MIN_TOKENS:
             return None, f"tail-too-small:{tail_est}"
         if len(c) <= ANCHOR_HEAD_CHARS + ANCHOR_TAIL_CHARS:
@@ -2175,7 +2431,7 @@ class ReasoningClamp(CustomLogger):
         middle = c[ANCHOR_HEAD_CHARS:len(c) - ANCHOR_TAIL_CHARS]
         if len(middle) < COMPACT_MIN_CHARS:
             return None, "middle-too-small"
-        chunks = self._chunk_for_map(middle)
+        chunks = self._chunk_for_map(middle, model)
         if not chunks:
             return None, "no-chunks"
         brief, info = await self._summarize_chunks(chunks, TAIL_ORIGIN, model)
@@ -2233,49 +2489,225 @@ class ReasoningClamp(CustomLogger):
         new_msgs = list(msgs)
         base = idx + 1
         done = 0
+        reasons = []
         for _, i in cand:
-            if (not self._saturated(cur, ctx)
+            if (self._settled(cur, ctx)
                     or done >= T2_MAX_MESSAGES
                     or time.monotonic() >= deadline):
                 break
             m = post[i]
-            chunks = self._chunk_for_map(m["content"])
+            chunks = self._chunk_for_map(m["content"], model)
             if not chunks:
+                reasons.append("no-chunks")
                 continue
             brief, info = await self._summarize_chunks(chunks, TAIL_ORIGIN, model)
             if brief is None:
-                continue
+                # Il motivo NON va perso: "no-gain" secco rende il 413
+                # indiagnosticabile (incidente 2026-11-20: l'operaio small-model
+                # rispondeva 500 "upstream command exited prematurely" per OOM e
+                # il 413 diceva solo "no-gain").
+                reasons.append(str(info))
+                # FAIL-FAST: l'operaio e' uno solo, il prossimo messaggio
+                # fallirebbe allo stesso modo - e ogni fallimento e' uno strike
+                # di quarantena che poi disabilita il compattatore per 15m.
+                break
             new_msgs[base + i] = dict(m, content=T2_HEADER + brief)
             data["messages"] = new_msgs  # progressivo: i guadagni restano
             cur = self._estimate_prompt_tokens(data)
             done += 1
         if not done:
-            return None, "no-gain"
+            return None, ("no-gain[" + "|".join(reasons[-3:]) + "]"
+                          if reasons else "no-gain")
         print(f"[reasoning_clamp] T2 {model}: {done} messaggi post-user "
               f"compressi, stima ~{cur} tok (contesto {ctx})", flush=True)
         return data, f"t2:{done}"
 
+    # ---------------- T3: troncamento deterministico (nessun modello) -------
+
+    async def _truncate_tail_messages(self, data, model, est):
+        """Livello T3: tronca IN PLACE i messaggi dopo l'ultimo user, il piu'
+        grande prima, finche' la stima rientra nel contesto.
+
+        Non chiama NESSUN modello: e' l'ultimo livello prima del 413 e deve
+        guadagnare sempre. Serve esattamente al caso in cui T (mezzo
+        dell'ultimo user) e T2 (riassunto dei messaggi post-user) non possono
+        lavorare - operaio di compattazione giu', in quarantena, in OOM o
+        troppo lento per il budget del livello (incidente 2026-11-20 17:23:
+        coda 260578 tok, ultimo user 536, small-model morto -> T
+        "tail-too-small", T2 "no-gain", 413 deterministico). Per questo, dopo
+        i messaggi post-user, taglia anche il MEZZO dell'ultimo user
+        conservando le ancore (ANCHOR_HEAD_CHARS / ANCHOR_TAIL_CHARS) verbatim.
+        Si conservano inizio e fine del contenuto (li' stanno intestazione e
+        conclusione di un tool result / log) e si rimuove il centro, con T3_HEADER
+        a dirlo esplicitamente al modello. Ruolo, tool_call_id e tool_calls
+        restano: un tool result orfano sarebbe un 400 del provider."""
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return None, "no-user-msg"
+        post = msgs[idx + 1:]
+        ctx = self._window_for(model)
+        cur = self._estimate_prompt_tokens(data)
+        if not self._saturated(cur, ctx):
+            return None, "already-fits"
+        # Candidati: i messaggi DOPO l'ultimo user, il piu' grande prima, e per
+        # ULTIMO il mezzo dell'ultimo user. Quello non lo tocca nessun altro
+        # livello deterministico - T lo affida all'operaio, che puo' essere
+        # morto/in quarantena/OOM o non finire nel budget (misurato 2026-11-20:
+        # 1.3 MB nell'ultimo user, small-model in timeout -> "T:level-budget"
+        # -> 413 con T2/T3 "no-post-user"). Le ANCORE (inizio e fine, dove sta
+        # la richiesta corrente) restano verbatim.
+        cand = []   # (char tagliabili, indice in msgs, pavimento da tenere)
+        for i, m in enumerate(post):
+            c = m.get("content")
+            if isinstance(c, str) and len(c) >= COMPACT_MIN_CHARS:
+                cand.append((len(c), idx + 1 + i, T3_MIN_KEEP_CHARS))
+        # content list (vision) / vuoto / solo tool_calls: niente da tagliare
+        last_c = msgs[idx].get("content")
+        if isinstance(last_c, str):
+            floor = ANCHOR_HEAD_CHARS + ANCHOR_TAIL_CHARS
+            if len(last_c) > floor + COMPACT_MIN_CHARS:
+                cand.append((len(last_c) - floor, idx, floor))
+        if not cand:
+            return None, "nothing-truncatable"
+        cand.sort(key=lambda t: -t[0])  # il piu' grande prima
+        new_msgs = list(msgs)
+        done = 0
+        # piu' giri: dopo un taglio il margine (3%) cambia, e un taglio
+        # stimato con il ratio sbagliato puo' non bastare. Ogni giro riparte
+        # dal piu' grande ANCORA troppo lungo; ci si ferma quando si rientra
+        # o quando nessun messaggio puo' piu' scendere (T3_MIN_KEEP_CHARS).
+        for _round in range(4):
+            if self._settled(cur, ctx):
+                break
+            progressed = False
+            for _, i, floor in cand:
+                if self._settled(cur, ctx):
+                    break
+                slot = new_msgs[i]
+                c = slot.get("content")
+                if not isinstance(c, str) or len(c) <= floor:
+                    continue
+                # il deficit si misura sul TARGET (ctx - headroom), non sul
+                # bordo del contesto: un taglio "a filo" lascia il payload
+                # dentro la stima e fuori dal motore. + SLACK: la conversione
+                # token->caratteri arrotonda, e senza slack si resta 1-2 token
+                # SOPRA il target (misurato: 249038 contro 249036) e il
+                # livello non risulta "settled".
+                deficit = (cur - int(ctx * (1.0 - COMPACTION_HEADROOM_PCT))
+                           + T3_TRIM_SLACK_TOKENS)
+                if deficit <= 0:
+                    break
+                # char/token EFFETTIVO di QUESTO testo (tiktoken sui testi
+                # grandi): CHARS_PER_TOKEN fisso sottostima i run ripetuti e
+                # il taglio resterebbe corto
+                per_tok = len(c) / max(self._estimate_text_tokens(c), 1)
+                keep = len(c) - int(deficit * per_tok)
+                if keep < floor:
+                    keep = floor
+                head = int(keep * T3_HEAD_RATIO)
+                tail = keep - head
+                header = "" if c.startswith(T3_HEADER) else T3_HEADER
+                slot["content"] = (header + c[:head] + "\n[...]\n"
+                                   + (c[len(c) - tail:] if tail > 0 else ""))
+                data["messages"] = new_msgs  # progressivo: i guadagni restano
+                cur = self._estimate_prompt_tokens(data)
+                done += 1
+                progressed = True
+            if not progressed:
+                break
+        if not done:
+            return None, "no-gain"
+        print(f"[reasoning_clamp] T3 {model}: {done} messaggi troncati "
+              f"(coda e/o mezzo dell'ultimo user), stima ~{cur} tok "
+              f"(contesto {ctx})", flush=True)
+        return data, f"t3:{done}"
+
     # ---------------- E: map/reduce (modello della richiesta) ---------------
 
-    def _chunk_for_map(self, body):
-        """Taglia la trascrizione in chunk di ~MAP_CHUNK_INPUT_TOKENS token;
-        un messaggio piu' grande del chunk viene tagliato a meta'."""
-        limit = int(MAP_CHUNK_INPUT_TOKENS * CHARS_PER_TOKEN)
-        chunks, cur = [], []
-        cur_len = 0
+    def _chunk_for_map(self, body, model=None):
+        """Taglia la trascrizione in chunk di ~limit token (MAP_CHUNK_INPUT_TOKENS
+        oppure il tetto misurato del compattatore locale); quello che avanza
+        da un blocco troppo grande viene spezzato in parti proporzionali.
+
+        `model` = modello della RICHIESTA: il taglio scende al tetto del suo
+        COMPATTATORE quando e' un modello locale (COMPACTOR_INPUT_TOKENS).
+        Senza questo un chunk da 90k token finisce su una scheda da 12GB e la
+        uccide (CUDA OOM -> llama-swap 500 -> cascata senza operaio).
+
+        Il taglio e' misurato in TOKEN STIMATI, non in caratteri: il vecchio
+        `limit_tokens * CHARS_PER_TOKEN` assumeva 2.8 char/token, ma su
+        codice/JSON densi (2.0) o CJK (1.5) un chunk "da 196k" pesava davvero
+        270-360k -> 400 dell'upstream, strike di quarantena e cascata di nuovo
+        senza operaio. Con il tetto in token, COMPACTOR_INPUT_TOKENS e' quello
+        che arriva davvero al modello."""
+        limit_tokens = MAP_CHUNK_INPUT_TOKENS
+        if model is not None:
+            # Il tetto del compattatore LOCALE SOSTITUISCE quello generico: e'
+            # misurato su quel motore, mentre MAP_CHUNK_INPUT_TOKENS e'
+            # dimensionato sui contesti cloud piu' piccoli. Prima lo abbassava
+            # soltanto, quindi il tetto locale non entrava mai in gioco e si
+            # restava a 90000: il "piu' largo possibile" non aveva effetto.
+            cap = COMPACTOR_INPUT_TOKENS.get(self._compactor_for(model))
+            if cap:
+                limit_tokens = cap
+
+        def pieces(block):
+            """(testo, token stimati): un blocco oltre il tetto viene spezzato
+            in parti proporzionali e RI-misurato - la densita' delle parti puo'
+            differire da quella del blocco intero."""
+            n = self._estimate_text_tokens(block)
+            if n <= limit_tokens or not block:
+                return [(block, n)]
+            parts = -(-n // limit_tokens)
+            step = max(1, -(-len(block) // parts))
+            out = []
+            for i in range(0, len(block), step):
+                piece = block[i:i + step]
+                out.append((piece, self._estimate_text_tokens(piece)))
+            return out
+
+        chunks, cur, cur_tok = [], [], 0
         for block in body.split("\n\n"):
-            if len(block) > limit:
-                for i in range(0, len(block), limit):
-                    chunks.append(block[i:i + limit])
-                continue
-            if cur and cur_len + len(block) > limit:
-                chunks.append("\n\n".join(cur))
-                cur, cur_len = [], 0
-            cur.append(block)
-            cur_len += len(block) + 2
-        if cur:
+            for piece, tok in pieces(block):
+                if cur and cur_tok + tok > limit_tokens:
+                    chunks.append("\n\n".join(cur))
+                    cur, cur_tok = [], 0
+                cur.append(piece)
+                cur_tok += tok
+            if len(chunks) >= MAP_MAX_CHUNKS:
+                break
+        if cur and len(chunks) < MAP_MAX_CHUNKS:
             chunks.append("\n\n".join(cur))
-        return chunks[:MAP_MAX_CHUNKS]
+
+        def split_over(chunk):
+            """Il conto per-parte non e' quello del testo UNITO: la densita'
+            del chunk intero puo' essere diversa (e sopra 150k char entra
+            tiktoken, che sulle parti piccole non veniva consultato).
+            MISURATO: 800k char di codice -> chunk "da 163840" che da unito
+            ne stima 170670, +4%. Si ri-divide finche' il tetto e' vero."""
+            out = [chunk]
+            for _ in range(3):
+                nxt = []
+                for c in out:
+                    n = self._estimate_text_tokens(c)
+                    if n <= limit_tokens or len(c) < 2:
+                        nxt.append(c)
+                        continue
+                    k = max(2, -(-n // limit_tokens))
+                    step = max(1, -(-len(c) // k))
+                    nxt.extend(c[i:i + step] for i in range(0, len(c), step))
+                out = nxt
+            return out
+
+        final = []
+        for c in chunks:
+            final.extend(split_over(c))
+        return final[:MAP_MAX_CHUNKS]
 
     async def _map_reduce(self, data, model, est):
         """Livello E: riassunto a chunk dell'intera storia (l'ultimo user
@@ -2287,7 +2719,7 @@ class ReasoningClamp(CustomLogger):
         body = self._serialize(body_src)
         if len(body) < COMPACT_MIN_CHARS:
             return None, "body-too-small"
-        chunks = self._chunk_for_map(body)
+        chunks = self._chunk_for_map(body, model)
         if not chunks:
             return None, "no-chunks"
         brief, info = await self._summarize_chunks(chunks, MAP_ORIGIN, model)
@@ -2317,7 +2749,8 @@ class ReasoningClamp(CustomLogger):
                          "grande -> C compressione BM25 -> T split+compress "
                          "della coda -> T2 compressione dei messaggi dopo "
                          "l'ultimo user -> E map/reduce, eseguiti con "
-                         f"{self._compactor_for(model)}) non ha "
+                         f"{self._compactor_for(model)} -> T3 troncamento "
+                         "deterministico) non ha "
                          "liberato spazio: riduci il contesto del client o "
                          "usa un modello con contesto maggiore"),
             },
@@ -2338,7 +2771,7 @@ class ReasoningClamp(CustomLogger):
             return data
         print(f"[reasoning_clamp] overflow {model}: ~{est} tok + "
               f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata "
-              f"B/C/T/T2/E", flush=True)
+              f"B/C/T/T2/E/T3", flush=True)
         if model not in _DYN_CTX:
             # il contesto NON viene dal listing dinamico: o tabella statica
             # per-modello (vera, ok) o floor di gruppo. Gap osservabilita'
@@ -2372,7 +2805,9 @@ class ReasoningClamp(CustomLogger):
                     data = new
                     est = self._estimate_prompt_tokens(data)
                     self._clamp_output(data, model, est)
-                    if not self._saturated(est, ctx):
+                    # _settled (non "appena sotto il bordo"): un payload a
+                    # 99% del contesto STIMATO e' spesso oltre quello REALE
+                    if self._settled(est, ctx):
                         print(f"[reasoning_clamp] {model}: cascata risolta "
                               f"da T (~{est} tok, contesto {ctx})", flush=True)
                         return data
@@ -2387,19 +2822,46 @@ class ReasoningClamp(CustomLogger):
                 if new is not None:
                     est = self._estimate_prompt_tokens(data)
                     self._clamp_output(data, model, est)
-                    if not self._saturated(est, ctx):
+                    if self._settled(est, ctx):
                         print(f"[reasoning_clamp] {model}: cascata risolta "
                               f"da T2 (~{est} tok, contesto {ctx})",
                               flush=True)
                         return data
-                # la coda resta verbatim anche per B/C/E: nessun aiuto
+                # la coda resta verbatim anche per B/C/E: nessun aiuto.
+                # T3 tronca i messaggi post-user SENZA modello: e' l'ultimo
+                # livello utile quando l'operaio di compattazione e' morto,
+                # in OOM o in quarantena (incidente 2026-11-20 17:23).
+                try:
+                    new, info = await self._truncate_tail_messages(
+                        data, model, est)
+                except Exception as e:
+                    new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
+                tried.append(f"T3:{info}")
+                if new is not None:
+                    est = self._estimate_prompt_tokens(data)
+                    self._clamp_output(data, model, est)
+                    if self._settled(est, ctx):
+                        print(f"[reasoning_clamp] {model}: cascata risolta "
+                              f"da T3 (~{est} tok, contesto {ctx})",
+                              flush=True)
+                        return data
+                # F-EVIT vale anche qui: se il prompt da solo ci sta, un 413
+                # sarebbe deterministico e inutile (l'upstream, se proprio,
+                # risponde 400 e la catena di fallback prosegue).
+                if est <= ctx and self._force_output(data, model, est):
+                    print(f"[reasoning_clamp] {model}: F evitato - prompt "
+                          f"~{est} tok ci sta nel contesto {ctx}: max_tokens "
+                          f"alla stanza residua, richiesta parte "
+                          f"({'|'.join(tried)})", flush=True)
+                    return data
                 return self._overflow(data, model, est, tried)
         tried = []
         for name, fn in (("B", self._compact_with_provider),
                          ("C", self._compress_locally),
                          ("T", self._split_compress_tail),
                          ("T2", self._compress_tail_messages),
-                         ("E", self._map_reduce)):
+                         ("E", self._map_reduce),
+                         ("T3", self._truncate_tail_messages)):
             try:
                 if name == "C":
                     # compressione BM25: CPU-heavy, fuori dal loop degli eventi

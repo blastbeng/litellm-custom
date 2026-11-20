@@ -350,8 +350,9 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` has no fallback since 2026-10-28; 163840 for the locals, 131072
-floor for the synthetic wildcard — real per-model contexts via `_window_for`).
+(`synthetic/*` has no fallback since 2026-10-28; 262144 for `local-model`,
+229376 for `small-model`, 131072 floor for the synthetic wildcard — real
+per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
 `max_completion_tokens`) to `context − prompt` of the **model the request
@@ -368,34 +369,50 @@ attempt **after** the hook (invisible to it): this is why the cloud
 wildcards carry **no** `max_tokens` default and `synthetic/*` is capped at
 32768.
 The prompt size is **estimated adaptively**: each message part gets a
-`chars / token` ratio derived from its symbol density — dense code/JSON 2.8,
-prose 4.6, CJK 1.5, mixed-with-base64 3.6 (linear interpolation in between) —
-plus per-message overhead, **tool schemas**, images, and a **fixed +
+`chars / token` ratio derived from its symbol density **of its non-digit
+characters** — dense code/JSON 2.8 (down to 2.2 at ≥ 35% symbols), prose 4.6,
+CJK 1.5, mixed-with-base64 3.6 (linear interpolation in between) — plus
+per-message overhead, **tool schemas**, images, and a **fixed +
 proportional safety margin** (1024 + 3% of the estimate). Overestimating is
 safe (shorter completion), underestimating produces the upstream 400.
 Measured on real ~100k-token transcripts `chars / 2.8` alone lands ~1.4–1.8%
 below the upstream count and small tool schemas are worth ~80 tokens each —
 the old fixed margin lost there and the clamp handed out a `max_tokens` the
-upstream refused (2026-10-06 incident, issue #545 text). For very large
-payloads (≥ 150k chars) `tiktoken cl100k_base` is consulted as a second
-opinion and the **larger** of the two estimates wins. **Tool schemas** (the
-other 2026-10-06 false 413) are counted with `tiktoken` **when it comes out
-lower** than the ratio — `min(ratio, tiktoken)`: never an underestimate, but
-the old `chars / 2.2` (calibrated on 18 tiny Strata schemas) over-counted the
-~100 big MCP schemas of AiderDesk ~2× (est 126,805 vs 71,796 real), the
-cascade could not shrink the estimate (schemas stay verbatim in every level)
-and F fired although the prompt alone fit. The schema count is **sha1-cached**
-(identical across requests → O(1) after the first) and the ratio fallback is
-now 3.0. On the opposite side, the old flat
-`chars / 2.8` over-counted prose transcripts ~2× (est 171k vs 87.8k real) and
-triggered the cascade spuriously — the density ratio fixes that too. If the
-prompt alone saturates the context the clamp is useless — there is no room
-left for the answer — and the **overflow cascade** below takes over.
+upstream refused (2026-10-06 incident, issue #545 text).
+
+**Digits are counted separately** (2026-11-20). `tiktoken cl100k_base` merges
+numbers (`2026` = one token) while the llama.cpp pretokenizer splits them:
+measured with llama-server `/tokenize` on `small-model`, numeric logs came out
+at 2.16 chars/token and JSON with indices at 2.04, i.e. 29% / 15% **more**
+tokens than every chars-based estimate. That gap is exactly what pushed a
+"compacted" payload ~90k tokens past the context (estimate 214,439, engine
+301,397 → upstream 400). The estimate is therefore `digits × 1` + the rest at
+its density ratio, and when `tiktoken` (≥ 150k chars) is used it gets
+`+ 0.6 × digits`. Re-measured on six calibrated samples (numeric logs, Python
+code, base64, prose, JSON, MCP schemas) the estimator now sits **1.03–1.15×**
+the engine count instead of 0.71–1.00× — never below it.
+
+**Tool schemas** (the other 2026-10-06 false 413) are counted with
+`tiktoken` whenever available (sha1-cached, identical across requests → O(1)
+after the first) plus the same digit correction; the density ratio (3.0) is
+only the fallback. The older `min(ratio, tiktoken)` kept the estimate from
+over-counting the ~100 big MCP schemas of AiderDesk (which the old `chars /
+2.2` inflated ~2×: est 126,805 vs 71,796 real) but silently under-counted
+numeric **tool results** by ~30% — the tool path was the biggest single hole.
+On the opposite side, the old flat `chars / 2.8` over-counted prose
+transcripts ~2× (est 171k vs 87.8k real) and triggered the cascade spuriously
+— the density ratio fixes that too. If the prompt alone saturates the context
+the clamp is useless — there is no room left for the answer — and the
+**overflow cascade** below takes over.
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
-aligned with `model_info.max_input_tokens` in `config.yaml`** (163840 since
-2026-11-04 for `local-model`/`small-model` — 196608 from 2026-10-06 to
-2026-11-03, previously 131072, capped by the local hardware). **synthetic is
+aligned with `model_info.max_input_tokens` in `config.yaml` and with the
+`--ctx-size` actually passed to the engine** (2026-11-20: **262144** for
+`local-model`, Strata `--context 262144` on the RX 7800 XT, and **229376** for
+`small-model`, the largest `--ctx-size` that loads on the RTX 3060 — 262144
+dies in the load-time CUDA warm-up, 245760 leaves only 1148 MiB free).
+The old 163840 was a stale local cap: the clamp was budgeting 98k tokens less
+than the engine really had. **synthetic is
 13 explicit entries** (12 chat + the nomic embedding) with the real per-model contexts exposed on `/v1/models`
 (`syn:large:text` 524288, `syn:small:text` 196608, `hf:openai/gpt-oss-120b`
 131072, …) — litellm's wildcard expansion propagates ids only, never context
@@ -414,7 +431,7 @@ listing, so the wildcard value stays static); 262144 for `openrouter/*`,
 `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
 entries are matched before generic prefixes.
 
-## Context overflow cascade (`B → C → T → E → 413`)
+## Context overflow cascade (`B → C → T → T2 → E → T3 → 413`)
 
 When `prompt + 1024 + margin > context` the request cannot fit **any** model in
 the chain, so shrinking `max_tokens` cannot save it: the prompt itself has to
@@ -550,15 +567,33 @@ choice is not controllable.
 |---|---|---|
 | **B** | Compact the **history** (everything before the last `user` message) with the **request's own model** (2026-10-28), 45 s, no retries, no fallbacks. Legacy wildcard-name requests only: the dynamic pool in cost-tier order, `COMPACTOR_MODELS` first inside a tier. | Faithful summary |
 | **C** | `litellm.compression.compress()` — BM25 scoring, low-relevance messages replaced by stubs, system/last-user/last-assistant protected. **Zero LLM calls**, target = 55 % of the context. | **Yes** — the `litellm_content_retrieve` tool is *not* injected and the originals are *not* kept: nothing in this stack serves that tool, so a stub is gone for good. That is why C comes after B. |
-| **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (~90k tokens, max 8) and summarised by the **request's own model**. A structured note marks the compression. | Yes (middle only) |
-| **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate fits; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |
-| **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8), each summarised by the **request's own model** (180 s each), partials re-placed before the current request. | Yes |
+| **T** | **Split + compress the oversized last `user` message** — the mass often sits in the agent's compiled prompt, which B/C/E keep verbatim. Anchors are preserved verbatim (head 3000 chars / tail 6000 chars, the client's current request lives at the tail) and the middle is chunked (max 8; 90k tokens for cloud workers, up to `COMPACTOR_INPUT_TOKENS` — **163 840** for the local compactors, measured in *estimated tokens* not chars) and summarised by the **request's own model**. A structured note marks the compression. | Yes (middle only) |
+| **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate is ≤ **95 % of the context**; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |
+| **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8, same local cap as T), each summarised by the **request's own model** (`MAP_TIMEOUT_S = 420 s` each — a 163k-token chunk on the 3060 is ~230 s of prefill + synthesis, measured), partials re-placed before the current request. | Yes |
+| **T3** | **Deterministic truncation, no model involved**: keeps head (35 %) and tail of the oversized messages after the last `user` message (and the middle of the last `user` message) and drops the centre, re-estimating after each cut until the estimate is ≤ **95 % of the context**. Last chance before the 413 — it is the only level that *always* gains when T/T2 cannot (short last `user`, compactor down/OOM/quarantined). Incident 2026-11-20 17:23: tail 260 578 tokens, last `user` 536, `small-model` dead → T skipped, T2 `no-gain`, deterministic 413. | Yes (middle of tool results dropped) |
 | **F** | Nothing freed space → if the **prompt alone fits** (`est ≤ context`) this is *not* a `prompt_too_large`: `max_tokens` is **forced to the room left** (`context − est − 1024`, flat margin, floor `MIN_FORCED_OUTPUT = 256` — below it the real 413 stands) and the request **is sent**: our 413 was deterministic and killed every client retry, while an upstream 400 is recoverable through the fallback chain and Strata shortens the completion itself (`fit_max_tokens`). Only when the prompt genuinely exceeds the context → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`). | — |
 
 **Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
 verbatim, so if the tail saturates the context *by itself* those levels cannot
-help — the cascade tries only T and T2, then goes straight to F, avoiding
+help — the cascade tries only T, T2 and T3, then goes straight to F, avoiding
 guaranteed useless cloud calls.
+
+**Compaction headroom** (`COMPACTION_HEADROOM_PCT = 0.05`, 2026-11-20):
+T/T2/T3 stop at `ctx × 0.95`, not at the very edge of the context. Stopping
+"just under" is what let the estimator's residual error decide between a 200
+and an upstream `400 prompt leaves no room` (measured: T2 estimated 214,439,
+the engine counted 301,397). 5 % of a 262k window is ~13k tokens of cushion;
+combined with the digit-corrected estimator the compacted payload now lands at
+~95 % estimated ≈ ~93 % real.
+
+**Local compactors summarise with reasoning disabled**: `_brief_call` sends
+`extra_body={"chat_template_kwargs": {"enable_thinking": false}}` when the
+compactor is one of `COMPACTOR_INPUT_TOKENS` (llama.cpp only; verified to pass
+through litellm → llama-gate → llama-swap → llama-server). With reasoning on,
+a 163k-token chunk spent the whole budget thinking and returned **empty
+content** at both `max_tokens` 4096 and 8192 (`finish=length`), so the chunk
+was lost on every request; with it off the same chunk returns `finish=stop`
+with a 4.5k-char brief in 294 s.
 
 Static per-model contexts: synthetic models are explicit entries in
 `config.yaml`, and `CONTEXT_BY_PREFIX` mirrors their real windows exactly
@@ -739,14 +774,15 @@ without restarting anything. `trust/` contains **only** the public bundle —
 
 ### Note on llama-server (local model)
 
-The context reported by `llama-server` is **`--ctx-size / -np`**: each slot
-exposes `--ctx-size / -np` tokens (since 2026-11-04 **163840** per slot,
-196608 from 2026-10-06 to 2026-11-03, 131072 before — the local hardware cap
-that forced every chain-aligned context down), and the upstream rejects
-oversized requests with its own 400 (see **Context clamp** above), consistent with `model_info` in config. A
-context flip must be kept in sync in **three** places: `config.yaml`
-(`model_info`), `config.example.yaml`, and `CONTEXT_BY_PREFIX` in
-`reasoning_clamp.py`.
+The context reported by `llama-server` is **`--ctx-size / -np`**: `-np 1`, so
+`small-model` exposes the whole **229376** (2026-11-20; the 262144 it declared
+before never loaded — CUDA OOM in the load-time warm-up — and every compaction
+call failed, which is what turned a big prompt into a 413). `local-model` is
+Strata, `--context 262144`. The upstream rejects oversized requests with its
+own 400 (see **Context clamp** above), consistent with `model_info` in config.
+A context flip must be kept in sync in **four** places: llama-swap's `cmd`
+(`--ctx-size`) and its `capabilities.context`, `config.yaml` (`model_info`),
+`config.example.yaml`, and `CONTEXT_BY_PREFIX` in `reasoning_clamp.py`.
 
 **Note on 5-minute client timeouts (AiderDesk and similar AI-SDK clients).**
 `Headers Timeout Error` after exactly 5 minutes is **not litellm**: litellm's
