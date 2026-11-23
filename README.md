@@ -344,6 +344,15 @@ The same hook drops deployments declaring `supports_vision: false`
 (`syn:small:text`) when the request carries an image; the filter receives the
 **group** name (litellm resolves the alias before selection).
 
+**Tie-break is rotating.** `least-busy` picks the *first* minimum in
+`_least_busy_index()` (`litellm/router_strategy/least_busy.py`), so with every
+in-flight count at 0 — i.e. any sequential traffic — every request would hit the
+same member (measured: 10/10 on one deployment). The filter therefore rotates
+the tier-1 list by one position per request (`_HYBRID_RR`, an
+`itertools.count()`), which distributes ties evenly (measured: 20 sequential →
+5/5/5/5; 8 concurrent → 2/2/2/2) while real load still decides whenever the
+counts differ.
+
 **Group context is pinned to 196608** (`PINNED_CONTEXT`), the smallest real
 member window: `/v1/models` reports the *widest* limit of a group (and here it
 reports the user-chosen 229376/131072 via `register_model`), while `/model/info`

@@ -705,6 +705,11 @@ router_settings:
     # gemini-flash-latest entra solo quando i 4 sono tutti in cooldown/down.
     # E' la priorita' VERA: la strategia "priority" nativa entro il tier
     # sceglie a caso, non per carico, e vieta routing_strategy_args.
+    # least-busy sceglie il PRIMO indice con conteggio minimo: a conteggi
+    # uguali (traffico sequenziale) vincerebbe sempre lo stesso membro, quindi
+    # il filtro ruota la lista tier1 di una posizione per richiesta
+    # (_HYBRID_RR in reasoning_clamp): pareggi a rotazione, carico reale
+    # ancora decisivo quando i conteggi differiscono.
     # I free (groq/*, cloudflare/*, openrouter/*:free) non sono membri: sono
     # il salto di ULTIMA RISORSA, scelto per-request da reasoning_clamp in
     # base a contesto e vision (litellm_params.fallbacks per-request).

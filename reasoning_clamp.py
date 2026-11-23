@@ -167,6 +167,7 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 """
 import asyncio
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -979,6 +980,16 @@ _DYN_VISION = {}
 # deployment di hybrid-model: si stampa solo quando CAMBIA, perche' l'hook
 # gira a ogni richiesta.
 _HYBRID_TIER_STATE = [None]
+# TIE-BREAK ROTANTE del filtro tier di hybrid-model. least-busy sceglie
+# _least_busy_index() = il PRIMO indice con conteggio minimo
+# (litellm/router_strategy/least_busy.py): a carico zero i conteggi sono tutti
+# 0 e vince sempre il primo deployment dell'ordine ricevuto, quindi richieste
+# sequenziali finiscono tutte sullo stesso membro (misurato: 10/10 su
+# local-model). Il filtro ruota la lista a ogni richiesta e i pareggi si
+# distribuiscono a rotazione; quando i conteggi differiscono (carico reale)
+# decide ancora least-busy. itertools.count().next e' una singola chiamata C:
+# atomica rispetto al GIL, nessun lock.
+_HYBRID_RR = itertools.count()
 _SWEEP_SEEN = [False]          # primo sweep contesti riuscito (log una volta)
 
 
@@ -3503,6 +3514,11 @@ class ReasoningClamp(CustomLogger):
         cooldown/down). La strategia nativa "priority" non sapeva farlo: entro
         il tier sceglie A CASO e vieta routing_strategy_args.
 
+        La lista restituita viene RUOTATA di una posizione a ogni richiesta
+        (_HYBRID_RR): least-busy sceglie il primo indice a conteggio minimo,
+        quindi a conteggi pari (traffico sequenziale) senza rotazione
+        vincerebbe sempre lo stesso membro.
+
         Replica inoltre il pre-filtro vision nativo per i membri che
         dichiarano supports_vision: False (syn:small:text): una richiesta con
         immagine non deve mai finirci.
@@ -3532,6 +3548,11 @@ class ReasoningClamp(CustomLogger):
             tier1 = [d for d in eligible
                      if str(d.get("model_name") or "") in HYBRID_TIER1]
             chosen = tier1 or eligible
+            # Rotazione: vedi _HYBRID_RR. Sposta in testa, a turno, un membro
+            # diverso cosi' i pareggi di least-busy non cadono sempre sul primo.
+            if len(chosen) > 1:
+                shift = next(_HYBRID_RR) % len(chosen)
+                chosen = chosen[shift:] + chosen[:shift]
             state = (len(tier1), len(eligible))
             if state != _HYBRID_TIER_STATE[0]:
                 _HYBRID_TIER_STATE[0] = state
