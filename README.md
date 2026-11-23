@@ -308,6 +308,65 @@ list (`router.py`: `kwargs.get("fallbacks", self.fallbacks)`).
 The config catch-all `"*": ["small-model"]` was **removed** (2026-10-25); the
 callback sets an explicit `fallbacks` list (often empty) on every request.
 
+## Hybrid model (`hybrid-model`)
+
+One endpoint that spreads the load over five deployments, all at the same level
+except for their tier:
+
+| Member | Context (input) | Vision | Tier |
+|---|---|---|---|
+| `local-model` | 229376 | yes | 1 |
+| `small-model` | 229376 | yes | 1 |
+| `synthetic/syn:large:text` | 524288 | yes | 1 |
+| `synthetic/syn:small:text` | 196608 | **no** | 1 |
+| `gemini/models/gemini-flash-latest` | 262144 | yes | 2 (cloud, only when tier 1 is exhausted) |
+
+**Group name vs public name.** `router_settings.routing_groups` defines a
+`hybrid-model-pool` group (`routing_strategy: least-busy`) and
+`router_settings.model_group_alias` maps the public name
+`hybrid-model → hybrid-model-pool`. The split is required by the listings:
+`/model/info` — the endpoint **AiderDesk** reads to enumerate models — only
+contains deployments (`registry.all()`) and **alias rows**; a routing group
+never shows up there. With the public name on the group, `hybrid-model` existed
+in `/v1/models` (OpenWebUI lists it) but was invisible to AiderDesk. A group
+whose name is also a deployment or alias is *shadowed* by it (litellm warns
+`group_name ... is shadowed ... not callable until renamed`), and a self-alias
+emits no rows at all — measured on 1.111.
+
+**Tiers are callback policy, not `routing_strategy: priority`.** The native
+priority strategy picks **at random** inside a tier and forbids
+`routing_strategy_args`, so the tier is chosen by
+`async_filter_deployments` in `reasoning_clamp.py`: while at least one tier-1
+member is healthy the filter returns only those and `least-busy` balances them
+**by load**; `gemini-flash-latest` enters only when all four are in
+cooldown/down (log: `[reasoning_clamp] hybrid-model: N/M membri tier1 sani`).
+The same hook drops deployments declaring `supports_vision: false`
+(`syn:small:text`) when the request carries an image; the filter receives the
+**group** name (litellm resolves the alias before selection).
+
+**Group context is pinned to 196608** (`PINNED_CONTEXT`), the smallest real
+member window: `/v1/models` reports the *widest* limit of a group (and here it
+reports the user-chosen 229376/131072 via `register_model`), while `/model/info`
+reports the *narrowest* across the alias rows (196608/131072) — the honest
+number for compaction. Sizing the cascade on 524288 would push prompts past
+`syn:small:text`'s window and produce 400s upstream.
+
+**Compaction chain**: `small-model` then `synthetic/syn:small:text`
+(`COMPACTOR_OVERRIDE`) — the local worker first, the synthetic one when the PC
+is off.
+
+**Free reserves** (`groq/*`, `cloudflare/*`, `openrouter/*:free` — only free
+ids) are **not** group members (a wildcard member resolves to the literal
+pattern and sends `model="*"` upstream, a 400): `reasoning_clamp` picks up to 3
+concrete ids per request (context and vision aware, `openrouter/free` first) and
+passes them as **per-request `fallbacks`**, so they only fire once the whole
+group is exhausted.
+
+**Cooldowns**: every member carries `allowed_fails_policy` (503/429/timeout/
+5xx → 1 allowed fail) and `cooldown_time: 45`, so one infrastructure failure
+moves the request to another member instead of burning the global retries on a
+dead one.
+
 ## `reasoning_effort` handling (cascade)
 
 Rule: default `xhigh` where valid, otherwise fall down (`high`, `medium`, ...).
@@ -350,8 +409,8 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` has no fallback since 2026-10-28; 262144 for `local-model`,
-229376 for `small-model`, 131072 floor for the synthetic wildcard — real
+(`synthetic/*` has no fallback since 2026-10-28; 229376 for `local-model` and
+`small-model` since 2026-11-23, 131072 floor for the synthetic wildcard — real
 per-model contexts via `_window_for`).
 
 `reasoning_clamp.py` therefore clamps `max_tokens` (and
@@ -407,10 +466,11 @@ the clamp is useless — there is no room left for the answer — and the
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml` and with the
-`--ctx-size` actually passed to the engine** (2026-11-20: **262144** for
-`local-model`, Strata `--context 262144` on the RX 7800 XT, and **229376** for
-`small-model`, the largest `--ctx-size` that loads on the RTX 3060 — 262144
-dies in the load-time CUDA warm-up, 245760 leaves only 1148 MiB free).
+`--ctx-size` actually passed to the engine** (2026-11-23: **229376** for both
+`local-model` — Strata `--context 229376` on the RX 7800 XT, lowered from
+262144, verified on the engine with `GET /v1/models` — and `small-model`, the
+largest `--ctx-size` that loads on the RTX 3060 — 262144 dies in the load-time
+CUDA warm-up, 245760 leaves only 1148 MiB free).
 The old 163840 was a stale local cap: the clamp was budgeting 98k tokens less
 than the engine really had. **synthetic is
 13 explicit entries** (12 chat + the nomic embedding) with the real per-model contexts exposed on `/v1/models`
@@ -778,7 +838,7 @@ The context reported by `llama-server` is **`--ctx-size / -np`**: `-np 1`, so
 `small-model` exposes the whole **229376** (2026-11-20; the 262144 it declared
 before never loaded — CUDA OOM in the load-time warm-up — and every compaction
 call failed, which is what turned a big prompt into a 413). `local-model` is
-Strata, `--context 262144`. The upstream rejects oversized requests with its
+Strata, `--context 229376` since 2026-11-23 (was 262144). The upstream rejects oversized requests with its
 own 400 (see **Context clamp** above), consistent with `model_info` in config.
 A context flip must be kept in sync in **four** places: llama-swap's `cmd`
 (`--ctx-size`) and its `capabilities.context`, `config.yaml` (`model_info`),
@@ -804,11 +864,15 @@ llama-gate/gate.py
 openrouter-gw/gw.py
 cloudflare-gw/gw.py       # Workers AI gateway (REST listing -> /v1/models, filters, cache)
 provider-gw/gw.py         # generic gateway (ID_PREFIX / PATH_PRE / cache)
-.env                      # POSTGRES_PASSWORD for litellm-db — NOT committed
+.env                      # POSTGRES_PASSWORD + UI_USERNAME/UI_PASSWORD — NOT committed
 ```
 
 ## Security
 
 - `config/config.yaml` is in `.gitignore`: it contains real keys. Use
   `config/config.example.yaml` as the template.
+- `.env` is in `.gitignore` too: it holds `POSTGRES_PASSWORD` and the proxy UI
+  login (`UI_USERNAME` / `UI_PASSWORD`). `docker-compose.yml` only references
+  them (`${UI_USERNAME:?...}`), so a missing `.env` fails the boot instead of
+  starting the UI without a password.
 - No keys are present in the code or the compose file.

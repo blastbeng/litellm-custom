@@ -364,10 +364,16 @@ LLAMA_SWAP_MEDIA_PREFIX = "llama-swap/"
 # limite lo impone l'upstream. Valori ALLINEATI a config(.example).yaml:
 # un contesto cambiato li' va cambiato anche qui.
 CONTEXT_BY_PREFIX = (
-    # locali: 262144 dal 2026-11-20, ALLINEATI a
+    # GRUPPO hybrid-model: 196608 = il MINIMO vero tra i membri
+    # (syn:small:text). Duplicato in PINNED_CONTEXT (unica fonte usata da
+    # _window_for, che consulta questo valore solo come ultima spiaggia).
+    ("hybrid-model", 196608),
+    # locali: 229376 dal 2026-11-23, ALLINEATI a
     # /home/blast/.config/llama-swap/config.yaml su 192.168.1.29 (verificato
-    # il 2026-11-20). local-model (Strata, RX 7800 XT): --context 262144
-    # --kv k8v4 --vram-reserve-mib 2048. small-model (llama-server, RTX 3060
+    # con GET /v1/models: context_length 229376 su entrambi). local-model
+    # (Strata, RX 7800 XT): --context 229376 --kv k8v4
+    # --vram-reserve-mib 2048 (262144 fino al 2026-11-22).
+    # small-model (llama-server, RTX 3060
     # 12GB): --ctx-size 229376 --cache-type-k/v q4_0 -ngl all --fit off,
     # MISURATO: 262144 NON carica (CUDA OOM nel warm-up di load), 245760
     # carica, 229376 con ~2GB di margine -> dichiarato 229376. Il valore
@@ -380,7 +386,7 @@ CONTEXT_BY_PREFIX = (
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    ("local-model", 262144),
+    ("local-model", 229376),
     ("small-model", 229376),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
@@ -460,6 +466,91 @@ EFFORTS_BY_MODEL = (
 # Direttive equivalenti, in ordine di preferenza (direttiva utente 2026-11-14).
 EFFORT_HIGH_FAMILY = ("high", "max")
 DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
+
+# --- hybrid-model: gruppo least-busy con priorita' --------------------------
+# I membri stanno in config.yaml (router_settings.routing_groups); qui vive la
+# POLITICA. Tier 1 = i modelli "nostri" (locali + synthetic): hanno SEMPRE la
+# precedenza. Tier 2 = il cloud a consumo (gemini-flash-latest): entra solo a
+# tier 1 esaurito (tutti in cooldown/down). Il tier lo decide
+# async_filter_deployments, NON routing_strategy "priority": quella, entro il
+# tier, sceglie A CASO e vieta routing_strategy_args (misurato su 1.111),
+# mentre qui least-busy continua a bilanciare per carico dentro il tier.
+# Nome INTERNO del routing_group. Il nome PUBBLICO ("hybrid-model") e' un
+# model_group_alias verso questo: /model/info - l'endpoint che AiderDesk legge
+# per elencare i modelli - contiene SOLO deployment e righe ALIAS, mai i
+# routing_group (misurato: con il nome pubblico sul gruppo hybrid-model
+# esisteva in /v1/models ma NON in /model/info). Il filtro sotto riceve il
+# nome del GRUPPO (litellm risolve l'alias prima della selezione), mentre il
+# pre-call hook vede il nome mandato dal client: servono entrambi.
+HYBRID_GROUP = "hybrid-model-pool"
+HYBRID_PUBLIC = "hybrid-model"
+HYBRID_TIER1 = ("local-model", "small-model",
+                "synthetic/syn:large:text", "synthetic/syn:small:text")
+# Contesto del GRUPPO = MINIMO vero tra i membri (syn:small:text = 196608).
+# Va pinnato: _window_for preferisce il listing /v1/models, che per un GRUPPO
+# riporta il MASSIMO tra i membri (524288). Dimensionare la cascata su 524288
+# manderebbe prompt oltre la finestra di syn:small:text (400 upstream) e
+# produrrebbe max_tokens che i membri cloud rifiutano.
+PINNED_CONTEXT = {HYBRID_PUBLIC: 196608}
+# Riserve di ULTIMA RISORSA (free): le wildcard NON possono essere membri di
+# un routing_group - il pattern verrebbe scelto alla lettera e all'upstream
+# arriverebbe model="*" (400, misurato). Si espandono per-request dai listing
+# in cache (nomi CONCRETI) e si passano come fallbacks per-request: partono
+# solo a gruppo esaurito. openrouter: SOLO id gratuiti.
+HYBRID_RESERVE_PREFIXES = ("openrouter/", "cloudflare/", "groq/")
+HYBRID_RESERVE_MAX = 3
+
+
+def _register_hybrid_listing():
+    """Pubblica i limiti di hybrid-model in /v1/models.
+
+    Un routing_group NON ha deployment, quindi il listing_info del registro e'
+    None e /v1/models pubblicava il nome SENZA max_input_tokens/
+    max_output_tokens (OpenWebUI lo vedeva, ma senza limiti). Il listing pesca
+    i limiti dal cost map quando il gruppo non ne ha
+    (create_model_info_response -> _resolve_listing_model_info), quindi si
+    registra qui la entry col nome PUBBLICO, con i valori decisi dall'utente
+    (229376 input / 131072 output). Nota: AiderDesk NON usa /v1/models ma
+    /model/info, dove il gruppo compare grazie alle righe ALIAS di
+    model_group_alias (li' i limiti sono il MINIMO tra i membri, 196608).
+
+    Le capability sono quelle VERE del gruppo: vision e' supportata da tutti i
+    membri che restano eleggibili su una richiesta con immagine
+    (syn:small:text viene filtrato), quindi dichiararla e' corretto. Senza
+    queste chiavi litellm le tratterebbe come False e potrebbe scartare
+    parametri per una richiesta che i membri sanno gestire.
+    """
+    try:
+        import litellm as _litellm
+
+        # DUE nomi: /v1/models risolve l'ALIAS prima di cercare i limiti
+        # (create_model_info_response -> resolve_model_group_alias ->
+        # registry().group(target).listing_info, che per un routing_group e'
+        # None), quindi i limiti vanno sul nome del GRUPPO; sul nome pubblico
+        # servono se l'alias venisse rimosso dalla config.
+        # NIENTE "mode": quella chiave finisce in /v1/models e nelle UI che
+        # filtrano sul mode; i limiti bastano (richiesta utente 2026-11-23).
+        _caps = {
+            "max_input_tokens": 229376,
+            "max_output_tokens": 131072,
+            "max_tokens": 131072,
+            "litellm_provider": "openai",
+            "supports_vision": True,
+            "supports_function_calling": True,
+            "supports_parallel_function_calling": True,
+            "supports_response_schema": True,
+            "supports_reasoning": True,
+        }
+        _litellm.register_model({
+            HYBRID_PUBLIC: dict(_caps),
+            HYBRID_GROUP: dict(_caps),
+        })
+    except Exception as _err:      # mai bloccare l'import della callback
+        print(f"[reasoning_clamp] register_model({HYBRID_PUBLIC}) fallita: "
+              f"{type(_err).__name__}: {_err}", flush=True)
+
+
+_register_hybrid_listing()
 MIN_OUTPUT_TOKENS = 1024  # sotto questo una risposta reasoning non e' utile
 SAFETY_MARGIN = 1024      # margine per l'errore della stima
 # F-EVIT: ultima spiaggia prima del 413 - se il PROMPT da solo ci sta
@@ -531,7 +622,15 @@ COMPACTOR_MODELS = (
 # found"). La compattazione passa quindi a small-model: stesso llama-swap ma
 # processo/slot SEPARATO, quindi non aspetta lo slot di local-model.
 # Chiave = modello della richiesta, valore = compattatore che esegue B/T/T2/E.
-COMPACTOR_OVERRIDE = {"local-model": "small-model"}
+COMPACTOR_OVERRIDE = {
+    "local-model": "small-model",
+    # hybrid-model: il compattatore e' una CATENA ORDINATA. small-model e'
+    # quello dimensionato per questo (COMPACTOR_INPUT_TOKENS), ma e' locale:
+    # se e' offline la compattazione deve continuare con syn:small:text
+    # invece di fallire (richiesta utente 2026-11-23). Il primo che regge il
+    # corpo viene usato; il resto della cascata resta invariato.
+    "hybrid-model": ("small-model", "synthetic/syn:small:text"),
+}
 COMPACTOR_TIMEOUT_S = 45
 # Timeout per un compattatore DELEGATO (COMPACTOR_OVERRIDE): il locale che
 # eredita il lavoro puo' dover essere CARICATO da llama-swap (cold start) e il
@@ -870,6 +969,16 @@ _PROXY_MODELS_STARTED = [False]
 # (get_valid_models espande solo gli id): il clamp e il pool leggono QUI.
 _DYN_CTX = {}                  # id pubblico -> finestra (int)
 _DYN_EFFORTS = {}              # id pubblico -> tuple(esforzi supportati)
+# id pubblico -> accetta IMMAGINI in input (True/False). Solo i provider che
+# lo dichiarano nel listing finiscono qui (input_modalities /
+# architecture.input_modalities / supports_vision): CHI MANCA E' IGNOTO, non
+# text-only. Serve alla scelta delle riserve free di hybrid-model, dove un
+# modello text-only su una richiesta con immagine sarebbe un 400.
+_DYN_VISION = {}
+# ultimo stato (n tier1 sani, n totale) pubblicato nel log dal filtro dei
+# deployment di hybrid-model: si stampa solo quando CAMBIA, perche' l'hook
+# gira a ogni richiesta.
+_HYBRID_TIER_STATE = [None]
 _SWEEP_SEEN = [False]          # primo sweep contesti riuscito (log una volta)
 
 
@@ -1360,6 +1469,19 @@ def _fetch_pattern_models(name):
                 if isinstance(v, (int, float)) and v > 0:
                     _DYN_CTX[full] = int(v)
                     break
+            # capacita' VISION del modello (vedi _DYN_VISION): campo diverso
+            # per provider, quindi si provano le forme note e si lascia
+            # IGNOTO chi non dichiara nulla.
+            if isinstance(m, dict):
+                mods = m.get("input_modalities")
+                if mods is None and isinstance(m.get("architecture"), dict):
+                    mods = m["architecture"].get("input_modalities")
+                if isinstance(mods, (list, tuple)) and mods:
+                    _DYN_VISION[full] = any(
+                        str(x).strip().lower() in ("image", "vision")
+                        for x in mods)
+                elif isinstance(m.get("supports_vision"), bool):
+                    _DYN_VISION[full] = m["supports_vision"]
             # reasoning_effort supportati dal modello, quando il GATEWAY li
             # espone nel listing (cloudflare-gw li ricava da supported_efforts
             # di Workers AI). Prima questo campo veniva letto solo per le
@@ -1450,7 +1572,8 @@ MAP_ORIGIN = "context_map_reduce"
 #   vero a un browser/Xorg che cresce (ogni 16k di ctx costa ~215 MiB).
 #   Prefill: 1178 tok/s su codice denso -> 196k tok in ~167 s.
 #   local-model (RX 7800 XT 16GB, Strata, --vram-reserve-mib 2048): 262144
-#   regge, 15.0 GiB usati / 2.1 GiB liberi.
+#   reggeva (15.0 GiB usati) ma dal 2026-11-23 e' sceso a 229376, allineato
+#   a small-model, cosi' un solo numero vale per entrambi i locali.
 # Conseguenza del valore sbagliato: small-model moriva a OGNI richiesta
 # (84 crash CUDA in un giorno), la cascata restava senza operaio e finiva in
 # 413 "T2:no-gain" (incidente 2026-11-20 17:23, prompt 265182 tok).
@@ -1739,6 +1862,37 @@ def _tools_tiktoken(tool_texts):
         return None
 
 
+def _request_has_image(data):
+    """True se `data` contiene un'IMMAGINE in input.
+
+    Accetta il body completo della richiesta oppure la sola lista `messages`
+    e copre le due forme che attraversano questo stack: chat
+    (`{"type": "image_url", "image_url": {...}}`) e Responses
+    (`{"type": "input_image", ...}`, anche dentro function_call_output).
+    Nessuna scansione del testo: si guardano solo chiavi e tipi, con un tetto
+    di profondita' per non esplorare strutture patologiche."""
+    def scan(obj, depth=0):
+        if depth > 6:
+            return False
+        if isinstance(obj, dict):
+            if obj.get("type") in ("image_url", "input_image", "image"):
+                return True
+            if obj.get("image_url") is not None \
+                    or obj.get("input_image") is not None:
+                return True
+            return any(scan(v, depth + 1) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(scan(v, depth + 1) for v in obj)
+        return False
+
+    if data is None:
+        return False
+    try:
+        return scan(data)
+    except Exception:
+        return False
+
+
 class ReasoningClamp(CustomLogger):
 
     def _context_for(self, model):
@@ -1766,6 +1920,13 @@ class ReasoningClamp(CustomLogger):
         locali e' la finestra intera e nel registro e' <= finestra reale),
         3) mappa statica (minimo vero del gruppo). Cosi' syn:large:text
         usa davvero 512k e hf:openai/gpt-oss-120b resta a 131k senza 400."""
+        # PINNED PRIMA DI TUTTO: per un GRUPPO il listing litellm riporta il
+        # MASSIMO tra i membri (hybrid-model -> 524288), che e' il valore
+        # SBAGLIATO per dimensionare clamp e compattazione: il minimo vero e'
+        # 196608 (syn:small:text). Vedi PINNED_CONTEXT.
+        pinned = PINNED_CONTEXT.get(model)
+        if pinned:
+            return pinned
         ctx = _DYN_CTX.get(model)
         if ctx:
             return ctx
@@ -2028,12 +2189,28 @@ class ReasoningClamp(CustomLogger):
         compattare con se stessi su uno slot unico significa mettersi in coda
         dietro la richiesta e andare in TimeoutError (richiesta utente
         2026-11-02). Un override verso se stesso o vuoto vale come "nessun
-        override"."""
+        override".
+
+        Puo' restituire una TUPLA (catena ordinata di compattatori: e' il caso
+        di hybrid-model, vedi COMPACTOR_OVERRIDE). Chi deve solo NOMINARLI usa
+        _compactor_chain; chi li passa a _worker_pool puo' passare la tupla
+        cosi' com'e'."""
         m = str(model or "")
         ov = COMPACTOR_OVERRIDE.get(m)
         if ov and ov != m:
             return ov
         return model
+
+    def _compactor_chain(self, model):
+        """Lista ORDINATA dei compattatori da provare per `model`.
+
+        Esiste perche' _compactor_for puo' restituire una stringa (caso
+        normale) o una tupla (catena): chi deve iterare o comporre un
+        messaggio usa questa, senza duplicare il controllo di tipo."""
+        c = self._compactor_for(model)
+        if isinstance(c, (list, tuple)):
+            return [str(n) for n in c if n]
+        return [str(c)] if c else []
 
     async def _compact_with_provider(self, data, model, est):
         """Livello B: sintetizza la STORIA (tutto cio' che precede l'ultimo
@@ -2165,15 +2342,26 @@ class ReasoningClamp(CustomLogger):
         per tier: un solo candidato, valutato solo sul fatto che contenga il
         corpo. Un nome wildcard letterale resta sul pool dinamico perche'
         richiederebbe model="*" all'upstream (400/404 visto in produzione)."""
-        # solo = modello della richiesta da usare in ESCLUSIVA (vedi docstring)
-        solo = str(only) if only and "*" not in str(only) else None
+        # solo = modello/i della richiesta da usare in ESCLUSIVA (vedi
+        # docstring). `only` e' di norma una STRINGA; e' una SEQUENZA ORDINATA
+        # per le catene di COMPACTOR_OVERRIDE (hybrid-model: prima small-model
+        # e, se offline, syn:small:text): in quel caso conta l'ORDINE dato, non
+        # il tier - il primo che regge il corpo deve essere davvero il primo.
+        if isinstance(only, (list, tuple)):
+            only_seq = [str(n) for n in only if n]
+        elif only and "*" not in str(only):
+            only_seq = [str(only)]
+        else:
+            only_seq = []
+        only_set = set(only_seq)
         names = []
         dyn = {}
         _ensure_proxy_models_refresher()
         with _PROXY_MODELS_LOCK:
             dyn.update(_PROXY_MODELS_CACHE["models"])
-        if solo:
-            names = [solo]
+        if only_seq:
+            # niente espansione/dedup: la catena e' gia' di nomi concreti
+            names = [n for n in only_seq if "*" not in n]
         else:
             try:
                 from litellm.proxy.proxy_server import llm_router
@@ -2227,7 +2415,8 @@ class ReasoningClamp(CustomLogger):
             # ECCEZIONE: il modello della richiesta (solo) - e' gia' quello
             # scelto dal client, escluderlo toglierebbe del tutto B/T/T2/E
             # (richiesta utente 2026-10-28)
-            if n != solo and _worker_too_expensive(n):
+            if (not only_seq or n not in only_set) \
+                    and _worker_too_expensive(n):
                 return False
             # finestra REALE per-modello (gateway _DYN_CTX -> listing
             # litellm -> statico di gruppo): stessa fonte del clamp
@@ -2243,10 +2432,15 @@ class ReasoningClamp(CustomLogger):
             return True
 
         # tier di costo PRIMARIO, preferenza del livello secondaria: il pool
-        # e' gratis -> economico -> costoso a prescindere dalle liste preferred
-        ordered = [n for n in sorted(
-                    names, key=lambda n: (_model_tier(n), rank(n)))
-                if fits(n)]
+        # e' gratis -> economico -> costoso a prescindere dalle liste preferred.
+        # ECCEZIONE catena (`only` sequenza): l'ordine e' quello DATO dal
+        # chiamante e viene rispettato alla lettera.
+        if only_seq:
+            ordered = [n for n in names if fits(n)]
+        else:
+            ordered = [n for n in sorted(
+                        names, key=lambda n: (_model_tier(n), rank(n)))
+                    if fits(n)]
         # I modelli in QUARANTENA sono gia' esclusi da fits(), non demoti:
         # la cascata non deve sprecare un tentativo su chi ha appena fallito
         # (richiesta utente 2026-11-02). Se il pool resta vuoto si risale di
@@ -2652,9 +2846,15 @@ class ReasoningClamp(CustomLogger):
             # dimensionato sui contesti cloud piu' piccoli. Prima lo abbassava
             # soltanto, quindi il tetto locale non entrava mai in gioco e si
             # restava a 90000: il "piu' largo possibile" non aveva effetto.
-            cap = COMPACTOR_INPUT_TOKENS.get(self._compactor_for(model))
-            if cap:
-                limit_tokens = cap
+            # Con una CATENA di compattatori (hybrid-model) vale il tetto piu'
+            # LARGO della catena: il chunk deve stare nel primo che risponde,
+            # e il locale (small-model) e' comunque il piu' stretto - se e'
+            # offline il chunk resta valido anche per syn:small:text.
+            caps = [COMPACTOR_INPUT_TOKENS[n]
+                    for n in self._compactor_chain(model)
+                    if n in COMPACTOR_INPUT_TOKENS]
+            if caps:
+                limit_tokens = max(caps)
 
         def pieces(block):
             """(testo, token stimati): un blocco oltre il tetto viene spezzato
@@ -2749,7 +2949,8 @@ class ReasoningClamp(CustomLogger):
                          "grande -> C compressione BM25 -> T split+compress "
                          "della coda -> T2 compressione dei messaggi dopo "
                          "l'ultimo user -> E map/reduce, eseguiti con "
-                         f"{self._compactor_for(model)} -> T3 troncamento "
+                         f"{', '.join(self._compactor_chain(model))} -> "
+                         "T3 troncamento "
                          "deterministico) non ha "
                          "liberato spazio: riduci il contesto del client o "
                          "usa un modello con contesto maggiore"),
@@ -3102,6 +3303,16 @@ class ReasoningClamp(CustomLogger):
             # prefisso (local-model/small-model/embedding-model) e restano
             # nelle catene qui sopra. Vedi LLAMA_SWAP_MEDIA_PREFIX.
             data["fallbacks"] = []
+        elif model == HYBRID_PUBLIC:
+            # Riserve free di ULTIMA RISORSA (vedi HYBRID_RESERVE_PREFIXES):
+            # scelte ORA, per QUESTA richiesta (contesto e vision), e passate
+            # come fallbacks per-request -> partono SOLO se tutto il gruppo e'
+            # esaurito (i 5 membri in cooldown/down). Nel corpo della richiesta
+            # servono id CONCRETI: un nome wildcard qui manderebbe model="*"
+            # all'upstream (400), ed e' il motivo per cui la lista si calcola
+            # a ogni richiesta dai listing in cache.
+            data["fallbacks"] = self._hybrid_reserves(
+                self._estimate_prompt_tokens(data), _request_has_image(data))
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
             # openrouter/free, ollama/*, ollama-cloud/* e qualunque prefisso
@@ -3110,6 +3321,15 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = []
         # --- reasoning_effort per-provider ---
         eff = data.get("reasoning_effort")
+        if model == HYBRID_PUBLIC:
+            # Il gruppo mescola provider con vocabolari diversi e il membro lo
+            # si scopre solo DOPO la selezione, non qui: "xhigh"/"max" NON sono
+            # validi su Gemini (che accetta high/medium/low/minimal/none),
+            # quindi si normalizza a "high" - valore accettato da tutti i
+            # membri. Nessuna INIEZIONE quando il client non manda nulla:
+            # resta il default del membro scelto (richiesta utente 2026-11-23).
+            if eff in ("xhigh", "max"):
+                data["reasoning_effort"] = "high"
         if model.startswith("groq/"):
             native = model[len("groq/"):]
             if eff in ("xhigh", "max"):
@@ -3208,6 +3428,122 @@ class ReasoningClamp(CustomLogger):
             )
         return None
 
+    def _hybrid_reserves(self, needed_tokens, wants_image):
+        """Fino a HYBRID_RESERVE_MAX id CONCRETI di riserva free, per UNA
+        richiesta a hybrid-model.
+
+        Le wildcard (groq/*, cloudflare/*, openrouter/*) non possono essere
+        membri di un routing_group, quindi la riserva si risolve qui, per
+        singola richiesta, sui listing gia' in cache. Si scarta:
+          - chi non e' sotto HYBRID_RESERVE_PREFIXES;
+          - i NON-CHAT del listing (embed/whisper/guard/rerank) e i media;
+          - i modelli openrouter a PAGAMENTO (solo ":free"/"openrouter/free");
+          - i quarantenati;
+          - chi non contiene prompt + margine (contesto reale dal listing);
+          - chi dichiara di NON accettare immagini, se la richiesta ne ha.
+        Ordine: prima chi accetta immagini (quando servono), poi contesto piu'
+        largo, poi tier di costo, poi openrouter (endpoint free piu' stabile).
+        Non solleva mai: senza listing torna [] e il gruppo resta senza
+        riserve (comportamento identico a prima)."""
+        try:
+            _ensure_proxy_models_refresher()
+            with _PROXY_MODELS_LOCK:
+                known = dict(_PROXY_MODELS_CACHE["models"])
+            names = list(known)
+            for n in _DYN_CTX:
+                if n not in known:
+                    names.append(n)
+            budget = needed_tokens + self._margin(needed_tokens)
+            out = []
+            for n in names:
+                if not any(n.startswith(p) for p in HYBRID_RESERVE_PREFIXES):
+                    continue
+                if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
+                    continue
+                if n.startswith(LLAMA_SWAP_MEDIA_PREFIX):
+                    continue
+                if n.startswith("openrouter/") and not (
+                        n == "openrouter/free" or n.endswith(":free")):
+                    continue
+                if _quarantined(n):
+                    continue
+                win = _DYN_CTX.get(n) or known.get(n, (None, None))[0]
+                if win is not None and win < budget:
+                    continue
+                # VISION: si accetta solo chi dichiara ESPLICITAMENTE di
+                # accettare immagini (True nel listing). Il silenzio NON e' una
+                # promessa: cloudflare/groq non espongono le modalita', e un
+                # text-only su una richiesta con immagine e' un 400 certo.
+                if wants_image and _DYN_VISION.get(n) is not True:
+                    continue
+                out.append(n)
+            # "openrouter/free" per primo: e' il meta-router gratuito che
+            # sceglie da solo il miglior modello free disponibile lato
+            # OpenRouter (e' la richiesta esplicita dell'utente), poi contesto.
+            out.sort(key=lambda n: (
+                0 if n == "openrouter/free" else 1,
+                -(_DYN_CTX.get(n) or known.get(n, (0, None))[0] or 0),
+                _model_tier(n),
+                0 if n.startswith("openrouter/") else 1,
+            ))
+            return out[:HYBRID_RESERVE_MAX]
+        except Exception:
+            return []
+
+    async def async_filter_deployments(self, model, healthy_deployments,
+                                       messages=None, request_kwargs=None,
+                                       parent_otel_span=None):
+        """TIER di hybrid-model: i modelli "nostri" prima del cloud.
+
+        litellm invoca questo hook PRIMA della strategia del gruppo
+        (callback_filters stage, verificato su 1.111) e il risultato VINCOLA
+        la scelta: restituire i soli tier 1 fa si' che least-busy bilanci per
+        CARICO tra local-model/small-model/syn:large:text/syn:small:text e che
+        gemini-flash-latest entri SOLO quando nessuno di loro e' sano (tutti in
+        cooldown/down). La strategia nativa "priority" non sapeva farlo: entro
+        il tier sceglie A CASO e vieta routing_strategy_args.
+
+        Replica inoltre il pre-filtro vision nativo per i membri che
+        dichiarano supports_vision: False (syn:small:text): una richiesta con
+        immagine non deve mai finirci.
+
+        Fail-open su qualunque errore o per qualunque modello diverso: un
+        filtro non deve MAI rompere una richiesta."""
+        try:
+            # litellm risolve il model_group_alias PRIMA della selezione: qui
+            # arriva il nome del GRUPPO. Si accetta anche il nome pubblico per
+            # robustezza (se un giorno l'alias sparisce dalla config).
+            if str(model or "") not in (HYBRID_GROUP, HYBRID_PUBLIC):
+                return healthy_deployments
+            deps = [d for d in (healthy_deployments or [])
+                    if isinstance(d, dict)]
+            if not deps:
+                return healthy_deployments
+            wants_image = _request_has_image(
+                messages if messages is not None else request_kwargs)
+            eligible = [
+                d for d in deps
+                if not (wants_image
+                        and (d.get("model_info") or {}).get(
+                            "supports_vision") is False)
+            ]
+            if not eligible:
+                return deps
+            tier1 = [d for d in eligible
+                     if str(d.get("model_name") or "") in HYBRID_TIER1]
+            chosen = tier1 or eligible
+            state = (len(tier1), len(eligible))
+            if state != _HYBRID_TIER_STATE[0]:
+                _HYBRID_TIER_STATE[0] = state
+                print(f"[reasoning_clamp] {HYBRID_PUBLIC}: "
+                      f"{len(tier1)}/{len(eligible)} membri tier1 sani -> "
+                      + ("cloud in attesa" if tier1
+                         else "tier1 ESAURITO, si passa al cloud"),
+                      flush=True)
+            return chosen
+        except Exception:
+            return healthy_deployments
+
     async def async_filter_listed_models(self, user_api_key_dict, model_names):
         """Nasconde i modelli in quarantena dalle listing.
 
@@ -3218,6 +3554,11 @@ class ReasoningClamp(CustomLogger):
         l'orologio) e chi ha bisogno di quel modello puo' ancora chiederlo
         esplicitamente: qui si toglie solo dalla VETRINA.
         """
+        # NOTA: NON nascondere HYBRID_GROUP qui. litellm espande la richiesta
+        # anche agli ALIAS il cui target e' nascosto
+        # (_names_hidden_by_listing_callbacks), quindi nascondere il gruppo
+        # faceva sparire hybrid-model da /v1/models (misurato): il nome
+        # interno resta visibile, e' solo una entry in piu'.
         hidden = {n for n in model_names if _quarantined(n)}
         if not hidden:
             return model_names

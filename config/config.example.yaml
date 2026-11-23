@@ -54,11 +54,26 @@ model_list:
       # 10-20 minuti -> 30 min di tetto. PC spento: la gate 503 in ~2s.
       timeout: 1800
     model_info:
+      supports_vision: true
+      # Cooldown per il gruppo hybrid-model: UN fallo infrastrutturale
+      # (503/429/timeout/5xx) mette il deployment in cooldown 45s e il
+      # router passa a un altro membro, invece di bruciare i 3 retry
+      # globali su un membro morto. Le voci NOMINATE sono l'unico modo
+      # perche' valga anche su un gruppo a deployment singolo (litellm
+      # protegge i gruppi a un solo membro dal cooldown).
+      allowed_fails_policy: &hybrid_cooldown
+        ServiceUnavailableErrorAllowedFails: 1
+        RateLimitErrorAllowedFails: 1
+        TimeoutErrorAllowedFails: 1
+        BadGatewayErrorAllowedFails: 1
+        InternalServerErrorAllowedFails: 1
+      cooldown_time: 45
       id: local-qwen-backend
-      # contesto lato engine: 262144, allineato a llama-swap
-      # (capabilities.context e Strata --context). Deve restare il contesto
-      # VERO: reasoning_clamp dimensiona su questo la cascata di compattazione.
-      max_input_tokens: 262144
+      # contesto lato engine: 229376, allineato a llama-swap
+      # (capabilities.context e Strata --context, verificato 2026-11-23).
+      # Deve restare il contesto VERO: reasoning_clamp dimensiona su questo
+      # la cascata di compattazione.
+      max_input_tokens: 229376
       max_output_tokens: 131072
       max_tokens: 131072
 
@@ -75,6 +90,9 @@ model_list:
       api_key: dummy
       timeout: 1800
     model_info:
+      supports_vision: true
+      allowed_fails_policy: *hybrid_cooldown
+      cooldown_time: 45
       id: local-small-backend
       # 229376 = il piu' largo --ctx-size che carica sulla RTX 3060 12GB senza
       # OOM (262144 non carica, 245760 lascia solo 1148 MiB). Deve restare
@@ -237,6 +255,9 @@ model_list:
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
     model_info:
+      supports_vision: true
+      allowed_fails_policy: *hybrid_cooldown
+      cooldown_time: 45
       max_input_tokens: 524288
       max_output_tokens: 65536
       max_tokens: 65536
@@ -251,6 +272,12 @@ model_list:
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
     model_info:
+      supports_vision: false
+      # dichiarato TEXT-ONLY di proposito: e' il pre-filtro nativo di
+      # litellm (router_rust: has_image + declares_no_vision) a escluderlo
+      # dalle richieste con immagini dentro hybrid-model, senza callback.
+      allowed_fails_policy: *hybrid_cooldown
+      cooldown_time: 45
       max_input_tokens: 196608
       max_output_tokens: 65536
       max_tokens: 65536
@@ -454,6 +481,26 @@ model_list:
   # contesto piccolo.
   # reasoning gestito dalla callback reasoning_clamp (default
   # "high"; "xhigh" non e' un valore valido su Gemini).
+  # --- gemini-flash-latest: entry LETTERALE (membro di hybrid-model) -----
+  # La wildcard gemini/* espande i nomi nel LISTING ma NON crea deployment:
+  # un routing_group che nomina "gemini/models/gemini-flash-latest" viene
+  # ignorato in silenzio ("not in model_list"). Questa entry crea il
+  # deployment vero; per lo stesso nome vince l'ESATTA, quindi la wildcard
+  # resta intatta per tutti gli altri id Gemini. Contesto dichiarato =
+  # quello della wildcard (il listing Gemini non espone context_length).
+  - model_name: gemini/models/gemini-flash-latest
+    litellm_params:
+      model: openai/models/gemini-flash-latest
+      api_base: http://gemini-gw/v1beta/openai
+      api_key: YOUR_GEMINI_API_KEY
+    model_info:
+      id: gemini-flash-hybrid
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+      max_tokens: 65536
+      supports_vision: true
+      allowed_fails_policy: *hybrid_cooldown
+      cooldown_time: 45
   - model_name: gemini/*
     litellm_params:
       model: openai/*
@@ -645,6 +692,45 @@ litellm_settings:
   # resta alcuna lista statica di fallback.
 
 router_settings:
+  routing_groups:
+    # --- hybrid-model: gruppo least-busy, priorita' ai 4 preferiti --------
+    # 5 deployment CONCRETI. Un routing_group NON accetta wildcard: il
+    # pattern verrebbe scelto alla lettera e all'upstream arriverebbe
+    # model="*" -> 400 (misurato); e un nome espanso dalla wildcard non e'
+    # un deployment -> membro ignorato con un warning.
+    # least-busy opera DENTRO il tier scelto da async_filter_deployments
+    # (reasoning_clamp): finche' almeno uno dei 4 preferiti (local-model,
+    # small-model, syn:large:text, syn:small:text) e' sano, il filtro
+    # restituisce solo quelli e least-busy li bilancia per carico;
+    # gemini-flash-latest entra solo quando i 4 sono tutti in cooldown/down.
+    # E' la priorita' VERA: la strategia "priority" nativa entro il tier
+    # sceglie a caso, non per carico, e vieta routing_strategy_args.
+    # I free (groq/*, cloudflare/*, openrouter/*:free) non sono membri: sono
+    # il salto di ULTIMA RISORSA, scelto per-request da reasoning_clamp in
+    # base a contesto e vision (litellm_params.fallbacks per-request).
+      - group_name: hybrid-model-pool
+        models:
+          - local-model
+          - small-model
+          - synthetic/syn:large:text
+          - synthetic/syn:small:text
+          - gemini/models/gemini-flash-latest
+        routing_strategy: least-busy
+  # --- alias PUBBLICO di hybrid-model ------------------------------------
+  # /model/info - l'endpoint che AiderDesk interroga per elencare i modelli -
+  # contiene SOLO i deployment (registry.all()) e le righe alias: un
+  # routing_group NON ci compare mai. Con il nome pubblico sul gruppo, quindi,
+  # hybrid-model esisteva in /v1/models (OpenWebUI lo vedeva) ma non in
+  # /model/info (AiderDesk no). Ora il gruppo ha un nome interno e il nome
+  # pubblico e' un alias: le richieste vengono instradate nel gruppo e le righe
+  # alias (nome + limiti reali dei membri) compaiono in /model/info.
+  # Limiti mostrati in /model/info = MINIMO tra i membri (syn:small:text =
+  # 196608), che e' il vero tetto del gruppo (PINNED_CONTEXT in
+  # reasoning_clamp). L'alias su se stesso NON funziona: litellm avvisa
+  # "group_name '...' is shadowed ... not callable until renamed" e non emette
+  # righe alias (misurato su 1.111).
+  model_group_alias:
+    hybrid-model: hybrid-model-pool
   # enable_pre_call_checks DISATTIVO: con le wildcard i nomi espansi non
   # esistono nel registry statico di litellm e i pre-call checks sollevano
   # ModelNotMappedError PRIMA della chiamata, deviando tutto silenziosamente

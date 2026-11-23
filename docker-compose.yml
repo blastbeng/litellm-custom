@@ -53,6 +53,12 @@ services:
       # (run_server(--skip_server_startup) + prisma generate): nessuno step
       # manuale. Il primo start e' piu' lento: aspettare il healthcheck.
       DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@litellm-db:5432/litellm
+      # Login della UI del proxy (/ui). Le credenziali stanno SOLO in .env
+      # (gitignored): il compose tracciato contiene solo i riferimenti, cosi'
+      # nessuna password finisce su GitHub. ":?" fa fallire il recreate se
+      # mancano, invece di lasciare la UI raggiungibile senza login.
+      UI_USERNAME: ${UI_USERNAME:?set UI_USERNAME in .env}
+      UI_PASSWORD: ${UI_PASSWORD:?set UI_PASSWORD in .env}
     # Tetto ALTO: litellm non deve essere OOM-killed (ogni kill tronca gli
     # stream in corso -> TransferEncodingError lato OpenWebUI), quindi 2g di
     # RAM + 1g di swap. Base osservata ~600MB; il vecchio 1g/1g moriva a
