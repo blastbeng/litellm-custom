@@ -69,11 +69,11 @@ model_list:
         InternalServerErrorAllowedFails: 1
       cooldown_time: 45
       id: local-qwen-backend
-      # contesto lato engine: 229376, allineato a llama-swap
-      # (capabilities.context e Strata --context, verificato 2026-11-23).
+      # contesto lato engine: 196608, allineato a llama-swap
+      # (capabilities.context e Strata --context, 2026-11-23).
       # Deve restare il contesto VERO: reasoning_clamp dimensiona su questo
       # la cascata di compattazione.
-      max_input_tokens: 229376
+      max_input_tokens: 196608
       max_output_tokens: 131072
       max_tokens: 131072
 
@@ -94,11 +94,11 @@ model_list:
       allowed_fails_policy: *hybrid_cooldown
       cooldown_time: 45
       id: local-small-backend
-      # 229376 = il piu' largo --ctx-size che carica sulla RTX 3060 12GB senza
-      # OOM (262144 non carica, 245760 lascia solo 1148 MiB). Deve restare
-      # ALLINEATO a llama-swap: se small-model muore la cascata di
-      # reasoning_clamp resta senza operaio e va in 413.
-      max_input_tokens: 229376
+      # 196608 = --ctx-size scelto dal 2026-11-23 per ENTRAMBI i locali
+      # (sulla RTX 3060 12GB 262144 non carica: CUDA OOM nel warm-up di load).
+      # Deve restare ALLINEATO a llama-swap: se small-model muore la cascata
+      # di reasoning_clamp resta senza operaio e va in 413.
+      max_input_tokens: 196608
       max_output_tokens: 131072
       max_tokens: 131072
 

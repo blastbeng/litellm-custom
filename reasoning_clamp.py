@@ -369,17 +369,17 @@ CONTEXT_BY_PREFIX = (
     # (syn:small:text). Duplicato in PINNED_CONTEXT (unica fonte usata da
     # _window_for, che consulta questo valore solo come ultima spiaggia).
     ("hybrid-model", 196608),
-    # locali: 229376 dal 2026-11-23, ALLINEATI a
-    # /home/blast/.config/llama-swap/config.yaml su 192.168.1.29 (verificato
-    # con GET /v1/models: context_length 229376 su entrambi). local-model
-    # (Strata, RX 7800 XT): --context 229376 --kv k8v4
-    # --vram-reserve-mib 2048 (262144 fino al 2026-11-22).
-    # small-model (llama-server, RTX 3060
-    # 12GB): --ctx-size 229376 --cache-type-k/v q4_0 -ngl all --fit off,
-    # MISURATO: 262144 NON carica (CUDA OOM nel warm-up di load), 245760
-    # carica, 229376 con ~2GB di margine -> dichiarato 229376. Il valore
-    # 163840 usato fino a ieri era solo una riduzione per RAM/VRAM rimasta
-    # qui a mano: il clamp lavorava con 98k di stanza in meno. synthetic: i
+    # locali: 196608 dal 2026-11-23, ALLINEATI a
+    # /home/blast/.config/llama-swap/config.yaml su 192.168.1.29. local-model
+    # (Strata, RX 7800 XT): --context 196608 --kv k8v4
+    # --vram-reserve-mib 2048 (262144 fino al 2026-11-22, 229376 fino al
+    # 2026-11-23). small-model (llama-server, RTX 3060 12GB): --ctx-size
+    # 196608 --cache-type-k/v q4_0 -ngl all --fit off - MISURATO: 262144 NON
+    # carica (CUDA OOM nel warm-up di load), 245760 lascia 1148 MiB.
+    # Stesso numero per entrambi i locali: 196608 = anche il MINIMO del
+    # gruppo hybrid-model. Il valore 163840 usato in passato era solo una
+    # riduzione per RAM/VRAM rimasta qui a mano: il clamp lavorava con 98k di
+    # stanza in meno. synthetic: i
     # 13 modelli sono entry ESPLICITE in config
     # dal 2026-10-06 -> qui sotto i contesti REALI per-modello (misurati sui
     # listing di api.synthetic.new). INCIDENTE 2026-10-06: GLM-5.3-Flash
@@ -387,8 +387,8 @@ CONTEXT_BY_PREFIX = (
     # di compattazione AVVIATA E INUTILE e 413 su un prompt che C'ENTRAVA
     # (est 148443 < 524288, _DYN_CTX vuoto al momento dell'incidente): la
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
-    ("local-model", 229376),
-    ("small-model", 229376),
+    ("local-model", 196608),
+    ("small-model", 196608),
     ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
     # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti
@@ -510,8 +510,9 @@ def _register_hybrid_listing():
     max_output_tokens (OpenWebUI lo vedeva, ma senza limiti). Il listing pesca
     i limiti dal cost map quando il gruppo non ne ha
     (create_model_info_response -> _resolve_listing_model_info), quindi si
-    registra qui la entry col nome PUBBLICO, con i valori decisi dall'utente
-    (229376 input / 131072 output). Nota: AiderDesk NON usa /v1/models ma
+    registra qui la entry col nome PUBBLICO con il contesto VERO del gruppo
+    (196608 input / 131072 output, come PINNED_CONTEXT). Nota: AiderDesk NON
+    usa /v1/models ma
     /model/info, dove il gruppo compare grazie alle righe ALIAS di
     model_group_alias (li' i limiti sono il MINIMO tra i membri, 196608).
 
@@ -532,7 +533,7 @@ def _register_hybrid_listing():
         # NIENTE "mode": quella chiave finisce in /v1/models e nelle UI che
         # filtrano sul mode; i limiti bastano (richiesta utente 2026-11-23).
         _caps = {
-            "max_input_tokens": 229376,
+            "max_input_tokens": 196608,
             "max_output_tokens": 131072,
             "max_tokens": 131072,
             "litellm_provider": "openai",
@@ -1578,12 +1579,12 @@ MAP_ORIGIN = "context_map_reduce"
 #   small-model (RTX 3060 12GB, Ornith-1.5-9B Q4_K_M + mmproj Q8, KV q4_0,
 #   --fit off): --ctx-size 262144 NON CARICA (CUDA OOM dentro
 #   server_context_impl::load_model -> il warm-up decodifica l'intero
-#   contesto), 245760 carica con 1148 MiB liberi, 229376 con ~1.3 GiB liberi
-#   (desktop incluso). Scelto 229376: e' il piu' largo che lascia margine
-#   vero a un browser/Xorg che cresce (ogni 16k di ctx costa ~215 MiB).
+#   contesto), 245760 carica con 1148 MiB liberi. Dal 2026-11-23 il
+#   --ctx-size e' 196608 su ENTRAMBI i locali: lascia margine vero a un
+#   browser/Xorg che cresce (ogni 16k di ctx costa ~215 MiB).
 #   Prefill: 1178 tok/s su codice denso -> 196k tok in ~167 s.
 #   local-model (RX 7800 XT 16GB, Strata, --vram-reserve-mib 2048): 262144
-#   reggeva (15.0 GiB usati) ma dal 2026-11-23 e' sceso a 229376, allineato
+#   reggeva (15.0 GiB usati) ma dal 2026-11-23 e' sceso a 196608, allineato
 #   a small-model, cosi' un solo numero vale per entrambi i locali.
 # Conseguenza del valore sbagliato: small-model moriva a OGNI richiesta
 # (84 crash CUDA in un giorno), la cascata restava senza operaio e finiva in
@@ -1602,8 +1603,8 @@ MAP_ORIGIN = "context_map_reduce"
 #     ~700-900 tok/s + 1187 token di sintesi a ~23 tok/s). Il tetto a 131072
 #     non serve piu'.
 #   - 163840 = 20 x 8192: il piu' largo che resta dentro UNA chiamata
-#     (MAP_TIMEOUT_S 420 s) con margine; il contesto del motore (229376)
-#     lascia ~65k token per output + template, e la richiesta FINALE (non il
+#     (MAP_TIMEOUT_S 420 s) con margine; il contesto del motore (196608)
+#     lascia ~33k token per output + template, e la richiesta FINALE (non il
 #     chunk) resta li'.
 # Oltre: un chunk da 196k costa ~350 s di solo prefill e sfonda il budget di
 # livello (WORKER_TIME_BUDGET_S) al primo chunk -> riassunti parziali.

@@ -315,8 +315,8 @@ except for their tier:
 
 | Member | Context (input) | Vision | Tier |
 |---|---|---|---|
-| `local-model` | 229376 | yes | 1 |
-| `small-model` | 229376 | yes | 1 |
+| `local-model` | 196608 | yes | 1 |
+| `small-model` | 196608 | yes | 1 |
 | `synthetic/syn:large:text` | 524288 | yes | 1 |
 | `synthetic/syn:small:text` | 196608 | **no** | 1 |
 | `gemini/models/gemini-flash-latest` | 262144 | yes | 2 (cloud, only when tier 1 is exhausted) |
@@ -355,9 +355,9 @@ counts differ.
 
 **Group context is pinned to 196608** (`PINNED_CONTEXT`), the smallest real
 member window: `/v1/models` reports the *widest* limit of a group (and here it
-reports the user-chosen 229376/131072 via `register_model`), while `/model/info`
-reports the *narrowest* across the alias rows (196608/131072) — the honest
-number for compaction. Sizing the cascade on 524288 would push prompts past
+reports 196608/131072 via `register_model`, the group's real ceiling), while
+`/model/info` reports the *narrowest* across the alias rows (196608/131072) —
+the same honest number for compaction. Sizing the cascade on 524288 would push prompts past
 `syn:small:text`'s window and produce 400s upstream.
 
 **Compaction chain**: `small-model` then `synthetic/syn:small:text`
@@ -418,7 +418,7 @@ About tab → Model settings in its web page; a prompt that leaves no room at
 all is still refused). With
 `enable_pre_call_checks: false` litellm performs **no** context check at all,
 so a big-prompt request kills the **whole fallback chain**
-(`synthetic/*` has no fallback since 2026-10-28; 229376 for `local-model` and
+(`synthetic/*` has no fallback since 2026-10-28; 196608 for `local-model` and
 `small-model` since 2026-11-23, 131072 floor for the synthetic wildcard — real
 per-model contexts via `_window_for`).
 
@@ -475,11 +475,10 @@ the clamp is useless — there is no room left for the answer — and the
 
 Contexts live in `CONTEXT_BY_PREFIX` in `reasoning_clamp.py` and **must stay
 aligned with `model_info.max_input_tokens` in `config.yaml` and with the
-`--ctx-size` actually passed to the engine** (2026-11-23: **229376** for both
-`local-model` — Strata `--context 229376` on the RX 7800 XT, lowered from
-262144, verified on the engine with `GET /v1/models` — and `small-model`, the
-largest `--ctx-size` that loads on the RTX 3060 — 262144 dies in the load-time
-CUDA warm-up, 245760 leaves only 1148 MiB free).
+`--ctx-size` actually passed to the engine** (2026-11-23: **196608** for both
+`local-model` — Strata `--context 196608` on the RX 7800 XT, lowered from
+262144 — and `small-model` — 262144 dies in the RTX 3060 load-time CUDA
+warm-up, 245760 leaves only 1148 MiB free).
 The old 163840 was a stale local cap: the clamp was budgeting 98k tokens less
 than the engine really had. **synthetic is
 13 explicit entries** (12 chat + the nomic embedding) with the real per-model contexts exposed on `/v1/models`
@@ -844,10 +843,11 @@ without restarting anything. `trust/` contains **only** the public bundle —
 ### Note on llama-server (local model)
 
 The context reported by `llama-server` is **`--ctx-size / -np`**: `-np 1`, so
-`small-model` exposes the whole **229376** (2026-11-20; the 262144 it declared
-before never loaded — CUDA OOM in the load-time warm-up — and every compaction
-call failed, which is what turned a big prompt into a 413). `local-model` is
-Strata, `--context 229376` since 2026-11-23 (was 262144). The upstream rejects oversized requests with its
+`small-model` exposes the whole **196608** (2026-11-23; 229376 before, and the
+262144 it declared earlier never loaded — CUDA OOM in the load-time warm-up —
+and every compaction call failed, which is what turned a big prompt into a
+413). `local-model` is Strata, `--context 196608` since 2026-11-23 (was
+229376, and 262144 before that). The upstream rejects oversized requests with its
 own 400 (see **Context clamp** above), consistent with `model_info` in config.
 A context flip must be kept in sync in **four** places: llama-swap's `cmd`
 (`--ctx-size`) and its `capabilities.context`, `config.yaml` (`model_info`),
