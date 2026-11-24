@@ -108,7 +108,7 @@ model_list:
   # vedi reasoning_clamp): il modello embedding e' servito dall'endpoint
   # /v1/embeddings di synthetic.new (non compare nel listing chat) e quando
   # non disponibile la richiesta cade qui (llama-swap: Qwen3-Embedding-0.6b
-  # su CPU, contesto 16384 dichiarato da llama-server). Stessa gate di
+  # su CPU, contesto 32768 dichiarato da llama-server). Stessa gate di
   # local-model/small-model: PC spento = 503 in ~2s.
   - model_name: embedding-model
     litellm_params:
@@ -118,8 +118,8 @@ model_list:
       timeout: 1800
     model_info:
       id: local-embedding-backend
-      # contesto dichiarato da llama-swap per l'embedding model
-      max_input_tokens: 16384
+      # contesto dichiarato da llama-swap per l'embedding model (32768 dal 2026-11-24, prima 16384); vettori 1024-dim
+      max_input_tokens: 32768
 
   # --- Modelli MEDIA di llama-swap (PC 192.168.1.29): img/vid/tts/music ---
   # (richiesta utente 2026-10-16) llama-swap espone TUTTI i suoi modelli su

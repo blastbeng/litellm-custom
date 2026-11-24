@@ -338,7 +338,7 @@ SYN_SMALL_VISION_FALLBACKS = list(SYN_SMALL_TEXT_FALLBACKS)
 # modello EMBEDDING su synthetic.new, servito dall'endpoint /v1/embeddings
 # ("api.synthetic.new/openai/v1/embeddings", non compare nel listing chat
 # di synthetic). Quando non disponibile cade su llama-swap: "embedding-model"
-# (Qwen3-Embedding-0.6b su CPU, contesto 16384). Catena a UN solo target:
+# (Qwen3-Embedding-0.6b su CPU, contesto 32768). Catena a UN solo target:
 # gli altri modelli llama-swap sono CHAT e su una richiesta embedding
 # risponderebbero 400 - nessun gradino dopo.
 SYN_EMBED = "synthetic/hf:nomic-ai/nomic-embed-text-v1.5"
@@ -389,7 +389,7 @@ CONTEXT_BY_PREFIX = (
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
     ("local-model", 196608),
     ("small-model", 196608),
-    ("embedding-model", 16384),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
+    ("embedding-model", 32768),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
     # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti
     # "GLM-5.3" catturerebbe anche "-Flash" a prescindere dall'ordine).
