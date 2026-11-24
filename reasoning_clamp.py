@@ -523,7 +523,7 @@ HYBRID_SPLIT_WEIGHTS = {"synthetic/syn:large:text": 0.6,
 # riporta il MASSIMO tra i membri (524288). Dimensionare la cascata su 524288
 # manderebbe prompt oltre la finestra di syn:small:text (400 upstream) e
 # produrrebbe max_tokens che i membri cloud rifiutano.
-PINNED_CONTEXT = {HYBRID_PUBLIC: 196608}
+PINNED_CONTEXT = {HYBRID_PUBLIC: 196608, HYBRID_GROUP: 196608}
 # Riserve di ULTIMA RISORSA (free): le wildcard NON possono essere membri di
 # un routing_group - il pattern verrebbe scelto alla lettera e all'upstream
 # arriverebbe model="*" (400, misurato). Si espandono per-request dai listing
@@ -531,6 +531,18 @@ PINNED_CONTEXT = {HYBRID_PUBLIC: 196608}
 # solo a gruppo esaurito. openrouter: SOLO id gratuiti.
 HYBRID_RESERVE_PREFIXES = ("openrouter/", "cloudflare/", "groq/")
 HYBRID_RESERVE_MAX = 3
+
+# CATENA di ripiego di hybrid-model quando il membro scelto non risponde
+# (quota 402, 429, 5xx, timeout): i NOSTRI modelli locali PRIMA di tutto,
+# in quest'ordine (richiesta utente 2026-11-24: "finiti i quota, usa i
+# modelli locali, prima local-model poi small-model"), e solo DOPO le
+# riserve free di HYBRID_RESERVE_PREFIXES. Non e' una rotazione: questi
+# nomi vengono provati solo quando il gruppo ha gia' fallito.
+# NOTA: qui small-model entra nella catena di UN SOLO modello (il gruppo),
+# che lo contiene gia' come membro del tier 2; la regola del 2026-10-25
+# ("small-model non e' fallback di nessuno") vale per le richieste DIRETTE,
+# che infatti restano con fallbacks=[] (vedi il ramo `model == "small-model"`).
+HYBRID_LOCALS = ("local-model", "small-model")
 
 
 def _register_hybrid_listing():
@@ -727,7 +739,7 @@ TIER_PAID = 2    # tutto il resto (gemini-pro, claude sonnet/opus, gpt-5...)
 # NB "-mini" col trattino: "gemini" CONTIENE "mini" e classificherebbe
 # tutti i Gemini come economici
 CHEAP_PATTERNS = (
-    "gpt-oss", "flash-lite", "flash", "lite", "gemma", "syn:small", "small",
+    "gpt-oss", "flash-lite", "flash", "lite", "gemma", "syn:large", "syn:small", "small",
     "qwen", "qwq", "nano", "-mini", "haiku", "deepseek", "glm", "kimi",
     "moonshot", "llama", "mistral-small", "ministral", "pixtral", "minimax",
     "phi-", "phi3", "phi4", "nemotron", "falcon", "tiny",
@@ -760,7 +772,8 @@ def _model_tier(n):
     if ("free" in brand or brand == "ollama-cloud"
             or s == "openrouter/free"):
         return TIER_FREE
-    if s in ("small-model", "local-model"):
+    if s in ("small-model", "local-model", "ollama/small-model",
+             "embedding-model"):
         return TIER_FREE
     low = s.lower()
     if any(p in low for p in CHEAP_PATTERNS):
@@ -807,6 +820,10 @@ EXPENSIVE_WORKER_RES = tuple(re.compile(p) for p in (
 WORKER_CHEAP_OVERRIDE_RES = tuple(re.compile(p) for p in (
     r"flash", r"mini", r"nano", r"lite", r"small", r"tiny", r"haiku",
     r"fast", r"free", r"air",
+    # nomi interni synthetic: 'large'/'max' in syn:large:text sono NOMI,
+    # non flagship; senza questo override il modello primario del gruppo
+    # veniva escluso dal pool operai per il solo pattern di nome.
+    r"syn:(?:large|small)",
 ))
 
 WEB_PRICES_URL = os.environ.get(
@@ -1399,14 +1416,19 @@ def _quar_note_ok(w):
 def _quar_failure_kind(exc):
     """Etichetta del guasto se e' colpa del MODELLO, altrimenti None.
 
-    Contano solo i guasti del provider: rate limit, 5xx, timeout, errore di
-    connessione. Un 400/401/404 o un context overflow sono errori NOSTRI
-    (parametri, chiave, prompt troppo lungo): mettere in quarantena il modello
-    per quelli nasconderebbe modelli sani.
+    Contano solo i guasti del provider: rate limit, quota esaurito, 5xx,
+    timeout, errore di connessione. Un 400/401/404 o un context overflow sono
+    errori NOSTRI (parametri, chiave, prompt troppo lungo): mettere in
+    quarantena il modello per quelli nasconderebbe modelli sani.
+    Il 402 e' colpa del provider (il conto finisce) e va contato come il 429:
+    un modello senza credito non e' utile finche' non viene ricaricato, e
+    tenerlo in vetrina fa partire richieste che falliscono di sicuro.
     """
     code = getattr(exc, "status_code", None)
     if code == 429:
         return "rate-limit"
+    if code == 402:
+        return "quota-402"
     if isinstance(code, int) and 500 <= code <= 599:
         return f"http-{code}"
     name = type(exc).__name__
@@ -1420,6 +1442,91 @@ def _quar_failure_kind(exc):
             or "BadGateway" in name):
         return "server"
     return None
+
+
+# ---------------------------------------------------------------------------
+# QUOTA ESAURITA (402) per singolo deployment
+# ---------------------------------------------------------------------------
+# Un 402 NON e' un guasto transitorio e litellm NON lo mette in cooldown (la
+# sua cooldown list riguarda 429/5xx/timeout), cosi' un membro di hybrid-model
+# senza credito resta "sano" e least-busy continua a scegliere lui: ogni
+# richiesta pagherebbe il round-trip del 402 prima di cadere sui locali. Qui si
+# tiene la MEMORIA del 402 per il modello CONCRETO dell'upstream (chiave =
+# litellm_params.model, es. "openai/syn:large:text") e async_filter_deployments
+# lo scarta dal tier finche' il TTL non scade: il tier si restringe sui membri
+# che possono davvero rispondere, e a quota zero resta solo il locale.
+# TTL CORTO perche' il quota puo' essere ricaricato: scaduto lui il membro
+# viene riprovato, e un nuovo 402 lo rimette fuori subito.
+HYBRID_QUOTA_S = 300            # 5 min: quanto un 402 tiene fuori un membro
+_QUOTA_OUT = {}                 # modello concreto -> fino a quando (monotonic)
+_QUOTA_LOCK = threading.Lock()
+
+
+def _quota_note(model):
+    """Segna `model` (il modello CONCRETO dell'upstream) a quota esaurita.
+
+    I nomi pubblici del gruppo (hybrid-model / hybrid-model-pool) NON si
+    segnano: una richiesta al gruppo passa per UN membro, e segnare il gruppo
+    significherebbe escluderli tutti. Pulisce le voci scadute ad ogni
+    scrittura, cosi' la mappa resta piccola senza thread di pulizia."""
+    if not model:
+        return
+    name = str(model)
+    if name in (HYBRID_PUBLIC, HYBRID_GROUP):
+        return
+    now = time.monotonic()
+    with _QUOTA_LOCK:
+        for k in [k for k, v in _QUOTA_OUT.items() if v <= now]:
+            _QUOTA_OUT.pop(k, None)
+        fresh = _QUOTA_OUT.get(name, 0) <= now
+        _QUOTA_OUT[name] = now + HYBRID_QUOTA_S
+    if fresh:
+        print(f"[reasoning_clamp] quota esaurita (402) per {name} -> fuori dal "
+              f"gruppo hybrid per {HYBRID_QUOTA_S // 60}m (la catena passa ai "
+              f"locali)", flush=True)
+
+
+def _quota_out(model):
+    """True se `model` e' a quota esaurita ADESSO.
+
+    Lettura lock-free come _quarantined: get atomico sotto GIL e scadenza
+    verificata sul monotonic corrente, cosi' il membro rientra da solo."""
+    if not model:
+        return False
+    until = _QUOTA_OUT.get(str(model))
+    return bool(until and until > time.monotonic())
+
+
+def _config_supports_vision(name):
+    """True se la CONFIG dichiara supports_vision per il modello `name`.
+
+    _DYN_VISION si popola SOLO dai listing dei pattern (le wildcard), quindi
+    i modelli STATICI di config (local-model, small-model) non ci sono mai:
+    fidarsi solo di _DYN_VISION vorrebbe dire che una richiesta con immagine
+    perde i locali dalla catena anche se la config PROMETTE espressamente che
+    accettano immagini. Il silenzio resta silenzio: niente voce, niente
+    promessa (vedi il commento analogo in _hybrid_reserves)."""
+    try:
+        from litellm.proxy.proxy_server import llm_router
+        if llm_router is None:
+            return False
+        try:
+            deps = llm_router.registry().all()
+        except Exception:
+            deps = getattr(llm_router, "model_list", None) or []
+        for dep in (deps or []):
+            get = getattr(dep, "get", None)
+            if get is None:
+                continue
+            if str(get("model_name") or "") != str(name):
+                continue
+            info = get("model_info")
+            get_info = getattr(info, "get", None)
+            if get_info is not None:
+                return get_info("supports_vision") is True
+        return False
+    except Exception:
+        return False
 
 
 def _price_usd_per_token(v):
@@ -2009,6 +2116,11 @@ class ReasoningClamp(CustomLogger):
         for pref, ctx in CONTEXT_BY_PREFIX:
             if model.startswith(pref):
                 return ctx
+        # Il routing_group interno ("hybrid-model-pool") non ha entry nella
+        # tabella statica: pinnare il contesto del gruppo (196608) anche qui,
+        # altrimenti il clamp lavorerebbe con DEFAULT_CONTEXT 131072.
+        if model in (HYBRID_PUBLIC, HYBRID_GROUP):
+            return PINNED_CONTEXT[HYBRID_PUBLIC]
         return DEFAULT_CONTEXT
 
     def _window_for(self, model):
@@ -2384,12 +2496,25 @@ class ReasoningClamp(CustomLogger):
         questo viene dopo B."""
         from litellm.compression import compress
         from litellm.types.utils import CallTypes
-        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        # Sanitizzazione prima di lasciare passare i messaggi a litellm: la
+        # v1.111.0 di litellm.compression fa content.count("\n") su ogni
+        # messaggio da stub (stub_message) SENZA gestire content=None
+        # (es. assistant con tool_calls: content None e' valido OpenAI).
+        # Senza questa normalizzazione l'AttributeError:'NoneType' object
+        # has no attribute 'count' uccide il livello C e la cascata salta.
+        msgs = []
+        for m in (data.get("messages") or []):
+            if not isinstance(m, dict):
+                continue
+            m = dict(m)
+            if m.get("content") is None:
+                m["content"] = ""
+            msgs.append(m)
         if len(msgs) < 3:
             return None, "too-few-messages"
         ctx = self._window_for(model)
         target = max(MIN_OUTPUT_TOKENS * 2, int(ctx * COMPRESS_TARGET_RATIO))
-        res = compress(messages=list(msgs), model=model,
+        res = compress(messages=msgs, model=model,
                        call_type=CallTypes.completion,
                        compression_trigger=1, compression_target=target)
         after = int(res.get("compressed_tokens") or 0)
@@ -3338,6 +3463,11 @@ class ReasoningClamp(CustomLogger):
         # Regola (richiesta utente 2026-10-25): small-model NON e' piu' un
         # fallback di nessun modello. Resta un modello autonomo, invocabile
         # direttamente; qui garantiamo che nessuna catena lo contenga.
+        # UNICA ECCEZIONE (richiesta utente 2026-11-24): la catena del GRUPPO
+        # hybrid-model, dove small-model e' gia' un membro del tier 2 e finisce
+        # secondo dopo local-model quando i quota a pagamento sono finiti
+        # (vedi HYBRID_LOCALS). Le richieste DIRETTE di small-model restano
+        # senza fallback, perche' e' il ramo qui sotto che le governa.
         if self._internal(data):
             # chiamata INTERNA della cascata (B/T/T2/E): stesso modello della
             # richiesta e NESSUN fallback - un hop su un altro modello
@@ -3403,15 +3533,20 @@ class ReasoningClamp(CustomLogger):
             # prefisso (local-model/small-model/embedding-model) e restano
             # nelle catene qui sopra. Vedi LLAMA_SWAP_MEDIA_PREFIX.
             data["fallbacks"] = []
-        elif model == HYBRID_PUBLIC:
-            # Riserve free di ULTIMA RISORSA (vedi HYBRID_RESERVE_PREFIXES):
-            # scelte ORA, per QUESTA richiesta (contesto e vision), e passate
-            # come fallbacks per-request -> partono SOLO se tutto il gruppo e'
-            # esaurito (i 5 membri in cooldown/down). Nel corpo della richiesta
-            # servono id CONCRETI: un nome wildcard qui manderebbe model="*"
-            # all'upstream (400), ed e' il motivo per cui la lista si calcola
-            # a ogni richiesta dai listing in cache.
-            data["fallbacks"] = self._hybrid_reserves(
+        elif model in (HYBRID_PUBLIC, HYBRID_GROUP):
+            # CATENA del gruppo: i NOSTRI locali PRIMA (local-model, poi
+            # small-model: richiesta utente 2026-11-24, "finiti i quota usa i
+            # modelli locali, prima local-model poi small-model"), poi le
+            # riserve free di ULTIMA RISORSA (vedi HYBRID_RESERVE_PREFIXES).
+            # Partono SOLO se il membro scelto dal gruppo ha gia' fallito: a
+            # quota zero (402) il membro resta "sano" per litellm (nessun
+            # cooldown su 402) e senza questa catena il cliente si vede
+            # restituito il 402 di synthetic con "no fallback model group was
+            # found". Nel corpo della richiesta servono id CONCRETI: un nome
+            # wildcard qui manderebbe model="*" all'upstream (400), ed e' il
+            # motivo per cui la parte free si calcola a ogni richiesta dai
+            # listing in cache.
+            data["fallbacks"] = self._hybrid_chain(
                 self._estimate_prompt_tokens(data), _request_has_image(data))
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
@@ -3421,7 +3556,7 @@ class ReasoningClamp(CustomLogger):
             data["fallbacks"] = []
         # --- reasoning_effort per-provider ---
         eff = data.get("reasoning_effort")
-        if model == HYBRID_PUBLIC:
+        if model in (HYBRID_PUBLIC, HYBRID_GROUP):
             # Il gruppo mescola provider con vocabolari diversi e il membro lo
             # si scopre solo DOPO la selezione, non qui: "xhigh"/"max" NON sono
             # validi su Gemini (che accetta high/medium/low/minimal/none),
@@ -3522,11 +3657,83 @@ class ReasoningClamp(CustomLogger):
         l'errore al client resta esattamente quello originale.
         """
         kind = _quar_failure_kind(original_exception)
-        if kind:
-            _quar_note_fail(
-                str((request_data or {}).get("model") or ""), kind
-            )
+        requested = str((request_data or {}).get("model") or "")
+        # Il GRUPPO non si mette mai in quarantena: qui `model` e' il nome che
+        # il cliente ha chiamato (hybrid-model), e quarantenarlo nasconderebbe
+        # dalla listing il punto di ingresso pubblico, mentre il gruppo ha
+        # ancora membri sani. Il membro che ha fallito si segna a parte, con
+        # il suo nome concreto (vedi async_post_call_failure_deployment_hook).
+        if kind and requested not in (HYBRID_PUBLIC, HYBRID_GROUP):
+            _quar_note_fail(requested, kind)
         return None
+
+    async def async_post_call_failure_deployment_hook(
+        self, request_data, exception, call_type, fallback_depth=None,
+    ):
+        """MEMORIA del quota (402) per il SINGOLO tentativo di deployment.
+
+        `async_post_call_failure_hook` e' a livello di RICHIESTA e arriva solo
+        quando la richiesta fallisce in modo definitivo: con la catena di
+        ripiego del gruppo, un hybrid-model a quota esaurita viene servito da
+        local-model e per il cliente e' un successo -> nessun hook, e il membro
+        esausto verrebbe riprovato a ogni richiesta (round-trip di 402 ogni
+        volta). Questo hook invece gira per OGNI tentativo fallito (primo
+        tentativo, retry e ogni hop della catena), quindi il 402 viene registrato
+        anche quando la richiesta poi riesce.
+
+        Prende il nome CONCRETO dell'upstream: `exception.model` (cosa che
+        litellm mette sull'eccezione: es. "openai/syn:large:text"), con
+        `request_data["model"]` come riserva. Non solleva nulla e non tocca
+        l'eccezione: litellm ne passa una copia apposta."""
+        try:
+            if getattr(exception, "status_code", None) == 402:
+                _quota_note(getattr(exception, "model", "")
+                            or (request_data or {}).get("model") or "")
+        except Exception:
+            pass
+        return None
+
+    def _hybrid_chain(self, needed_tokens, wants_image):
+        """CATENA di ripiego di hybrid-model: i NOSTRI locali, poi le riserve free.
+
+        Ordine voluto (richiesta utente 2026-11-24): finito il quota dei
+        provider a pagamento, la richiesta deve finire sui nostri modelli
+        locali, prima local-model e poi small-model. Le riserve free vengono
+        DOPO perche' sono il ripiego quando i locali non possono servire la
+        richiesta: llama-swap ne serve UNA alla volta (un locale occupo e' un
+        429/503 in coda), il PC puo' essere spento, e un prompt che non entra
+        nel loro contesto reale li esclude a priori.
+
+        Un locale si scarta solo se: e' in quarantena; la richiesta ha immagini
+        e ne' la config ne' i listing dichiarano espressamente che le accetta
+        (il silenzio non e' una promessa, vedi _hybrid_reserves); oppure il suo
+        contesto reale non contiene prompt + margine. Ritorna una lista che puo' anche
+        essere vuota: vuota vuol dire "nessun ripiego esiste" (prompt enorme e
+        free tutti fuori contesto), e il router chiude con l'errore del membro
+        scelto, come faceva prima di questa catena."""
+        chain = []
+        try:
+            with _PROXY_MODELS_LOCK:
+                known = dict(_PROXY_MODELS_CACHE["models"])
+            budget = needed_tokens + self._margin(needed_tokens)
+            for n in HYBRID_LOCALS:
+                if _quarantined(n):
+                    continue
+                # Vision: vale la promessa dei listing dei pattern (per i
+                # locali non esiste) OPPURE quella scritta in config
+                # (supports_vision: true su local-model e small-model).
+                if wants_image and not (
+                        _DYN_VISION.get(n) is True
+                        or _config_supports_vision(n)):
+                    continue
+                win = _DYN_CTX.get(n) or known.get(n, (None, None))[0]
+                if win is not None and win < budget:
+                    continue
+                chain.append(n)
+        except Exception:
+            # la catena non deve MAI rompere una richiesta: restano le riserve
+            return self._hybrid_reserves(needed_tokens, wants_image)
+        return chain + self._hybrid_reserves(needed_tokens, wants_image)
 
     def _hybrid_reserves(self, needed_tokens, wants_image):
         """Fino a HYBRID_RESERVE_MAX id CONCRETI di riserva free, per UNA
@@ -3633,6 +3840,19 @@ class ReasoningClamp(CustomLogger):
                     if isinstance(d, dict)]
             if not deps:
                 return healthy_deployments
+            # Membri a QUOTA ESAURITA (402 recente, vedi _QUOTA_OUT): litellm
+            # NON raffredda un deployment su 402, quindi least-busy continuerebbe
+            # a scegliere il membro senza credito e ogni richiesta pagherebbe il
+            # round-trip del 402 prima della catena. Scartandoli qui il tier resta
+            # formato dai membri che possono rispondere davvero (a quota zero di
+            # solito sopravvive solo il locale). Se si scartano TUTTI si riparte
+            # dalla lista originale: meglio un tentativo in piu' che una richiesta
+            # senza membri.
+            alive = [d for d in deps
+                     if not _quota_out((d.get("litellm_params") or {})
+                                       .get("model") or "")]
+            if alive:
+                deps = alive
             wants_image = _request_has_image(
                 messages if messages is not None else request_kwargs)
             eligible = [
