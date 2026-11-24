@@ -108,7 +108,7 @@ model_list:
   # vedi reasoning_clamp): il modello embedding e' servito dall'endpoint
   # /v1/embeddings di synthetic.new (non compare nel listing chat) e quando
   # non disponibile la richiesta cade qui (llama-swap: Qwen3-Embedding-0.6b
-  # su CPU, contesto 32768 dichiarato da llama-server). Stessa gate di
+  # su CPU, contesto 8192 dichiarato da llama-server). Stessa gate di
   # local-model/small-model: PC spento = 503 in ~2s.
   - model_name: embedding-model
     litellm_params:
@@ -118,8 +118,15 @@ model_list:
       timeout: 1800
     model_info:
       id: local-embedding-backend
-      # contesto dichiarato da llama-swap per l'embedding model (32768 dal 2026-11-24, prima 16384); vettori 1024-dim
-      max_input_tokens: 32768
+      # contesto dichiarato da llama-swap per l'embedding model (8192 dal
+      # 2026-11-24, prima 32768); vettori 1024-dim. Questo valore non e' solo
+      # documentazione: la semantic cache redis lo usa come TETTO di
+      # troncamento dell'input da embeddare (litellm
+      # resolve_embedding_max_input_tokens legge model_info.max_input_tokens).
+      # Se il contesto cambia su llama-swap va cambiato anche qui, altrimenti
+      # la cache manda all'embedder piu' token di n_ctx -> 400 fail-open
+      # (nessun hit, nessuna scrittura, richiesta comunque servita).
+      max_input_tokens: 8192
 
   # --- Modelli MEDIA di llama-swap (PC 192.168.1.29): img/vid/tts/music ---
   # (richiesta utente 2026-10-16) llama-swap espone TUTTI i suoi modelli su
@@ -641,6 +648,14 @@ litellm_settings:
     redis_url: redis://host.docker.internal:6379/0
     redis_semantic_cache_index_name: litellm_semantic_cache
     redis_semantic_cache_embedding_model: embedding-model
+    # Troncamento dell'input da embeddare: senza questo litellm usa
+    # model_info.max_input_tokens del deployment (8192), cioe' il contesto
+    # ESATTO di llama-swap. Il conteggio pero' e' fatto col tokenizer di
+    # default (cl100k), non con quello Qwen3, e llama-server aggiunge il BOS:
+    # un prompt tagliato a 8192 puo' superare n_ctx -> 400. 8000 lascia ~2.4%
+    # di margine; l'errore sarebbe comunque fail-open (cache miss, richiesta
+    # servita) ma un hit perso in silenzio e' peggio di 192 token in meno.
+    semantic_cache_embedding_max_input_tokens: 8000
     similarity_threshold: 0.85
     ttl: 86400
     supported_call_types:

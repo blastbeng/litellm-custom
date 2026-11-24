@@ -277,7 +277,7 @@ untouched.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
   **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
-  32768, 1024-dim vectors, same `llama-gate` as the other local models). Single target: the
+  8192, 1024-dim vectors, same `llama-gate` as the other local models). Single target: the
   other llama-swap models are chat models and would 400 on an embeddings
   request, so there is no further step.
 - **`local-model`** itself (requested directly) → **no fallback** (user
@@ -519,7 +519,7 @@ pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 `reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still
 131072 for `groq/openai/gpt-oss-120b` / `-20b`,
 whose real Groq context is 131072 even though the `groq/*` wildcard declares
-262144 as the ceiling for its largest model; 32768 for `embedding-model`;
+262144 as the ceiling for its largest model; 8192 for `embedding-model`;
 131072 for `ollama/*` (Ollama does **not** expose `context_length` in its
 listing, so the wildcard value stays static); 262144 for `openrouter/*`,
 `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
@@ -761,6 +761,15 @@ Details / constraints:
   via llama-gate), with **no fallback** — a different embedding model lives in
   a different vector space and would yield false hits. If `embedding-model` is
   down the cache simply misses (never a wrong answer).
+- **Truncation**: the text handed to the embedder is cut to
+  `semantic_cache_embedding_max_input_tokens: 8000`, just below the model's
+  real 8192 window (with no explicit value litellm uses
+  `model_info.max_input_tokens` = 8192, but the count is tiktoken's cl100k, not
+  Qwen3's tokenizer, and llama-server adds BOS → an exactly-8192 prompt can
+  overflow `n_ctx` and 400, a silent cache miss). Longer prompts are matched on
+  their first ~8k tokens; lowering the window upstream changes the vector of
+  those long prompts, so entries written with the older cut are never matched
+  again and expire with the TTL — no index flush required.
 - **Scope**: `supported_call_types: [acompletion]` → `/chat/completions` only
   (not embeddings/media). `similarity_threshold: 0.85` is strict: identical or
   near-identical prompts hit, looser paraphrases miss.
