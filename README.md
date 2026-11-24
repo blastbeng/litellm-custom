@@ -762,14 +762,19 @@ Details / constraints:
   a different vector space and would yield false hits. If `embedding-model` is
   down the cache simply misses (never a wrong answer).
 - **Truncation**: the text handed to the embedder is cut to
-  `semantic_cache_embedding_max_input_tokens: 8000`, just below the model's
-  real 8192 window (with no explicit value litellm uses
-  `model_info.max_input_tokens` = 8192, but the count is tiktoken's cl100k, not
-  Qwen3's tokenizer, and llama-server adds BOS → an exactly-8192 prompt can
-  overflow `n_ctx` and 400, a silent cache miss). Longer prompts are matched on
-  their first ~8k tokens; lowering the window upstream changes the vector of
-  those long prompts, so entries written with the older cut are never matched
-  again and expire with the TTL — no index flush required.
+  `semantic_cache_embedding_max_input_tokens: 2560` — **litellm tokens
+  (cl100k)**, not model tokens. Two measured reasons (2026-11-24): llama-swap
+  advertises 8192 for `embedding-model` but runs llama-server with `-np 2`, so a
+  single request only sees `n_ctx/2` = 4096 tokens (4001 tokens pass, 4302 get
+  `exceeds the available context size (4096 tokens)`); and litellm counts with
+  tiktoken's cl100k while llama-server uses the Qwen3 tokenizer, which on the
+  same text costs 1.00× on prose, 1.13× on Python, 1.38× on UUIDs, 1.55× on
+  hex. 2560 × 1.55 ≈ 3968 + BOS stays under 4096. With no explicit value
+  litellm would use `model_info.max_input_tokens` (8192) and silently 400 on
+  every long prompt. Longer prompts are matched on their prefix; lowering the
+  window upstream changes the vector of those long prompts, so entries written
+  with the older cut are never matched again and expire with the TTL — no index
+  flush required.
 - **Scope**: `supported_call_types: [acompletion]` → `/chat/completions` only
   (not embeddings/media). `similarity_threshold: 0.85` is strict: identical or
   near-identical prompts hit, looser paraphrases miss.

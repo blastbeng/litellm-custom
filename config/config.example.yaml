@@ -126,6 +126,13 @@ model_list:
       # Se il contesto cambia su llama-swap va cambiato anche qui, altrimenti
       # la cache manda all'embedder piu' token di n_ctx -> 400 fail-open
       # (nessun hit, nessuna scrittura, richiesta comunque servita).
+      # ATTENZIONE (misurato 2026-11-24): llama-swap DICHIARA 8192 ma lancia
+      # llama-server con -np 2 (due slot paralleli), quindi UNA richiesta vede
+      # n_ctx/2 = 4096 token: 4001 token passano, 4302 rispondono "request
+      # (4302 tokens) exceeds the available context size (4096 tokens)". Qui
+      # resta 8192 perche' e' il valore dichiarato dal modello (e tornerebbe
+      # vero con -np 1); a dimensionare l'input e' il cap della semantic cache,
+      # tenuto sotto i 4096 REALI per richiesta.
       max_input_tokens: 8192
 
   # --- Modelli MEDIA di llama-swap (PC 192.168.1.29): img/vid/tts/music ---
@@ -648,14 +655,19 @@ litellm_settings:
     redis_url: redis://host.docker.internal:6379/0
     redis_semantic_cache_index_name: litellm_semantic_cache
     redis_semantic_cache_embedding_model: embedding-model
-    # Troncamento dell'input da embeddare: senza questo litellm usa
-    # model_info.max_input_tokens del deployment (8192), cioe' il contesto
-    # ESATTO di llama-swap. Il conteggio pero' e' fatto col tokenizer di
-    # default (cl100k), non con quello Qwen3, e llama-server aggiunge il BOS:
-    # un prompt tagliato a 8192 puo' superare n_ctx -> 400. 8000 lascia ~2.4%
-    # di margine; l'errore sarebbe comunque fail-open (cache miss, richiesta
-    # servita) ma un hit perso in silenzio e' peggio di 192 token in meno.
-    semantic_cache_embedding_max_input_tokens: 8000
+    # Troncamento dell'input da embeddare, in TOKEN DEL TOKENIZER DI LITELLM
+    # (cl100k), NON in token del modello. Senza questo valore litellm userebbe
+    # model_info.max_input_tokens = 8192, che per UNA richiesta e' troppo:
+    # llama-swap gira con -np 2 e ogni slot vede 4096 token (misurato
+    # 2026-11-24: 4001 passano, 4302 -> 400). In piu' cl100k e il tokenizer
+    # Qwen3 contano diverso sullo stesso testo (misurato: prosa 1.00x, codice
+    # .py 1.13x, UUID 1.38x, hex 1.55x), e llama-server aggiunge il BOS.
+    # 2560 * 1.55 = 3968 + BOS resta sotto 4096: nessun 400 dall'embedder per
+    # i contenuti misurati. Oltre il cap il prompt e' tagliato - l'hit su
+    # prompt lunghissimi e' comunque approssimato al prefisso - e un
+    # contenuto patologico oltre ~1.6x resta fail-open (cache miss silenzioso,
+    # richiesta servita).
+    semantic_cache_embedding_max_input_tokens: 2560
     similarity_threshold: 0.85
     ttl: 86400
     supported_call_types:
