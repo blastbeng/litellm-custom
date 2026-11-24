@@ -2435,6 +2435,26 @@ class ReasoningClamp(CustomLogger):
                 sub[k] = data[k]
         return self._estimate_prompt_tokens(sub)
 
+    def _estimate_block_tokens(self, msgs):
+        """Token stimati dei SOLI messaggi passati, SENZA gli schemi
+        tools/functions: costo INCREMENTALE di un blocco di storia che il
+        livello D si appresta a rimuovere.
+
+        Perche' non `_estimate_subset`: quello somma gli schemi tool, che
+        sono CONDIVISI da tutti i blocchi. Con i ~138 schemi di AiderDesk
+        (~21k tok misurati) ogni blocco risultava da 21-43k token invece dei
+        ~1.6k veri, quindi la sottrazione di D scendeva sotto il target dopo
+        4 blocchi con ~174k token "rimossi" a fronte di ~6.6k reali: D si
+        fermava, la riconta fedele diceva ancora overflow e T3 non aveva
+        nulla da troncare (la massa era nella storia) -> 413 con 206.228 tok
+        su un contesto di 196.608 (incidente 2026-11-25).
+
+        Stesso stimatore della riconta (`_estimate_faithful_tokens`) e
+        additivo sui testi: la somma dei blocchi toglie a `cur` esattamente
+        quello che la riconta togliera' davvero.
+        """
+        return self._estimate_faithful_tokens({"messages": list(msgs)})
+
     def _estimate_faithful_tokens(self, data):
         """Stima FEDELE: tiktoken (+correzione cifre) SENZA il max() col ratio
         a densita' usato da `_estimate_prompt_tokens`.
@@ -3424,10 +3444,13 @@ class ReasoningClamp(CustomLogger):
         blocks = self._blocks_of(msgs, idx)
         if not blocks:
             return None, "no-history-blocks"
-        # costo per blocco misurato UNA volta (la somma ignora il framing: il
-        # riconteggio fedele a fine giro lo corregge, e i giri sono 4)
+        # costo INCREMENTALE per blocco, misurato UNA volta: i soli messaggi
+        # del blocco, senza gli schemi tools (condivisi: contarli per ogni
+        # blocco faceva "liberare" 174k token con 4 blocchi e D si fermava
+        # ancora in overflow, vedi `_estimate_block_tokens`). La somma resta
+        # una stima: il riconteggio fedele a fine giro la corregge.
         for b in blocks:
-            b["tok"] = self._estimate_subset([msgs[k] for k in b["g"]], data)
+            b["tok"] = self._estimate_block_tokens([msgs[k] for k in b["g"]])
         droppable = [b for b in blocks if not b["keep"]]
         max_drop = max(0, len(blocks) - AGENT_KEEP_BLOCKS)
         dropped = []
