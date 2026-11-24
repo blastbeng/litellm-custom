@@ -693,32 +693,36 @@ litellm_settings:
 
 router_settings:
   routing_groups:
-    # --- hybrid-model: gruppo least-busy, priorita' ai 4 preferiti --------
+    # --- hybrid-model: qualita' prima, split per carico ------------------
     # 5 deployment CONCRETI. Un routing_group NON accetta wildcard: il
     # pattern verrebbe scelto alla lettera e all'upstream arriverebbe
     # model="*" -> 400 (misurato); e un nome espanso dalla wildcard non e'
     # un deployment -> membro ignorato con un warning.
-    # least-busy opera DENTRO il tier scelto da async_filter_deployments
-    # (reasoning_clamp): finche' almeno uno dei 4 preferiti (local-model,
-    # small-model, syn:large:text, syn:small:text) e' sano, il filtro
-    # restituisce solo quelli e least-busy li bilancia per carico;
-    # gemini-flash-latest entra solo quando i 4 sono tutti in cooldown/down.
-    # E' la priorita' VERA: la strategia "priority" nativa entro il tier
-    # sceglie a caso, non per carico, e vieta routing_strategy_args.
-    # least-busy sceglie il PRIMO indice con conteggio minimo: a conteggi
-    # uguali (traffico sequenziale) vincerebbe sempre lo stesso membro, quindi
-    # il filtro ruota la lista tier1 di una posizione per richiesta
-    # (_HYBRID_RR in reasoning_clamp): pareggi a rotazione, carico reale
-    # ancora decisivo quando i conteggi differiscono.
+    # L'ORDINE dei membri qui sotto e' solo di lettura: la PRIORITA' vera la
+    # impone async_filter_deployments (reasoning_clamp) con due tier:
+    #   tier 1 = syn:large:text, local-model            (qualita' prima)
+    #   tier 2 = syn:small:text, small-model, gemini-flash-latest
+    # Finche' almeno un tier 1 e' sano il filtro restituisce solo quelli.
+    # A carico ZERO decide least-busy sui conteggi IN-FLIGHT e vince il PRIMO
+    # (syn:large:text): la stessa conversazione resta sullo stesso modello e
+    # il prompt caching e' PRESERVATO. Appena il primario ha carico il filtro
+    # restringe la lista al vincitore di (in-flight + 1) / HYBRID_SPLIT_WEIGHTS
+    # (60/40 in reasoning_clamp): split PESATO sotto concorrenza con il
+    # primario davanti (2 richieste -> 1+1, 3 -> 2+1, a regime 60/40).
+    # Il tier 2 NON e' spill per carico: entra solo quando NESSUN tier 1 e'
+    # sano. NESSUNA rotazione per-richiesta: la vecchia _HYBRID_RR uccideva la
+    # cache cambiando modello a ogni turno.
+    # routing_strategy "priority" NON si usa: entro il tier sceglie a caso e
+    # vieta routing_strategy_args.
     # I free (groq/*, cloudflare/*, openrouter/*:free) non sono membri: sono
     # il salto di ULTIMA RISORSA, scelto per-request da reasoning_clamp in
     # base a contesto e vision (litellm_params.fallbacks per-request).
       - group_name: hybrid-model-pool
         models:
-          - local-model
-          - small-model
           - synthetic/syn:large:text
+          - local-model
           - synthetic/syn:small:text
+          - small-model
           - gemini/models/gemini-flash-latest
         routing_strategy: least-busy
   # --- alias PUBBLICO di hybrid-model ------------------------------------

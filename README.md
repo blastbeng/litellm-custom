@@ -310,16 +310,15 @@ callback sets an explicit `fallbacks` list (often empty) on every request.
 
 ## Hybrid model (`hybrid-model`)
 
-One endpoint that spreads the load over five deployments, all at the same level
-except for their tier:
+One endpoint that spreads the load over five deployments, **quality-first**:
 
-| Member | Context (input) | Vision | Tier |
+| Member | Context (input) | Vision | Priority |
 |---|---|---|---|
-| `local-model` | 196608 | yes | 1 |
-| `small-model` | 196608 | yes | 1 |
-| `synthetic/syn:large:text` | 524288 | yes | 1 |
-| `synthetic/syn:small:text` | 196608 | **no** | 1 |
-| `gemini/models/gemini-flash-latest` | 262144 | yes | 2 (cloud, only when tier 1 is exhausted) |
+| `synthetic/syn:large:text` | 524288 | yes | tier 1 — primary |
+| `local-model` | 196608 | yes | tier 1 — secondary (only while the PC is online/healthy) |
+| `synthetic/syn:small:text` | 196608 | **no** | tier 2 — fallback (only with no healthy tier 1) |
+| `small-model` | 196608 | yes | tier 2 — fallback |
+| `gemini/models/gemini-flash-latest` | 262144 | yes | tier 2 — fallback (cloud, last) |
 
 **Group name vs public name.** `router_settings.routing_groups` defines a
 `hybrid-model-pool` group (`routing_strategy: least-busy`) and
@@ -337,21 +336,48 @@ emits no rows at all — measured on 1.111.
 priority strategy picks **at random** inside a tier and forbids
 `routing_strategy_args`, so the tier is chosen by
 `async_filter_deployments` in `reasoning_clamp.py`: while at least one tier-1
-member is healthy the filter returns only those and `least-busy` balances them
-**by load**; `gemini-flash-latest` enters only when all four are in
-cooldown/down (log: `[reasoning_clamp] hybrid-model: N/M membri tier1 sani`).
-The same hook drops deployments declaring `supports_vision: false`
-(`syn:small:text`) when the request carries an image; the filter receives the
-**group** name (litellm resolves the alias before selection).
+member (`syn:large:text`, `local-model`) is healthy the filter returns only
+those, **ordered by priority**; `syn:small:text`, `small-model` and
+`gemini-flash-latest` enter only when no tier-1 member is healthy (log:
+`[reasoning_clamp] hybrid-model: N/M membri tier1 sani`). Tier 2 is a
+**quality fallback, not a load spill**: overlapping requests never push a
+conversation onto a *smaller* model, they only split inside tier 1. The order is imposed
+in the filter (`by_name` over the priority tuples), never inherited from
+`healthy_deployments`: litellm lists them in *config* order, and depending on
+that order — rather than on `HYBRID_TIER1` — is how `local-model` would end up
+the primary by accident. The same hook drops
+deployments declaring `supports_vision: false` (`syn:small:text`) when the
+request carries an image; the filter receives the **group** name (litellm
+resolves the alias before selection).
 
-**Tie-break is rotating.** `least-busy` picks the *first* minimum in
-`_least_busy_index()` (`litellm/router_strategy/least_busy.py`), so with every
-in-flight count at 0 — i.e. any sequential traffic — every request would hit the
-same member (measured: 10/10 on one deployment). The filter therefore rotates
-the tier-1 list by one position per request (`_HYBRID_RR`, an
-`itertools.count()`), which distributes ties evenly (measured: 20 sequential →
-5/5/5/5; 8 concurrent → 2/2/2/2) while real load still decides whenever the
-counts differ.
+**No rotation: affinity when idle, weighted split under load.** Two rules,
+both in `async_filter_deployments`:
+
+* **Idle (in-flight counts all 0)** — the filter returns the whole tier and
+  `least-busy` picks the *first* minimum in `_least_busy_index()`
+  (`litellm/router_strategy/least_busy.py`). Sequential traffic — the normal
+  coding-agent case — therefore always lands on `syn:large:text`, so **every
+  turn of a conversation stays on the primary** and its prompt cache stays
+  warm. The old per-request rotation (`_HYBRID_RR`) distributed ties but
+  changed the model on every turn, which is exactly what broke prompt caching
+  and re-billed full prompts; it has been removed.
+* **Busy (at least one in-flight count > 0)** — the filter **narrows the list
+  to a single winner**: the minimum of `(in-flight + 1) / weight`, with
+  `HYBRID_SPLIT_WEIGHTS = {syn:large:text: 0.6, local-model: 0.4}`. Two
+  overlapping requests therefore go one each, three go 2+1, and sustained
+  concurrency converges to **60/40** in favour of the primary. `least-busy`
+  still does the accounting, so retries, cooldowns and streaming completions
+  behave exactly as before.
+
+The in-flight numbers are **read, not maintained**: `_hybrid_inflight()` reads
+the same `{group}_request_count:{deployment_id}` keys that `least-busy` itself
+increments (`local_only`, single uvicorn worker), so there is no counter of our
+own to drift and no completion hook to get wrong when a stream is cancelled. If
+the cache is unreachable the filter returns the plain tier (fail-open) and
+`least-busy` splits evenly as before. When the filter does pick the secondary,
+it logs
+`[reasoning_clamp] hybrid-model: split pesato -> local-model (in-flight
+syn:large:text=1, local-model=0)`.
 
 **Group context is pinned to 196608** (`PINNED_CONTEXT`), the smallest real
 member window: `/v1/models` reports the *widest* limit of a group (and here it

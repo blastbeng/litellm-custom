@@ -167,7 +167,6 @@ Registrato in config.yaml come: litellm_settings.callbacks -> "reasoning_clamp.r
 """
 import asyncio
 import hashlib
-import itertools
 import json
 import os
 import re
@@ -468,14 +467,23 @@ EFFORTS_BY_MODEL = (
 EFFORT_HIGH_FAMILY = ("high", "max")
 DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
 
-# --- hybrid-model: gruppo least-busy con priorita' --------------------------
+# --- hybrid-model: qualita' prima, split per carico -------------------------
 # I membri stanno in config.yaml (router_settings.routing_groups); qui vive la
-# POLITICA. Tier 1 = i modelli "nostri" (locali + synthetic): hanno SEMPRE la
-# precedenza. Tier 2 = il cloud a consumo (gemini-flash-latest): entra solo a
-# tier 1 esaurito (tutti in cooldown/down). Il tier lo decide
-# async_filter_deployments, NON routing_strategy "priority": quella, entro il
-# tier, sceglie A CASO e vieta routing_strategy_args (misurato su 1.111),
-# mentre qui least-busy continua a bilanciare per carico dentro il tier.
+# POLITICA. NON si ruota piu' la lista a ogni richiesta (era _HYBRID_RR): la
+# rotazione rendeva la scelta "a caso" e la STESSA conversazione cambiava
+# modello a ogni turno, perdendo il prompt caching (prefisso mai caldo) e
+# ripagando i token pieni sui membri a pagamento. Ora l'ordine e' FISSO e
+# QUALITA'-PRIMA. Il tier lo decide async_filter_deployments; DENTRO il tier
+# la scelta la fa least-busy (config routing_groups) sui conteggi IN-FLIGHT
+# reali:
+#   - carico zero (uso sequenziale): i conteggi sono tutti 0 e least-busy
+#     sceglie il PRIMO dell'ordine -> syn:large:text SEMPRE. Stessa
+#     conversazione, stesso modello -> prompt caching preservato (affinity di
+#     fatto, senza stato per-sessione).
+#   - richieste CONCORRENTI: syn:large:text risulta occupato (in-flight > 0) e
+#     least-busy passa a local-model, poi ai tier 2 -> split del carico
+#     automatico, pesato dal numero di richieste in-flight. Nessun contatore
+#     di concorrenza da mantenere a mano: lo fa gia' litellm.
 # Nome INTERNO del routing_group. Il nome PUBBLICO ("hybrid-model") e' un
 # model_group_alias verso questo: /model/info - l'endpoint che AiderDesk legge
 # per elencare i modelli - contiene SOLO deployment e righe ALIAS, mai i
@@ -485,8 +493,30 @@ DEFAULT_CONTEXT = 131072  # il piu' piccolo: clamp conservativo per l'ignoto
 # pre-call hook vede il nome mandato dal client: servono entrambi.
 HYBRID_GROUP = "hybrid-model-pool"
 HYBRID_PUBLIC = "hybrid-model"
-HYBRID_TIER1 = ("local-model", "small-model",
-                "synthetic/syn:large:text", "synthetic/syn:small:text")
+# Tier 1 = QUALITA' PRIMA. L'ordine e' la priorita' a carico zero (least-busy
+# tie-break sul primo indice): syn:large:text primario. local-model resta
+# SECONDARIO: subentra quando il primario e' occupato (split sotto
+# concorrenza) o giu' (failover), e solo se il PC e' online - spento va in
+# cooldown e non compare tra gli healthy, quindi non viene mai scelto.
+HYBRID_TIER1 = ("synthetic/syn:large:text", "local-model")
+# Tier 2 = SPILL: entra solo quando NESSUN tier 1 e' sano. syn:small:text e'
+# text-only (il pre-filtro vision lo esclude sulle richieste con immagine);
+# gemini-flash-latest e' il cloud a consumo, ultimo.
+HYBRID_TIER2 = ("synthetic/syn:small:text", "small-model",
+                "gemini/models/gemini-flash-latest")
+# PESI del riparto DENTRO il tier 1 (somma 1.0). Regola: qualita' prima, ma
+# senza accodare tutto sul primario quando arrivano richieste concorrenti.
+#   - a carico ZERO il filtro NON decide: lascia il tier a least-busy, che
+#     sceglie il primo indice = syn:large:text, sempre lo stesso per la
+#     stessa conversazione -> prompt caching intatto;
+#   - appena il primario ha carico in-flight il filtro sceglie il minimo di
+#     (in-flight + 1) / peso: 60/40 -> la seconda richiesta parallela va su
+#     local-model, la terza torna sul primario (2:1), e sotto carico
+#     sostenuto il riparto converge a 60/40.
+# E' l'unico numero da toccare per spostare l'ago verso la qualita' (es.
+# 0.8/0.2 = il locale entra solo con 2+ richieste gia' sul primario).
+HYBRID_SPLIT_WEIGHTS = {"synthetic/syn:large:text": 0.6,
+                        "local-model": 0.4}
 # Contesto del GRUPPO = MINIMO vero tra i membri (syn:small:text = 196608).
 # Va pinnato: _window_for preferisce il listing /v1/models, che per un GRUPPO
 # riporta il MASSIMO tra i membri (524288). Dimensionare la cascata su 524288
@@ -981,16 +1011,12 @@ _DYN_VISION = {}
 # deployment di hybrid-model: si stampa solo quando CAMBIA, perche' l'hook
 # gira a ogni richiesta.
 _HYBRID_TIER_STATE = [None]
-# TIE-BREAK ROTANTE del filtro tier di hybrid-model. least-busy sceglie
-# _least_busy_index() = il PRIMO indice con conteggio minimo
-# (litellm/router_strategy/least_busy.py): a carico zero i conteggi sono tutti
-# 0 e vince sempre il primo deployment dell'ordine ricevuto, quindi richieste
-# sequenziali finiscono tutte sullo stesso membro (misurato: 10/10 su
-# local-model). Il filtro ruota la lista a ogni richiesta e i pareggi si
-# distribuiscono a rotazione; quando i conteggi differiscono (carico reale)
-# decide ancora least-busy. itertools.count().next e' una singola chiamata C:
-# atomica rispetto al GIL, nessun lock.
-_HYBRID_RR = itertools.count()
+# NIENTE rotazione (_HYBRID_RR rimossa): least-busy sceglie il PRIMO indice
+# con conteggio minimo (litellm/router_strategy/least_busy.py); a carico zero
+# vince sempre il primo = syn:large:text. La rotazione distribuiva i pareggi
+# ma cambiava modello a ogni turno della stessa conversazione, uccidendo il
+# prompt caching: l'ordine ora e' fisso e lo split avviene solo per carico
+# reale (in-flight > 0).
 _SWEEP_SEEN = [False]          # primo sweep contesti riuscito (log una volta)
 
 
@@ -1903,6 +1929,67 @@ def _request_has_image(data):
         return scan(data)
     except Exception:
         return False
+
+
+def _hybrid_inflight(deps):
+    """Carico in-flight dei deployment di hybrid-model: {id: n}.
+
+    Legge le STESSE chiavi che least-busy incrementa quando un tentativo
+    parte ({gruppo}_request_count:{deployment_id}, locali: un solo processo
+    uvicorn), cosi' non serve un contatore nostro - e quindi nessun hook di
+    chiusura da azzeccare (stream interrotti, cancellazioni, client che
+    spariscono). None = cache non raggiungibile/non leggibile: il chiamante
+    lascia fare a least-busy come prima (fail-open)."""
+    try:
+        from litellm.proxy import proxy_server as _proxy
+        cache = getattr(getattr(_proxy, "llm_router", None), "cache", None)
+        if cache is None:
+            return None
+        ids = [str((d.get("model_info") or {}).get("id") or "") for d in deps]
+        if not ids or not all(ids):
+            return None
+        # entrambi i nomi: il conteggio usa il model_group RISOLTO, che per
+        # questo pool e' il nome interno, ma l'alias pubblico resta possibile
+        keys = [f"{grp}_request_count:{did}"
+                for did in ids for grp in (HYBRID_GROUP, HYBRID_PUBLIC)]
+        raw = list(cache.batch_get_cache(keys, local_only=True) or ())
+        counts = {}
+        for pos, did in enumerate(ids):
+            pair = raw[pos * 2:pos * 2 + 2]
+            counts[did] = max([int(v) for v in pair
+                               if isinstance(v, (int, float))] or [0])
+        return counts
+    except Exception:
+        return None
+
+
+def _hybrid_weighted_pick(tier, inflight):
+    """Minimo di (in-flight + 1) / peso dentro il tier.
+
+    Il +1 e' la richiesta corrente: senza, una richiesta sola vedrebbe 0/0 e
+    il pareggio lo deciderebbe l'ordine, non il peso. A carico zero il
+    primario vince sempre (1/0.6 < 1/0.4), con il primario occupato vince
+    chi costa meno in proporzione al proprio peso."""
+    best, best_score = None, None
+    for dep in tier:
+        weight = HYBRID_SPLIT_WEIGHTS.get(str(dep.get("model_name") or ""))
+        if not weight:
+            continue
+        did = str((dep.get("model_info") or {}).get("id") or "")
+        score = (inflight.get(did, 0) + 1) / weight
+        if best_score is None or score < best_score:
+            best, best_score = dep, score
+    return best
+
+
+def _hybrid_inflight_summary(tier, inflight):
+    """'syn:large=1, local=0' per il log (solo nomi noti del tier 1)."""
+    parts = []
+    for dep in tier:
+        did = str((dep.get("model_info") or {}).get("id") or "")
+        parts.append(f"{str(dep.get('model_name') or '?').split('/')[-1]}"
+                     f"={inflight.get(did, 0)}")
+    return ", ".join(parts)
 
 
 class ReasoningClamp(CustomLogger):
@@ -3505,20 +3592,29 @@ class ReasoningClamp(CustomLogger):
     async def async_filter_deployments(self, model, healthy_deployments,
                                        messages=None, request_kwargs=None,
                                        parent_otel_span=None):
-        """TIER di hybrid-model: i modelli "nostri" prima del cloud.
+        """TIER di hybrid-model: qualita' prima, split per carico.
 
         litellm invoca questo hook PRIMA della strategia del gruppo
         (callback_filters stage, verificato su 1.111) e il risultato VINCOLA
-        la scelta: restituire i soli tier 1 fa si' che least-busy bilanci per
-        CARICO tra local-model/small-model/syn:large:text/syn:small:text e che
-        gemini-flash-latest entri SOLO quando nessuno di loro e' sano (tutti in
-        cooldown/down). La strategia nativa "priority" non sapeva farlo: entro
-        il tier sceglie A CASO e vieta routing_strategy_args.
+        la scelta. Ordine FISSO, NESSUNA rotazione (era _HYBRID_RR: cambiava
+        modello a ogni turno e uccideva il prompt caching):
+          tier 1 = syn:large:text, local-model              (qualita' prima)
+          tier 2 = syn:small:text, small-model, gemini-flash-latest
+        Si restituisce il tier 1 se almeno un membro e' sano, altrimenti il
+        tier 2 (il tier 2 NON e' uno spill per carico: e' il ripiego di
+        qualita' quando il tier 1 e' giu').
+        DENTRO il tier 1, a carico ZERO, si restituisce la lista: least-busy
+        prende il PRIMO (syn:large:text) -> stessa conversazione, stesso
+        modello, prompt caching preservato. Appena il primario ha carico
+        in-flight il filtro RESTRINGE la lista al vincitore di
+        (in-flight + 1) / HYBRID_SPLIT_WEIGHTS: 60/40 -> split pesato sotto
+        concorrenza, con il primario comunque davanti. Il carico arriva dalle
+        chiavi che least-busy stesso mantiene, mai da un contatore nostro.
 
-        La lista restituita viene RUOTATA di una posizione a ogni richiesta
-        (_HYBRID_RR): least-busy sceglie il primo indice a conteggio minimo,
-        quindi a conteggi pari (traffico sequenziale) senza rotazione
-        vincerebbe sempre lo stesso membro.
+        L'ordine del tier e' imposto QUI (by_name sull'ordine delle costanti),
+        NON ereditato da healthy_deployments: litellm li elenca nell'ordine
+        della config (local-model prima di syn:large:text), e fidarsi di
+        quell'ordine renderebbe local il primario.
 
         Replica inoltre il pre-filtro vision nativo per i membri che
         dichiarano supports_vision: False (syn:small:text): una richiesta con
@@ -3546,21 +3642,38 @@ class ReasoningClamp(CustomLogger):
             ]
             if not eligible:
                 return deps
-            tier1 = [d for d in eligible
-                     if str(d.get("model_name") or "") in HYBRID_TIER1]
-            chosen = tier1 or eligible
-            # Rotazione: vedi _HYBRID_RR. Sposta in testa, a turno, un membro
-            # diverso cosi' i pareggi di least-busy non cadono sempre sul primo.
-            if len(chosen) > 1:
-                shift = next(_HYBRID_RR) % len(chosen)
-                chosen = chosen[shift:] + chosen[:shift]
+            by_name = {str(d.get("model_name") or ""): d for d in eligible}
+
+            def _ordered(order):
+                # ordine = PRIORITA' delle costanti, non quello della config
+                return [by_name[n] for n in order if n in by_name]
+
+            tier1 = _ordered(HYBRID_TIER1)
+            tier2 = _ordered(HYBRID_TIER2)
+            chosen = tier1 or tier2 or eligible
+            if len(tier1) > 1:
+                # split pesato SOLO a carico reale: a in-flight 0 la lista
+                # resta intera e least-busy prende il primario (finche' non
+                # arriva una richiesta concorrente il caching e' salvo)
+                inflight = _hybrid_inflight(tier1)
+                if inflight and any(inflight.values()):
+                    pick = _hybrid_weighted_pick(tier1, inflight)
+                    if pick is not None:
+                        if pick is not tier1[0]:
+                            print(f"[reasoning_clamp] {HYBRID_PUBLIC}: split "
+                                  f"pesato -> "
+                                  f"{str(pick.get('model_name') or '?')} "
+                                  f"(in-flight "
+                                  f"{_hybrid_inflight_summary(tier1, inflight)}"
+                                  f")", flush=True)
+                        chosen = [pick]
             state = (len(tier1), len(eligible))
             if state != _HYBRID_TIER_STATE[0]:
                 _HYBRID_TIER_STATE[0] = state
                 print(f"[reasoning_clamp] {HYBRID_PUBLIC}: "
                       f"{len(tier1)}/{len(eligible)} membri tier1 sani -> "
-                      + ("cloud in attesa" if tier1
-                         else "tier1 ESAURITO, si passa al cloud"),
+                      + ("qualita' prima (syn:large/local)" if tier1
+                         else "tier1 ESAURITO, spill ai tier 2"),
                       flush=True)
             return chosen
         except Exception:
