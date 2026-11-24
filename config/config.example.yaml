@@ -25,6 +25,22 @@ model_list:
   # il corpo (contesto reale: chunk+output+margine) o se la richiesta e'
   # non-chat/media; in quel caso la cascata prosegue e alla fine risponde 413
   # senza 400 a monte.
+  #
+  # RAMO AGENICO (incidente 2026-11-24, AiderDesk su hybrid-model): se il body
+  # dichiara tools/functions, o la storia ha role tool / tool_calls /
+  # function_call_output, la cascata e' SOLO D -> T3 -> 413. D rimuove BLOCCHI
+  # INTERI di storia vecchia dal piu' vecchio (tool_calls + suoi risultati
+  # restano insieme), tiene gli ultimi 6 blocchi e la coda verbatim, e lo
+  # dichiara al modello con UN messaggio system in INGLESE (quanti blocchi/
+  # messaggi/token sono spariti); T3 tronca con pavimento AGENT_T3_MIN_CHARS
+  # (4000 char: un file_read da 26 righe non si tocca). B/C/T/T2/E sono esclusi
+  # perche' RISCIVONO i tool result - il riassuntore e' il modello della
+  # richiesta (su hybrid un locale da 12GB: 669.939 char -> 3405 char) - e per
+  # un operaio di coding un tool result riassunto sembra una cache rotta. La
+  # soglia del ramo agentico sono i token FEDELI (tiktoken,
+  # _estimate_faithful_tokens), non il ratio a densita': misurato, la cascata
+  # partiva a ~299.638 tok stimati su contesto 196608 mentre AiderDesk compatta
+  # a 160k, bruciando ~250k token di contesto del client per niente.
 
   # --- Modelli locali (PC 192.168.1.29, llama-swap: una richiesta alla volta) ---
   # local-model e' il modello principale; small-model e' un modello autonomo
@@ -320,6 +336,16 @@ model_list:
       # budget: direttiva utente 2026-10-06)
       max_tokens: 32768
     model_info:
+      # dichiarato VISION-CAPABLE (utente 2026-11-24): e' il primo gradino
+      # vision del tier 2 di hybrid-model, e la catena di ripiego lo tiene
+      # solo sulle richieste con immagine (_config_supports_vision). Senza
+      # questa riga il silenzio lo escluderebbe dalla catena vision.
+      supports_vision: true
+      # membro di hybrid-model (tier 2 vision): stessa policy di cooldown
+      # degli altri membri, cosi' UN fallo infrastrutturale lo mette in
+      # cooldown 45s invece di bruciare i retry globali.
+      allowed_fails_policy: *hybrid_cooldown
+      cooldown_time: 45
       max_input_tokens: 262144
       max_output_tokens: 65536
       max_tokens: 65536
@@ -495,7 +521,9 @@ model_list:
   # contesto piccolo.
   # reasoning gestito dalla callback reasoning_clamp (default
   # "high"; "xhigh" non e' un valore valido su Gemini).
-  # --- gemini-flash-latest: entry LETTERALE (membro di hybrid-model) -----
+  # --- gemini-flash-latest: entry LETTERALE (riserva free pool gemini/) ---
+  # NON e' piu' un membro di hybrid-model (utente 2026-11-24): entra solo
+  # come riserva dinamica del pool "gemini/" quando il gruppo ha fallito.
   # La wildcard gemini/* espande i nomi nel LISTING ma NON crea deployment:
   # un routing_group che nomina "gemini/models/gemini-flash-latest" viene
   # ignorato in silenzio ("not in model_list"). Questa entry crea il
@@ -682,27 +710,27 @@ litellm_settings:
       - acompletion
   drop_params: false
 
-  # Fallback (richiesta utente 2026-10-25): small-model NON e' piu' un
-  # fallback di NESSUN modello. Resta un modello autonomo, invocabile
-  # direttamente; quando una catena si esaurisce l'errore dell'upstream
-  # arriva al client. Catene per-modello (via callback reasoning_clamp,
-  # wildcard-safe):
-  # (Ollama LOCALE ripristinata il 2026-10-11: ollama/* via ollama-gate +
-  #  ollama-gw; ollama-cloud/* resta ollama.com, provider separato)
+  # Fallback (richiesta utente 2026-11-24): le catene si fermano sui NOSTRI
+  # modelli, locali prima e poi i cloud gratuiti; small-model NON e' piu' il
+  # fallback universale di ogni modello (regola 2026-10-25, ancora valida per
+  # tutti i rami non elencati qui). Quando una catena si esaurisce l'errore
+  # dell'upstream arriva al client. Catene per-modello (via callback
+  # reasoning_clamp, wildcard-safe):
+  # (ollama-cloud/* resta ollama.com, provider cloud separato dai locali)
   # - synthetic/*  -> NESSUN fallback (richiesta utente 2026-10-28: local-model
   #   rimosso da ogni catena synthetic/*; restano solo le catene esatte
   #   syn:small:text, syn:small:vision e l'embedding nomic qui sotto)
-  # - synthetic/syn:small:text -> ollama/small-model -> openrouter/free
-  #   (richiesta utente 2026-10-12: ollama/small-model e' Ollama sullo
-  #   STESSO PC 192.168.1.29:11434, via ollama-gw + ollama-gate: server
-  #   INDIPENDENTE da llama-swap, quindi regge quando llama-swap e' occupo o
-  #   da 429; poi il cloud GRATIS openrouter/free: nomi concreti risolti
-  #   dalle wildcard ollama/* e openrouter/* del model_list - vedi
-  #   reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
+  # - synthetic/syn:small:text -> small-model -> openrouter/free
+  #   (richiesta utente 2026-11-24: small-model e' il gemello LOCALE su
+  #   llama-swap - una richiesta alla volta, quindi regge quando il cloud e' a
+  #   quota o in 429 - poi il cloud GRATIS openrouter/free come rete di
+  #   sicurezza col PC spento: nomi concreti, il primo e' un deployment di
+  #   questa config, il secondo e' risolto dalla wildcard openrouter/* del
+  #   model_list - vedi reasoning_clamp, SYN_SMALL_TEXT_FALLBACKS)
   # - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
-  #   2026-10-14): ollama/small-model -> openrouter/free, stessi gradini e
-  #   stesso ordine. Il target locale e' text-only: una richiesta vision puo'
-  #   400, hop sprecato, la catena prosegue.
+  #   2026-10-14): small-model -> openrouter/free, stessi gradini e stesso
+  #   ordine. small-model dichiara supports_vision: true, quindi il gradino
+  #   locale serve anche l'input vision.
   # - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> embedding-model
   #   (embeddings: quando synthetic non e' disponibile la richiesta cade sul
   #   modello embedding di llama-swap; vedi reasoning_clamp)
@@ -736,7 +764,9 @@ router_settings:
     # L'ORDINE dei membri qui sotto e' solo di lettura: la PRIORITA' vera la
     # impone async_filter_deployments (reasoning_clamp) con due tier:
     #   tier 1 = syn:large:text, local-model            (qualita' prima)
-    #   tier 2 = syn:small:text, small-model, gemini-flash-latest
+    #   tier 2 = syn:small:text                (richiesta di TESTO)
+    #            syn:small:vision, small-model (richiesta con IMMAGINE)
+    # Il tier 2 cambia con la capacita' della richiesta (utente 2026-11-24).
     # Finche' almeno un tier 1 e' sano il filtro restituisce solo quelli.
     # A carico ZERO decide least-busy sui conteggi IN-FLIGHT e vince il PRIMO
     # (syn:large:text): la stessa conversazione resta sullo stesso modello e
@@ -749,16 +779,22 @@ router_settings:
     # cache cambiando modello a ogni turno.
     # routing_strategy "priority" NON si usa: entro il tier sceglie a caso e
     # vieta routing_strategy_args.
-    # I free (groq/*, cloudflare/*, openrouter/*:free) non sono membri: sono
-    # il salto di ULTIMA RISORSA, scelto per-request da reasoning_clamp in
-    # base a contesto e vision (litellm_params.fallbacks per-request).
+    # I pool free (openrouter/*, ollama-cloud/*, groq/*, gemini/*,
+    # cloudflare/*) NON sono membri: sono il salto di ULTIMA RISORSA, scelto
+    # per-request da reasoning_clamp (uno per pool, in quest'ordine, solo se
+    # sano: litellm_params.fallbacks per-request). gemini-flash-latest non e'
+    # piu' un membro: rientra dal pool "gemini/".
+    # Catena di ripiego del gruppo (solo se il membro scelto ha fallito):
+    #   testo -> local-model -> syn:small:text -> riserve free
+    #   vision -> syn:small:vision -> small-model -> riserve free
+    # (HYBRID_CHAIN_TEXT / HYBRID_CHAIN_VISION in reasoning_clamp).
       - group_name: hybrid-model-pool
         models:
           - synthetic/syn:large:text
           - local-model
           - synthetic/syn:small:text
+          - synthetic/syn:small:vision
           - small-model
-          - gemini/models/gemini-flash-latest
         routing_strategy: least-busy
   # --- alias PUBBLICO di hybrid-model ------------------------------------
   # /model/info - l'endpoint che AiderDesk interroga per elencare i modelli -

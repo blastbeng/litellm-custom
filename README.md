@@ -236,44 +236,41 @@ models: PC off → 503 in ~2s, huge model loading → up to 30 min.
 
 ## Fallback policy
 
-**`small-model` is no longer a fallback of any model** (user request
-2026-10-25). It remains a standalone model that can be called directly, but no
-chain contains it any more: when a chain is exhausted, the upstream error
-reaches the client unchanged.
+**`small-model` is not the universal fallback any more** (user request
+2026-10-25, still true for every chain not listed below). It remains a
+standalone model that can be called directly with **no** fallback. Since
+2026-11-24 it is the **local step** of three chains only:
+`synthetic/syn:small:text`, `synthetic/syn:small:vision` (chains identical) and
+the vision branch of `hybrid-model` (`HYBRID_CHAIN_VISION`). When a chain is
+exhausted, the upstream error reaches the client unchanged.
 
-**Local Ollama was restored on 2026-10-11** (`ollama/*`, `ollama-gate`,
-`ollama-gw`): the Windows PC serves its OpenAI-compatible API on
-`blastpc:11434` behind the same TCP gate as llama-swap. `ollama/small-model`
-is the local step of **two** chains only — `synthetic/syn:small:text` (user
-request 2026-10-12) and `synthetic/syn:small:vision` (user request 2026-10-14,
-chains identical).
+The local Ollama model that used to be the first step of the `syn:small:*`
+chains was **removed from the whole stack on 2026-11-24** (user request: "we
+use just small-model from llama-swap") — callback, `config.yaml`,
+`config.example.yaml` and this README no longer mention it.
 **`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
 untouched.
 
 - **`synthetic/*`** → **no fallback** (user request 2026-10-28: `local-model`
   removed from every `synthetic/*` chain, right after `small-model` on
   2026-10-25). Only the three exact chains below remain.
-- **`synthetic/syn:small:text`** → **`ollama/small-model`** →
-  **`openrouter/free`** (user request 2026-10-12; since 2026-10-14
+- **`synthetic/syn:small:text`** → **`small-model`** →
+  **`openrouter/free`** (user request 2026-11-24; since 2026-10-14
   `syn:small:vision` has the *identical* chain).
-  `ollama/small-model` — the Ollama model on the **same PC**
-  (`192.168.1.29:11434`, via `ollama-gw` + `ollama-gate`) — comes **first**:
-  an **independent server**, so it answers when llama-swap is busy or 429s (its
-  one-request-at-a-time serialization is exactly why this step exists). Its
-  static context is 131072, so a larger prompt can 400 here — one wasted hop,
-  the chain continues. The name must exist in Ollama on the PC, otherwise the
-  upstream 404s: also just a failed hop. The **free cloud** model is the
-  safety net for when the local PC is off. `ollama/small-model` and
-  `openrouter/free` are **concrete names resolved by the `ollama/*` and
-  `openrouter/*` wildcards** in the model_list (litellm `get_model_list` →
-  `_get_wildcard_deployments` → `PatternMatchRouter.route`), **not**
-  fictional prefixes.
-- **`synthetic/syn:small:vision`** → **`ollama/small-model`** →
+  `small-model` (llama-swap on the same PC, behind `llama-gate`, one request at
+  a time) comes **first**: it answers when the cloud is out of quota or 429s,
+  and 503s in ~2s when the PC is off, so the free cloud step is reached
+  immediately. Its real context is 196608, so a larger prompt can 400 here —
+  one wasted hop, the chain continues. The **free cloud** model is the safety
+  net. `small-model` is a plain config deployment; `openrouter/free` is a
+  **concrete name resolved by the `openrouter/*` wildcard** in the model_list
+  (litellm `get_model_list` → `_get_wildcard_deployments` →
+  `PatternMatchRouter.route`), **not** a fictional prefix.
+- **`synthetic/syn:small:vision`** → **`small-model`** →
   **`openrouter/free`** — the *identical* chain of
   `synthetic/syn:small:text` (user request 2026-10-14: same steps, same order;
-  defined as an alias so the two cannot diverge again). The local target is
-  text-only, so a vision request may 400 there: one wasted hop, the chain
-  continues.
+  defined as an alias so the two cannot diverge again). `small-model` declares
+  `supports_vision: true`, so the local step serves vision input too.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
   **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
@@ -282,7 +279,9 @@ untouched.
   request, so there is no further step.
 - **`local-model`** itself (requested directly) → **no fallback** (user
   request 2026-10-25: `small-model` removed from every chain).
-- **`small-model`** → no fallback: standalone model, never a fallback.
+- **`small-model`** (requested directly) → **no fallback of its own**: it is a
+  *step* of the chains above, not a chain owner, so a call addressed to it
+  never hops.
 - **`embedding-model`** (requested directly) → no fallback: it is the only
   embedding-capable model in the chain, any other target would 400 on an
   embeddings request.
@@ -316,9 +315,16 @@ One endpoint that spreads the load over five deployments, **quality-first**:
 |---|---|---|---|
 | `synthetic/syn:large:text` | 524288 | yes | tier 1 — primary |
 | `local-model` | 196608 | yes | tier 1 — secondary (only while the PC is online/healthy) |
-| `synthetic/syn:small:text` | 196608 | **no** | tier 2 — fallback (only with no healthy tier 1) |
-| `small-model` | 196608 | yes | tier 2 — fallback |
-| `gemini/models/gemini-flash-latest` | 262144 | yes | tier 2 — fallback (cloud, last) |
+| `synthetic/syn:small:text` | 196608 | **no** | tier 2 — text requests only (no healthy tier 1) |
+| `synthetic/syn:small:vision` | 262144 | yes | tier 2 — image requests, first |
+| `small-model` | 196608 | yes | tier 2 — image requests, second |
+
+Tier 2 is **capability-dependent** (user request 2026-11-24). Text requests:
+`syn:small:text`. Image requests: `syn:small:vision` then `small-model`. Tier 1
+is not skipped for images — both its members declare `supports_vision: true`,
+so quality still goes first and the vision branch takes over when tier 1 is
+down or out of quota. `gemini/models/gemini-flash-latest` is **no longer a
+member**: it comes back as a dynamic free reserve from the `gemini/` pool.
 
 **Group name vs public name.** `router_settings.routing_groups` defines a
 `hybrid-model-pool` group (`routing_strategy: least-busy`) and
@@ -337,9 +343,10 @@ priority strategy picks **at random** inside a tier and forbids
 `routing_strategy_args`, so the tier is chosen by
 `async_filter_deployments` in `reasoning_clamp.py`: while at least one tier-1
 member (`syn:large:text`, `local-model`) is healthy the filter returns only
-those, **ordered by priority**; `syn:small:text`, `small-model` and
-`gemini-flash-latest` enter only when no tier-1 member is healthy (log:
-`[reasoning_clamp] hybrid-model: N/M membri tier1 sani`). Tier 2 is a
+those, **ordered by priority**; the tier-2 members above (text or vision set,
+depending on the request) enter only when no tier-1 member is healthy (log:
+`[reasoning_clamp] hybrid-model: N/M membri tier1 sani ... spill al tier 2
+testo|vision`). Tier 2 is a
 **quality fallback, not a load spill**: overlapping requests never push a
 conversation onto a *smaller* model, they only split inside tier 1. The order is imposed
 in the filter (`by_name` over the priority tuples), never inherited from
@@ -390,12 +397,18 @@ the same honest number for compaction. Sizing the cascade on 524288 would push p
 (`COMPACTOR_OVERRIDE`) — the local worker first, the synthetic one when the PC
 is off.
 
-**Free reserves** (`groq/*`, `cloudflare/*`, `openrouter/*:free` — only free
-ids) are **not** group members (a wildcard member resolves to the literal
-pattern and sends `model="*"` upstream, a 400): `reasoning_clamp` picks up to 3
-concrete ids per request (context and vision aware, `openrouter/free` first) and
-passes them as **per-request `fallbacks`**, so they only fire once the whole
-group is exhausted.
+**Free reserves** — pools `openrouter/*` (free ids only: `openrouter/free` or
+`*:free`), `ollama-cloud/*`, `groq/*`, `gemini/*`, `cloudflare/*`, in that
+order — are **not** group members (a wildcard member resolves to the literal
+pattern and sends `model="*"` upstream, a 400). `reasoning_clamp` picks **one
+healthy concrete id per pool** per request (skipping quarantined models, 402
+quota-out models, non-chat/media models, contexts too small for the prompt and
+models that do not declare vision on an image request), so the reserve ladder
+is five different providers instead of five ids of the same one, and passes
+them as **per-request `fallbacks`**: they only fire once the whole group is
+exhausted. The chain in front of them is
+`local-model → syn:small:text` (text) or `syn:small:vision → small-model`
+(vision).
 
 **Cooldowns**: every member carries `allowed_fails_policy` (503/429/timeout/
 5xx → 1 allowed fail) and `cooldown_time: 45`, so one infrastructure failure
@@ -525,7 +538,7 @@ listing, so the wildcard value stays static); 262144 for `openrouter/*`,
 `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
 entries are matched before generic prefixes.
 
-## Context overflow cascade (`B → C → T → T2 → E → T3 → 413`)
+## Context overflow cascade (`B → C → T → T2 → E → T3 → 413`; agentic requests: `D → T3 → 413`)
 
 When `prompt + 1024 + margin > context` the request cannot fit **any** model in
 the chain, so shrinking `max_tokens` cannot save it: the prompt itself has to
@@ -665,12 +678,55 @@ choice is not controllable.
 | **T2** | **Compress the messages after the last `user` message in place** (tool results, assistant turns) — B/C/E keep the whole tail verbatim and T only touches the last `user` message, so when the mass sits in oversized tool results none of them can help (incident 2026-10-06: 126 640-token tail of which only 842 tokens in the last `user` message). Biggest message first, one at a time, re-estimating after each until the estimate is ≤ **95 % of the context**; only the text `content` is replaced with a summary note — roles, `tool_call_id` and `tool_calls` stay intact so no orphaned tool result 400s. | Yes |
 | **E** | Map/reduce over the whole history: ≤ 90k-token chunks (max 8, same local cap as T), each summarised by the **request's own model** (`MAP_TIMEOUT_S = 420 s` each — a 163k-token chunk on the 3060 is ~230 s of prefill + synthesis, measured), partials re-placed before the current request. | Yes |
 | **T3** | **Deterministic truncation, no model involved**: keeps head (35 %) and tail of the oversized messages after the last `user` message (and the middle of the last `user` message) and drops the centre, re-estimating after each cut until the estimate is ≤ **95 % of the context**. Last chance before the 413 — it is the only level that *always* gains when T/T2 cannot (short last `user`, compactor down/OOM/quarantined). Incident 2026-11-20 17:23: tail 260 578 tokens, last `user` 536, `small-model` dead → T skipped, T2 `no-gain`, deterministic 413. | Yes (middle of tool results dropped) |
+| **D** | **Drop the oldest history blocks** (agentic branch only, 2026-11-24): removes **whole** blocks from the oldest — an `assistant` with `tool_calls` and its `role: tool` results stay in the same block (splitting them produces an orphaned tool result and a provider 400) — keeping the last `AGENT_KEEP_BLOCKS = 6` blocks and the whole tail verbatim, `system`/`developer` never. Then **one** `system` message is inserted after the head system prompts saying which blocks, how many messages and how many tokens are gone and that the rest is verbatim (`D_HEADER`, English: the model reads it). Re-measured with `_estimate_faithful_tokens` after every pass, max 4 passes. **No LLM call.** | No — the removed text is gone and the model is *told* it is gone, so it re-reads it with a tool instead of trusting a summary. |
 | **F** | Nothing freed space → if the **prompt alone fits** (`est ≤ context`) this is *not* a `prompt_too_large`: `max_tokens` is **forced to the room left** (`context − est − 1024`, flat margin, floor `MIN_FORCED_OUTPUT = 256` — below it the real 413 stands) and the request **is sent**: our 413 was deterministic and killed every client retry, while an upstream 400 is recoverable through the fallback chain and Strata shortens the completion itself (`fit_max_tokens`). Only when the prompt genuinely exceeds the context → **413** with a structured detail (`model`, `context_tokens`, `prompt_tokens_estimated`, `tried`, `hint`). | — |
 
 **Tail-alone shortcut**: B/C/E preserve the tail (last `user` message onward)
 verbatim, so if the tail saturates the context *by itself* those levels cannot
 help — the cascade tries only T, T2 and T3, then goes straight to F, avoiding
 guaranteed useless cloud calls.
+
+**Agentic branch — `D → T3 → 413` only** (incident 2026-11-24, AiderDesk on
+`hybrid-model`). On a tool-calling loop the tool results *are* the worker's
+verification channel, and B/C/T/T2/E **rewrite** content: T2 replaces the current
+turn's tool results with a summary, E summarises the whole history, and the
+summariser is the request's own model — on `hybrid` a 12 GB local card. Measured
+over 9 identical cascades: history **669 939 chars → a 3 405-char brief**
+(0.5 % kept), the same number 8 times out of 9 because the per-chunk cap decides
+it. The agent then reports *"I applied the fix but could not verify it — my
+tool-output channel is broken in this session"*, or *"the compression proxy is
+returning a cached compressed blob … cache collision"*: from inside the session a
+summarised tool result is indistinguishable from a broken cache. So
+`_is_agentic_request` (body with `tools`/`functions`, or history with
+`role: tool`, `tool_calls`, `function_call`, Responses `function_call_output`)
+routes `_cascade` to `_cascade_agentic`: **D** first, then **T3** with a floor of
+`AGENT_T3_MIN_CHARS = 4000` chars (a 26-line `file_read` result is never cut in
+half), then an honest **413** whose `hint` is English and says compaction is the
+client's job (`agentic: true`, `prompt_tokens_faithful`, `dropped_blocks`). The
+excluded levels show up in `tried` as `skip-agentic`, so the log and the 413 body
+say they were left out on purpose, not that they failed.
+
+**Faithful estimate = the agentic threshold** (`_estimate_faithful_tokens`,
+2026-11-24): the density-ratio estimator is built to never underestimate — right
+when a miss costs a provider 400, disastrous when it costs an agent's history.
+Measured on the same AiderDesk request: the cascade fired at **~299 638 estimated
+tokens** against the pinned **196 608** context while AiderDesk itself compacts
+at **160k** — ~250k tokens of the worker's context destroyed for a request that
+fit. The agentic gate therefore uses tiktoken (+ digit correction, **no** `max()`
+with the ratio), re-measured after each level; when only the conservative
+estimate saturates, the cascade is skipped (`FALSO overflow` in the log) and the
+payload is left untouched. Non-agentic requests keep the conservative gate (they
+pay for a false 400, not for lost history). The tiktoken pass runs off the event
+loop (`asyncio.to_thread`) and only for requests already saturated, so the fast
+path is unchanged.
+
+**Language of injected text**: every marker/note that lands in the prompt
+(`TAIL_HEADER`, `T2_HEADER`, `T3_HEADER`, `COMPACTED_HEADER`, `D_HEADER`,
+`UNRESOLVABLE_IMAGE_NOTE`, `TRUNCATED_STREAM_MARKER`,
+`UPSTREAM_NOTICE_STREAM_TEXT`, the agentic 413 hint, the compaction system
+prompts) is **English**, because the model reads it and not every model handles
+Italian (user preference 2026-11-24). Comments and log lines stay Italian: the
+operator reads those.
 
 **Compaction headroom** (`COMPACTION_HEADROOM_PCT = 0.05`, 2026-11-20):
 T/T2/T3 stop at `ctx × 0.95`, not at the very edge of the context. Stopping

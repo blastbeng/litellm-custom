@@ -32,6 +32,12 @@ self.fallbacks)):
   di NESSUN modello. Resta un modello autonomo, invocabile direttamente, ma
   nessuna catena lo contiene piu': quando una catena si esaurisce l'errore
   dell'upstream arriva al client.
+  SUPERATA IN PARTE il 2026-11-24 (richiesta utente: "we use just small-model
+  from llama-swap"): small-model torna a essere il gradino LOCALE di
+  syn:small:text/vision (SYN_SMALL_*_FALLBACKS) e del ramo vision della
+  catena di hybrid-model (HYBRID_CHAIN_VISION), al posto del vecchio gemello
+  servito dall'Ollama locale, rimosso da tutto lo stack. Le richieste DIRETTE
+  a small-model restano senza fallback (fallbacks=[]).
 
   REGOLA (richiesta utente 2026-10-28): le chiamate INTERNE della cascata
   (B/T/T2/E, riconosciute dal metadata interno) girano con fallbacks=[] -
@@ -41,17 +47,17 @@ self.fallbacks)):
 - synthetic/*            -> [] (NESSUN fallback: local-model rimosso il
   2026-10-28; restano solo i rami esatti qui sotto - syn:small:text,
   syn:small:vision, embedding nomic)
-- synthetic/syn:small:text -> ["ollama/small-model","openrouter/free"]
-  (richiesta utente 2026-10-12: ollama/small-model (Ollama sullo STESSO PC:
-  server INDIPENDENTE da llama-swap, regge dove llama-swap da
-  429/serializza), poi il cloud GRATIS come rete di sicurezza col PC spento.
-  ollama/small-model e openrouter/free sono nomi concreti risolti dalle
-  wildcard ollama/* e openrouter/* del model_list - vedi la definizione di
-  SYN_SMALL_TEXT_FALLBACKS)
+- synthetic/syn:small:text -> ["small-model","openrouter/free"]
+  (richiesta utente 2026-11-24: prima small-model di llama-swap - il gemello
+  locale, una richiesta alla volta, regge dove il cloud da 429/quota - poi il
+  cloud GRATIS come rete di sicurezza col PC spento. small-model e
+  openrouter/free sono nomi concreti: il primo e' un deployment di config, il
+  secondo lo risolve la wildcard openrouter/* del model_list - vedi la
+  definizione di SYN_SMALL_TEXT_FALLBACKS)
 - synthetic/syn:small:vision -> IDENTICA a syn:small:text (richiesta utente
-  2026-10-14): stessi gradini, stesso ordine. syn:small:VISION su
-  ollama/small-model (text-only) puo' rispondere 400 sull'input vision: hop
-  sprecato, la catena prosegue - vedi SYN_SMALL_VISION_FALLBACKS)
+  2026-10-14): stessi gradini, stesso ordine. small-model dichiara
+  supports_vision: true, quindi il gradino locale serve anche l'input vision -
+  vedi SYN_SMALL_VISION_FALLBACKS)
 - synthetic/hf:nomic-ai/nomic-embed-text-v1.5 -> ["embedding-model"]
   (richiesta utente 2026-10-04: modello EMBEDDING su synthetic.new, endpoint
   /v1/embeddings; quando non disponibile cade sul modello omonimo di
@@ -143,12 +149,45 @@ una cascata a livelli, e dopo ogni livello riusa la stima per il clamp:
      verbatim. T tiene verbatim solo le ANCORE (inizio ~3000 char, fine
      ~6000 char, dove sta la richiesta corrente) e riassume il mezzo a
      chunk. Se la coda satura DA SOLA, B/C/E vengono saltati del tutto.
+  T2 riassunto IN PLACE dei messaggi DOPO l'ultimo user (tool result,
+     assistant), con il modello della richiesta. Perde il contenuto: utile ai
+     client che non ricompattano, VIETATO sui loop agentici (REGOLA sotto).
   E  map/reduce: l'intera storia viene tagliata in chunk e riassunta, poi
      le sintesi vengono ricomposte davanti alla richiesta corrente (che
      resta fedele). Ultima spiaggia perche' e' lossy e costa N chiamate.
+  D  DROP DEI BLOCCHI PIU' VECCHI (richiesta utente 2026-11-24): rimuove
+     blocchi INTERI di storia vecchia dal piu' vecchio (un assistant con
+     tool_calls e i suoi risultati restano insieme), lascia verbatim gli
+     ultimi AGENT_KEEP_BLOCKS blocchi e tutta la coda, e inserisce UN solo
+     messaggio system che dice quali blocchi, quanti messaggi e quanti token
+     sono spariti. Nessun riassunto, nessuna chiamata LLM. Solo ramo agentico.
+  T3 troncamento DETERMINISTICO (nessun modello): testa+coda verbatim e centro
+     rimosso sui messaggi post-user, pavimento AGENT_T3_MIN_CHARS sul ramo
+     agentico. Ultimo livello prima del 413: guadagna sempre.
   F  se nessun livello libera spazio: 413 con dettaglio strutturato
      (modello, contesto, stima, livelli provati, hint) invece di far
      partire la richiesta e farla morire sulla catena di fallback.
+
+REGOLA AGENICA (incidente 2026-11-24, AiderDesk su hybrid-model): per le
+richieste agentiche (_is_agentic_request) la cascata e' SOLO D -> T3 -> 413,
+e la SOGLIA e' la stima FEDELE (_estimate_faithful_tokens, tiktoken): il
+ratio a densita' sovrastima codice + schemi tool (~45% misurato) e faceva
+partire la cascata su richieste che stavano dentro il contesto. Motivo dello
+skip di B/C/T/T2/E: quei livelli RISCIVONO il contenuto (riassunto o stub) e
+su un loop di coding i tool result SONO il canale di verifica dell'operaio;
+il riassuntore e' il modello della richiesta (su hybrid un locale da 12GB) e
+da 669.939 char di storia produceva un brief da 3405 char, identico in 8
+passaggi su 9. L'operaio legge "mi arriva un blob di contesto compattato, il
+proxy ha una cache rotta" e riporta un tool-output channel rotto: un 413
+onesto con la lista dei livelli esclusi costa meno di contenuto falso.
+
+LINGUA DEI TESTI INIETTATI: i marker e le note che finiscono nel PROMPT
+(TAIL_HEADER, T2_HEADER, T3_HEADER, COMPACTED_HEADER, D_HEADER,
+UNRESOLVABLE_IMAGE_NOTE, TRUNCATED_STREAM_MARKER, UPSTREAM_NOTICE_STREAM_TEXT,
+hint del 413 agentico, system prompt dei compattatori) sono IN INGLESE perche'
+li legge il modello e non tutti i modelli sanno l'italiano (preferenza utente
+2026-11-24). Commenti e righe di log restano in italiano: li legge
+chi amministra il proxy.
 
 POOL OPERARI = MODELLO DELLA RICHIESTA (richiesta utente 2026-10-28, che
 sostituisce il pool dinamico del 2026-10-06): B, T, T2 ed E chiamano SEMPRE
@@ -196,7 +235,7 @@ GROQ_REASONING = ("openai/gpt-oss", "qwen/")
 # ha gia' ricevuto contenuto (vedi async_post_call_streaming_iterator_hook):
 # meglio una risposta parziale con un avviso esplicito di un 500 che la perde.
 TRUNCATED_STREAM_MARKER = (
-    "\n\n[risposta interrotta: il provider ha chiuso lo stream in anticipo]"
+    "\n\n[answer interrupted: the provider closed the stream early]"
 )
 
 # Testo che sostituisce un'immagine il cui URL il provider non puo' risolvere
@@ -205,7 +244,7 @@ TRUNCATED_STREAM_MARKER = (
 # _sanitize_unresolvable_images: senza questa sostituzione synthetic risponde
 # 400 "Could not parse image as valid URL" e la richiesta non parte.
 UNRESOLVABLE_IMAGE_NOTE = (
-    "[immagine non disponibile: file locale di OpenWebUI non risolvibile dal provider]"
+    "[image unavailable: local OpenWebUI file cannot be resolved by the provider]"
 )
 
 # Avviso di THROTTLING servito come CONTENUTO di una risposta 200.
@@ -226,9 +265,9 @@ UPSTREAM_NOTICE_SCAN_CHARS = 300
 # Testo che sostituisce lo stream quando l'avviso arriva mentre si legge:
 # le header SSE (200) sono gia' partite, l'unica cosa utile e' dirlo.
 UPSTREAM_NOTICE_STREAM_TEXT = (
-    "[provider free temporaneamente limitato (quota per IP): la risposta non "
-    "e' stata generata. Riprova tra qualche minuto oppure usa un modello "
-    "di un altro provider.]"
+    "[free provider temporarily rate-limited (per-IP quota): the answer was "
+    "not generated. Retry in a few minutes, or use a model from another "
+    "provider.]"
 )
 
 
@@ -305,42 +344,36 @@ def _upstream_notice(text):
 # autonomo, invocabile direttamente; quando una catena si esaurisce l'errore
 # dell'upstream arriva al client.
 
-# synthetic/syn:small:text (richiesta utente 2026-10-12): la catena parte dal
-# gemello Ollama e prosegue sui cloud GRATIS. La divergenza da
-# syn:small:vision e' DURATA fino al 2026-10-14: da allora le due catene sono
-# di nuovo IDENTICHE (richiesta utente 2026-10-14), vedi
-# SYN_SMALL_VISION_FALLBACKS.
-#   1) ollama/small-model (Ollama sullo STESSO PC 192.168.1.29:11434, via
-#      ollama-gw + ollama-gate -> 503 in ~2s col PC spento: server INDIPENDENTE
-#      da llama-swap, quindi regge quando llama-swap e' occupo o da 429 "Too
-#      many requests" - la sua serializzazione one-request-at-a-time e' il
-#      motivo principale di questo gradino. Contesto statico della wildcard
-#      131072: un prompt che lo supera puo' 400 qui, la catena prosegue (hop
-#      sprecato, non fatale). Il nome DEVE esistere in Ollama sul PC: se manca
-#      l'upstream da 404, anche quello e' un fallimento d'hop e la catena
-#      prosegue)
-#   2) openrouter/free (cloud, GRATIS)
+# synthetic/syn:small:text (richiesta utente 2026-11-24): il primo gradino e'
+# il gemello LOCALE su llama-swap (small-model), poi il cloud GRATIS.
+#   1) small-model (llama-swap sul PC 192.168.1.29, via llama-gate -> 503 in
+#      ~2s col PC spento; una richiesta alla volta, quindi regge quando il
+#      cloud e' a quota/429. Contesto reale 196608: un prompt che lo supera
+#      puo' 400 qui, la catena prosegue - hop sprecato, non fatale)
+#   2) openrouter/free (cloud, GRATIS: meta-router che sceglie da solo il
+#      miglior modello free disponibile lato OpenRouter)
 # Il nome cloud e' CONCRETO, risolto dalla wildcard "openrouter/*" del
 # model_list (litellm: get_model_list -> _get_wildcard_deployments ->
 # PatternMatchRouter.route: "openrouter/free" matcha "openrouter/.*" e
 # instrada verso il gateway openrouter-gw) - verificato sul listing del
 # proxy, NON un prefisso fittizio.
-# "ollama/small-model" segue la STESSA meccanica con la wildcard "ollama/*"
-# (il capture toglie "ollama/" e a Ollama arriva il nome nativo "small-model"):
-# la wildcard instrada ANCHE col PC spento perche' PatternMatchRouter matcha il
-# PATTERN della model_list, non il listing, che per ollama-gw e' dinamico.
+# STORIA: fino al 2026-11-24 il primo gradino era il gemello servito
+# dall'Ollama LOCALE del PC (server separato da llama-swap). Richiesta utente
+# 2026-11-24 ("we use just small-model from llama-swap"): quel server non si
+# usa piu' e il nome e' stato rimosso da TUTTO lo stack (qui, in config.yaml,
+# in config.example.yaml e nel README).
 # ORDINE: il gradino locale PRIMA (unico posto con i dati dell'utente; 503 in
-# ~2s col PC spento, quindi i cloud restano raggiungibili subito), i cloud
+# ~2s col PC spento, quindi i cloud restano raggiungibili subito), il cloud
 # gratis come rete di sicurezza.
 SYN_SMALL_TEXT = "synthetic/syn:small:text"
-SYN_SMALL_TEXT_FALLBACKS = ["ollama/small-model", "openrouter/free"]
+SYN_SMALL_TEXT_FALLBACKS = ["small-model", "openrouter/free"]
 
 # synthetic/syn:small:vision (richiesta utente 2026-10-14): catena IDENTICA a
 # syn:small:text - stessi gradini, stesso ordine. Definiti per ALIAS su
 # SYN_SMALL_TEXT_FALLBACKS cosi' le due catene non possono piu' divergere
 # (il ramo _apply resta separato solo per chiarezza dei commenti).
-# syn:small:VISION su ollama/small-model (text-only) puo' rispondere 400
-# sull'input vision: hop sprecato, la catena prosegue.
+# small-model dichiara supports_vision: true in config.yaml, quindi il gradino
+# locale serve anche l'input vision: nessun hop sprecato.
 SYN_SMALL_VISION = "synthetic/syn:small:vision"
 SYN_SMALL_VISION_FALLBACKS = list(SYN_SMALL_TEXT_FALLBACKS)
 
@@ -511,11 +544,18 @@ HYBRID_PUBLIC = "hybrid-model"
 # concorrenza) o giu' (failover), e solo se il PC e' online - spento va in
 # cooldown e non compare tra gli healthy, quindi non viene mai scelto.
 HYBRID_TIER1 = ("synthetic/syn:large:text", "local-model")
-# Tier 2 = SPILL: entra solo quando NESSUN tier 1 e' sano. syn:small:text e'
-# text-only (il pre-filtro vision lo esclude sulle richieste con immagine);
-# gemini-flash-latest e' il cloud a consumo, ultimo.
-HYBRID_TIER2 = ("synthetic/syn:small:text", "small-model",
-                "gemini/models/gemini-flash-latest")
+# Tier 2 = SPILL: entra solo quando NESSUN tier 1 e' sano (o quando il tier 1
+# e' stato svuotato dal pre-filtro). Cambia con la CAPACITA' della richiesta
+# (richiesta utente 2026-11-24: "... if no vision, else ..."):
+#   - testo:  syn:small:text (text-only dichiarato, 196608)
+#   - vision: syn:small:vision, poi small-model (entrambi vision-capable)
+# Il tier 1 NON viene saltato sulle richieste vision: entrambi i suoi membri
+# dichiarano supports_vision: true (syn:large:text 524288, local-model), quindi
+# la qualita' resta davanti e il ramo vision scatta quando il tier 1 e' giu' o
+# a quota zero. gemini-flash-latest NON e' piu' un membro: ora e' una delle
+# riserve free dinamiche (HYBRID_RESERVE_POOLS, pool "gemini/").
+HYBRID_TIER2_TEXT = ("synthetic/syn:small:text",)
+HYBRID_TIER2_VISION = ("synthetic/syn:small:vision", "small-model")
 # PESI del riparto DENTRO il tier 1 (somma 1.0). Regola: qualita' prima, ma
 # senza accodare tutto sul primario quando arrivano richieste concorrenti.
 #   - a carico ZERO il filtro NON decide: lascia il tier a least-busy, che
@@ -539,21 +579,33 @@ PINNED_CONTEXT = {HYBRID_PUBLIC: 196608, HYBRID_GROUP: 196608}
 # un routing_group - il pattern verrebbe scelto alla lettera e all'upstream
 # arriverebbe model="*" (400, misurato). Si espandono per-request dai listing
 # in cache (nomi CONCRETI) e si passano come fallbacks per-request: partono
-# solo a gruppo esaurito. openrouter: SOLO id gratuiti.
-HYBRID_RESERVE_PREFIXES = ("openrouter/", "cloudflare/", "groq/")
-HYBRID_RESERVE_MAX = 3
+# solo a gruppo esaurito.
+# POOL in ORDINE DI PREFERENZA (l'ordine dato dall'utente il 2026-11-24:
+# "openrouter/free ollama-cloud groq/* gemini/* cloudflare/*"). Da ogni pool si
+# prende UN SOLO nome scelto per salute/contesto: cinque gradini = cinque
+# provider diversi, mai due tentativi sullo stesso provider. openrouter: SOLO
+# id gratuiti (n == "openrouter/free" oppure suffisso ":free").
+HYBRID_RESERVE_POOLS = ("openrouter/", "ollama-cloud/", "groq/",
+                        "gemini/", "cloudflare/")
+HYBRID_RESERVE_MAX = len(HYBRID_RESERVE_POOLS)   # un gradino per pool
 
 # CATENA di ripiego di hybrid-model quando il membro scelto non risponde
-# (quota 402, 429, 5xx, timeout): i NOSTRI modelli locali PRIMA di tutto,
-# in quest'ordine (richiesta utente 2026-11-24: "finiti i quota, usa i
-# modelli locali, prima local-model poi small-model"), e solo DOPO le
-# riserve free di HYBRID_RESERVE_PREFIXES. Non e' una rotazione: questi
-# nomi vengono provati solo quando il gruppo ha gia' fallito.
-# NOTA: qui small-model entra nella catena di UN SOLO modello (il gruppo),
-# che lo contiene gia' come membro del tier 2; la regola del 2026-10-25
-# ("small-model non e' fallback di nessuno") vale per le richieste DIRETTE,
-# che infatti restano con fallbacks=[] (vedi il ramo `model == "small-model"`).
-HYBRID_LOCALS = ("local-model", "small-model")
+# (quota 402, 429, 5xx, timeout). Ordine RICHIESTO dall'utente il 2026-11-24:
+#   testo:  local-model -> syn:small:text
+#   vision: syn:small:vision -> small-model
+# e solo DOPO le riserve free di HYBRID_RESERVE_POOLS. Non e' una rotazione:
+# questi nomi vengono provati solo quando il gruppo ha gia' fallito.
+# I due rami NON sono simmetrici di proposito: syn:small:text e' text-only
+# (mettarlo davanti a una richiesta con immagine sarebbe un 400 garantito),
+# mentre nel ramo vision servono entrambi i nomi vision-capable - e small-model
+# (llama-swap, una richiesta alla volta) e' l'ultimo locale utile quando anche
+# syn:small:vision e' a quota zero.
+# NOTA: small-model entra nella catena di UN SOLO modello (il gruppo); le
+# richieste DIRETTE di small-model restano con fallbacks=[] (vedi il ramo
+# `model == "small-model"`). Vale lo stesso per syn:small:text/vision, che
+# hanno la loro catena statica SYN_SMALL_*_FALLBACKS.
+HYBRID_CHAIN_TEXT = ("local-model", SYN_SMALL_TEXT)
+HYBRID_CHAIN_VISION = (SYN_SMALL_VISION, "small-model")
 
 
 def _register_hybrid_listing():
@@ -783,8 +835,7 @@ def _model_tier(n):
     if ("free" in brand or brand == "ollama-cloud"
             or s == "openrouter/free"):
         return TIER_FREE
-    if s in ("small-model", "local-model", "ollama/small-model",
-             "embedding-model"):
+    if s in ("small-model", "local-model", "embedding-model"):
         return TIER_FREE
     low = s.lower()
     if any(p in low for p in CHEAP_PATTERNS):
@@ -1508,6 +1559,29 @@ def _quota_out(model):
     return bool(until and until > time.monotonic())
 
 
+def _quota_out_name(name):
+    """True se il nome di LISTING `name` e' a quota esaurita (402) adesso.
+
+    _QUOTA_OUT e' chiavata sul modello CONCRETO dell'upstream, quello che
+    litellm mette in `exception.model`: per i deployment statici e'
+    litellm_params.model ("openai/syn:large:text"), per le wildcard dei pool
+    free e' "openai/<id-nativo>" (misurato nei log: "openai/mimo-v2.6-pro" per
+    il listing ollama-cloud/mimo-v2.6-pro, "openai/models/gemini-flash-latest"
+    per gemini/models/gemini-flash-latest). Qui si provano le forme note, cosi'
+    una riserva appena andata in 402 non viene riprovata per i 5 minuti del TTL.
+    """
+    if _quota_out(name):
+        return True
+    text = str(name or "")
+    if "/" not in text:
+        return False
+    suffix = text.split("/", 1)[1]
+    for cand in (suffix, "openai/" + suffix):
+        if cand != text and _quota_out(cand):
+            return True
+    return False
+
+
 def _config_supports_vision(name):
     """True se la CONFIG dichiara supports_vision per il modello `name`.
 
@@ -1765,10 +1839,13 @@ ANCHOR_HEAD_CHARS = 3000       # inizio dell'ultimo user: VERBATIM
 ANCHOR_TAIL_CHARS = 6000       # fine dell'ultimo user: VERBATIM (qui sta
                                # la richiesta corrente del client)
 TAIL_ORIGIN = "context_tail_split"
+# I marker che finiscono nel PROMPT sono in INGLESE (preferenza utente
+# 2026-11-24): li legge il modello, non l'operatore. Commenti e righe di log
+# restano in italiano perche' li legge chi amministra il proxy.
 TAIL_HEADER = (
-    "[NOTA: la parte CENTRALE di questo messaggio (lungo) e' stata "
-    "compressa: inizio e fine sono VERBATIM, il mezzo e' riassunto qui "
-    "sotto in modo fedele]\n"
+    "[NOTE: the MIDDLE of this long message was compressed by the proxy so "
+    "the prompt fits the context window: the beginning and the end are "
+    "VERBATIM, the middle is summarised below]\n"
 )
 # T2: compressione dei messaggi DOPO l'ultimo user (risultati tool,
 # assistant). B/C/E tengono la coda verbatim e T tocca SOLO il mezzo
@@ -1777,9 +1854,9 @@ TAIL_HEADER = (
 T2_MAX_MESSAGES = 12    # tetto di messaggi compressi in una passata
 T2_TIME_BUDGET_S = 420  # budget TOTALE di wall-time della passata (TTL)
 T2_HEADER = (
-    "[NOTA: questo messaggio (lungo, tipicamente un risultato tool) e' "
-    "stato COMPRESSO dal proxy per rientrare nel contesto: qui sotto un "
-    "riassunto fedele del contenuto originale]\n"
+    "[NOTE: this message (long, typically a tool result) was COMPRESSED by "
+    "the proxy so the prompt fits the context window: below is a summary of "
+    "the original content, NOT the original text]\n"
 )
 # T3: TRONCAMENTO deterministico (nessun modello). Ultimo livello prima del
 # 413: quando T/T2 non possono lavorare (operaio di compattazione giu'/in
@@ -1790,14 +1867,38 @@ T2_HEADER = (
 # e, per ultimo, il MEZZO dell'ultimo user lasciando le ancore verbatim (li'
 # nessun altro livello deterministico arriva: T dipende dall'operaio).
 T3_HEADER = (
-    "[NOTA: contenuto TRONCATO dal proxy per rientrare nel contesto: "
-    "restano inizio e fine VERBATIM, il centro e' stato rimosso]\n"
+    "[NOTE: content TRUNCATED by the proxy so the prompt fits the context "
+    "window: the beginning and the end are VERBATIM, the middle was removed]\n"
 )
 T3_MIN_KEEP_CHARS = 2000   # sotto questo tagliare non ha piu' senso: si passa
                            # al messaggio successivo (o al 413)
 T3_TRIM_SLACK_TOKENS = 512  # arrotondamento token->char: senza slack il
                             # taglio resta 1-2 token sopra il target
 T3_HEAD_RATIO = 0.35       # quota di testa del testo che resta (il resto coda)
+
+# CASCATA AGENICA (incidente 2026-11-24: AiderDesk su hybrid-model). Su un
+# loop agentico i tool result NON devono essere riassunti: T2/E li sostituiscono
+# con un brief scritto dal modello della richiesta (su hybrid un locale da
+# 12GB: 669.939 char di storia -> 3405 char di brief, lo stesso numero in 8
+# passaggi su 9 perche' e' il tetto per-chunk a deciderlo) e l'operaio riporta
+# "il canale dei tool e' rotto / mi arriva un blob di contesto compattato".
+# Per le richieste agentiche la cascata diventa D -> T -> T3 -> 413: si
+# rimuovono BLOCCHI INTERI di storia vecchia (l'informazione meno utile), non
+# si riscrive MAI il contenuto recente.
+AGENT_KEEP_BLOCKS = 6      # gli ultimi N blocchi della storia non si toccano
+AGENT_DROP_MIN_CHARS = 200  # blocchi piu' piccoli: rimuoverli non paga
+AGENT_T3_MIN_CHARS = 4000  # pavimento di T3 sui tool result agentici (~1000
+                           # token): un file_read da 26 righe non si tocca
+D_LIST_MAX = 12            # blocchi elencati nel marker (poi "... and N more")
+D_ORIGIN = "context_drop_oldest"
+D_HEADER = (
+    "[NOTE FROM THE PROXY: the {n} OLDEST conversation blocks ({m} messages, "
+    "~{t} tokens) were REMOVED from this prompt so it fits the model context "
+    "of {ctx} tokens. This is NOT a summary: the removed text is gone and "
+    "cannot be retrieved from here. The most recent {k} messages, the current "
+    "request and its tool results are VERBATIM. If you need a removed detail, "
+    "re-read it from the file/system with a tool.]\n"
+)
 
 COMPACT_SYSTEM_PROMPT = (
     "You compress conversation context for a coding agent. Rewrite the "
@@ -1807,7 +1908,7 @@ COMPACT_SYSTEM_PROMPT = (
     "invent facts, do not answer the request, do not add advice. Output "
     "ONLY the brief."
 )
-COMPACTED_HEADER = "CONTESTO PRECEDENTE COMPATTATO (fedele, compresso):\n"
+COMPACTED_HEADER = "PREVIOUS CONTEXT COMPACTED BY THE PROXY (summary, lossy):\n"
 MAP_SYSTEM_PROMPT = (
     "You compress one slice of a coding-agent transcript. Keep VERBATIM "
     "file paths, symbols, numbers, commands, error messages and decisions. "
@@ -2063,8 +2164,16 @@ def _is_agentic_request(data):
     e la cache degli originali NON e' servita da nessun endpoint (vedi README).
     Un agente che legge quello stub prova a chiamare un tool che non esiste e
     conclude di avere "il canale dei tool rotto" (sintomo riportato
-    2026-11-24). Per il resto della cascata (B/T/T2/T3/E) il testo prodotto e'
-    usabile, quindi si salta SOLO C.
+    2026-11-24).
+
+    POLIZIA (2026-11-24, stesso sintomo nella seconda forma riportata da
+    AiderDesk): su True la cascata corre nel ramo D -> T3 -> 413
+    (`_cascade_agentic`) e la soglia passa alla stima FEDELE
+    (`_estimate_faithful_tokens`). NON si salta piu' solo C: B/T/T2/E
+    riscrivono il contenuto - tool result del turno corrente in T2, intera
+    storia in E - e per un operaio di coding un contenuto riscritto e'
+    indistinguibile da una cache rotta. D e T3 rimuovono e lo dichiarano con
+    i numeri, quindi il modello sa cosa non ha e se lo rilegge con un tool.
 
     Stessi segnali di headroom_callback._is_agentic: ``tools``/``functions``
     dichiarati, oppure storia con ruolo ``tool``/``function``, ``tool_calls``,
@@ -2092,8 +2201,7 @@ _FAKE_RETRIEVAL_HINT = (
     "Use litellm_content_retrieve tool to get full content."
 )
 _HONEST_RETRIEVAL_HINT = (
-    "[contenuto rimosso in modo definitivo: nessun tool di retrieval in "
-    "questo stack]"
+    "[content permanently removed: no retrieval tool exists in this stack]"
 )
 
 
@@ -2326,6 +2434,76 @@ class ReasoningClamp(CustomLogger):
             if data.get(k):
                 sub[k] = data[k]
         return self._estimate_prompt_tokens(sub)
+
+    def _estimate_faithful_tokens(self, data):
+        """Stima FEDELE: tiktoken (+correzione cifre) SENZA il max() col ratio
+        a densita' usato da `_estimate_prompt_tokens`.
+
+        Perche' serve: `_estimate_prompt_tokens` e' costruita per NON
+        sottostimare MAI (un 400 dell'upstream ammazza la catena di fallback),
+        e sul testo denso il ratio 2.8 char/token batte tiktoken. Misurato
+        2026-11-24 su una richiesta AiderDesk (codice + ~100 schemi tool): la
+        cascata e' partita a ~299.638 tok stimati contro un contesto di
+        196608, il conteggio fedele era sotto quella soglia e AiderDesk
+        compatta a 160k. La cascata ha quindi distrutto ~250k token di
+        contesto dell'operaio (E: 669.939 char -> 3405 char) per una richiesta
+        che, contata come conta il provider, stava dentro.
+
+        Sul ramo AGENTICO i livelli disponibili (D/T3) sono deterministici e
+        rimuovono storia VECCHIA: il costo di un falso overflow e' altissimo,
+        cosi' come quello di un 400. cl100k+ cifra resta conservativo sul
+        tokenizer llama (~1.2x sulla prosa, ~1x sul codice, vedi
+        `_tiktoken_estimate`), quindi regge come soglia da sola. Se tiktoken
+        non e' disponibile si ricade sul ratio: comportamento identico a prima.
+        """
+        texts = []
+        images = 0
+        for m in data.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                texts.append(c)
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict):
+                        if part.get("type") in ("image_url", "image"):
+                            images += 1
+                            continue
+                        for k in ("text", "content"):
+                            v = part.get(k)
+                            if isinstance(v, str):
+                                texts.append(v)
+                    elif isinstance(part, str):
+                        texts.append(part)
+            for k in ("reasoning", "reasoning_content", "name"):
+                v = m.get(k)
+                if isinstance(v, str):
+                    texts.append(v)
+            if m.get("tool_calls"):
+                try:
+                    texts.append(json.dumps(m["tool_calls"], ensure_ascii=False))
+                except Exception:
+                    texts.append(str(m["tool_calls"]))
+        tool_texts = []
+        for t in data.get("tools") or data.get("functions") or []:
+            try:
+                tool_texts.append(t if isinstance(t, str) else json.dumps(t))
+            except Exception:
+                tool_texts.append(str(t))
+        fixed = TOOL_FIXED_TOKENS * len(tool_texts)
+        tk_msgs = _tiktoken_corrected(texts)
+        tk_tools = _tools_tiktoken(tool_texts)
+        if tk_msgs is None:
+            # tiktoken indisponibile: identico alla stima conservativa
+            return self._estimate_prompt_tokens(data)
+        est = tk_msgs + int(sum(_digit_count(t) for t in tool_texts)
+                            * DIGIT_TOKEN_EXTRA)
+        est += tk_tools if tk_tools is not None else sum(
+            _ratio_estimate(t) for t in tool_texts)
+        return (est + fixed + PER_MESSAGE_OVERHEAD
+                * len(data.get("messages") or [])
+                + images * IMAGE_TOKEN_COST)
 
     def _margin(self, est):
         """Margine di sicurezza della stima: FISSO + PROPORZIONALE.
@@ -3041,9 +3219,21 @@ class ReasoningClamp(CustomLogger):
 
     # ---------------- T3: troncamento deterministico (nessun modello) -------
 
-    async def _truncate_tail_messages(self, data, model, est):
+    async def _truncate_tail_messages(self, data, model, est,
+                                      min_chars=COMPACT_MIN_CHARS,
+                                      faithful=False):
         """Livello T3: tronca IN PLACE i messaggi dopo l'ultimo user, il piu'
         grande prima, finche' la stima rientra nel contesto.
+
+        `min_chars` e' il pavimento: sotto quella misura un messaggio NON viene
+        toccato. Sul ramo agentico vale AGENT_T3_MIN_CHARS (~1000 token), perche'
+        li' i candidati sono i risultati tool del turno corrente e un
+        file_read da 26 righe che torna meta' tagliato e' esattamente il
+        "tool-output channel broken" segnalato da AiderDesk il 2026-11-24.
+        `faithful` = misura con `_estimate_faithful_tokens` (tiktoken): sul ramo
+        agentico tutta la cascata usa quella soglia, altrimenti il ratio a
+        densita' (che sovrastima del ~45% sul codice) fa tagliare contenuto che
+        stava dentro.
 
         Non chiama NESSUN modello: e' l'ultimo livello prima del 413 e deve
         guadagnare sempre. Serve esattamente al caso in cui T (mezzo
@@ -3068,7 +3258,9 @@ class ReasoningClamp(CustomLogger):
             return None, "no-user-msg"
         post = msgs[idx + 1:]
         ctx = self._window_for(model)
-        cur = self._estimate_prompt_tokens(data)
+        est_fn = (self._estimate_faithful_tokens if faithful
+                  else self._estimate_prompt_tokens)
+        cur = est_fn(data)
         if not self._saturated(cur, ctx):
             return None, "already-fits"
         # Candidati: i messaggi DOPO l'ultimo user, il piu' grande prima, e per
@@ -3081,7 +3273,7 @@ class ReasoningClamp(CustomLogger):
         cand = []   # (char tagliabili, indice in msgs, pavimento da tenere)
         for i, m in enumerate(post):
             c = m.get("content")
-            if isinstance(c, str) and len(c) >= COMPACT_MIN_CHARS:
+            if isinstance(c, str) and len(c) >= min_chars:
                 cand.append((len(c), idx + 1 + i, T3_MIN_KEEP_CHARS))
         # content list (vision) / vuoto / solo tool_calls: niente da tagliare
         last_c = msgs[idx].get("content")
@@ -3132,7 +3324,7 @@ class ReasoningClamp(CustomLogger):
                 slot["content"] = (header + c[:head] + "\n[...]\n"
                                    + (c[len(c) - tail:] if tail > 0 else ""))
                 data["messages"] = new_msgs  # progressivo: i guadagni restano
-                cur = self._estimate_prompt_tokens(data)
+                cur = est_fn(data)
                 done += 1
                 progressed = True
             if not progressed:
@@ -3143,6 +3335,150 @@ class ReasoningClamp(CustomLogger):
               f"(coda e/o mezzo dell'ultimo user), stima ~{cur} tok "
               f"(contesto {ctx})", flush=True)
         return data, f"t3:{done}"
+
+    # ------------- D: rimozione dei blocchi piu' vecchi (zero modello) ------
+
+    def _blocks_of(self, msgs, upto):
+        """Blocchi ATOMICI di storia per il livello D.
+
+        Un assistant con `tool_calls` e i suoi risultati tool viaggiano
+        INSIEME: separarli produce un tool result orfano o un tool_calls senza
+        risposta, che per i provider OpenAI-compatibili e' un 400. Ogni altro
+        messaggio e' un blocco da solo. I role system/developer sono marcati
+        keep=True (il prompt di sistema del client non viene rimosso dal
+        proxy: non e' il proxy che lo ha scelto).
+        Ritorna [{"g": [indici], "label": str, "chars": n, "keep": bool}].
+        """
+        blocks = []
+        i = 0
+        while i < upto:
+            m = msgs[i]
+            role = str(m.get("role") or "?")
+            keep = role in ("system", "developer")
+            grp = [i]
+            label = role
+            if m.get("tool_calls") or m.get("function_call"):
+                j = i + 1
+                while j < upto and msgs[j].get("role") in ("tool", "function"):
+                    grp.append(j)
+                    j += 1
+                label = f"assistant+{len(grp) - 1} tool result"
+                i = j
+            else:
+                if role in ("tool", "function"):
+                    label = f"{role} (orphan tool result)"
+                i += 1
+            blocks.append({"g": grp, "label": label, "keep": keep,
+                           "chars": sum(len(self._serialize([msgs[k]]))
+                                        for k in grp)})
+        return blocks
+
+    def _drop_oldest_blocks(self, data, model, est):
+        """Livello D (incidente 2026-11-24, AiderDesk su hybrid-model): rimuove
+        i blocchi di storia PIU' VECCHI, interi, dal piu' vecchio, finche' la
+        stima FEDELE rientra nel contesto.
+
+        Perche' esiste: su un loop agentico T2/E sostituiscono i tool result
+        con un riassunto, e il riassuntore e' il modello della richiesta (su
+        hybrid un locale da 12GB). Misurato: storia 669.939 char -> brief di
+        3405 char (0,5% trattenuto), stesso numero in 8 passaggi su 9 perche'
+        e' il tetto per-chunk a deciderlo. L'operaio si trova il contenuto dei
+        suoi tool sostituito e riporta "il canale dei tool e' rotto / il proxy
+        mi restituisce un blob di contesto compattato": da fuori e' indistinguibile
+        da una collisione di cache.
+
+        Cosa fa:
+        - blocchi atomici (vedi `_blocks_of`): mai separare un tool_calls dal
+          suo risultato;
+        - la coda dall'ULTIMO user in poi non si tocca (e' la richiesta
+          corrente con i suoi tool result);
+        - gli ultimi AGENT_KEEP_BLOCKS blocchi della storia non si toccano: la
+          parte recente e' quella su cui l'agente sta agendo;
+        - system/developer mai;
+        - un SOLO marker di ruolo system, subito dopo i system di testa, che
+          dice quanti blocchi/mezzaggi/token sono spariti e che gli ultimi N
+          messaggi sono VERBATIM (un buco silenzioso e' peggio del buco).
+
+        Perche' la soglia e' la stima FEDELE (`_estimate_faithful_tokens`):
+        D rimuove contenuto VECCHIO in modo deterministico, quindi qui il
+        pericolo non e' il 400 dell'upstream ma il buttare via storia che
+        serviva. Misurato: la cascata partiva a ~299.638 tok stimati (ratio a
+        densita') su contesto 196608 per una richiesta AiderDesk che compatta
+        a 160k: il ratio sovrastima, la cascata si mangiava ~250k token di
+        contesto per niente.
+
+        Ritorna (data, info) o (None, motivo).
+        """
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        idx = None
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return None, "no-user-msg"
+        ctx = self._window_for(model)
+        cur = self._estimate_faithful_tokens(data)
+        if not self._saturated(cur, ctx):
+            return None, f"already-fits:{cur}"
+        blocks = self._blocks_of(msgs, idx)
+        if not blocks:
+            return None, "no-history-blocks"
+        # costo per blocco misurato UNA volta (la somma ignora il framing: il
+        # riconteggio fedele a fine giro lo corregge, e i giri sono 4)
+        for b in blocks:
+            b["tok"] = self._estimate_subset([msgs[k] for k in b["g"]], data)
+        droppable = [b for b in blocks if not b["keep"]]
+        max_drop = max(0, len(blocks) - AGENT_KEEP_BLOCKS)
+        dropped = []
+        for _round in range(4):
+            if self._settled(cur, ctx) or len(dropped) >= max_drop:
+                break
+            progressed = False
+            for b in droppable:
+                if b.get("done"):
+                    continue
+                b["done"] = True
+                dropped.append(b)
+                progressed = True
+                cur -= max(1, b["tok"])
+                if self._settled(cur, ctx) or len(dropped) >= max_drop:
+                    break
+            if not progressed:
+                break
+            # riconteggio autorevole: la somma dei blocchi sottostima il
+            # framing e il ratio dei tools, quindi dopo ogni giro si rimisura
+            drop_idx = {k for b in dropped for k in b["g"]}
+            cur = self._estimate_faithful_tokens(
+                dict(data, messages=[m for i, m in enumerate(msgs)
+                                      if i not in drop_idx]))
+        if not dropped:
+            return None, f"nothing-droppable({len(blocks)} blocchi)"
+        drop_idx = {k for b in dropped for k in b["g"]}
+        new_msgs = [m for i, m in enumerate(msgs) if i not in drop_idx]
+        head_sys = 0
+        while (head_sys < len(new_msgs)
+               and str(new_msgs[head_sys].get("role") or "")
+               in ("system", "developer")):
+            head_sys += 1
+        lines = [f"  - {b['label']}: {b['chars']} char, ~{b['tok']} tok"
+                 for b in dropped[:D_LIST_MAX]]
+        if len(dropped) > D_LIST_MAX:
+            lines.append(f"  - ... and {len(dropped) - D_LIST_MAX} more blocks")
+        n_msgs = sum(len(b["g"]) for b in dropped)
+        n_tok = sum(b["tok"] for b in dropped)
+        new_msgs.insert(head_sys, {
+            "role": "system",
+            "content": D_HEADER.format(
+                n=len(dropped), m=n_msgs, t=n_tok, ctx=ctx,
+                k=len(new_msgs) - head_sys - 1) + "\n".join(lines)})
+        data["messages"] = new_msgs
+        after = self._estimate_faithful_tokens(data)
+        print(f"[reasoning_clamp] D {model}: rimossi {len(dropped)} blocchi "
+              f"({n_msgs} messaggi, ~{n_tok} tok), ~{after} tok fedeli "
+              f"(contesto {ctx}); {len(blocks) - len(dropped)} blocchi + coda "
+              f"verbatim", flush=True)
+        return data, f"drop:{len(dropped)}"
 
     # ---------------- E: map/reduce (modello della richiesta) ---------------
 
@@ -3255,32 +3591,127 @@ class ReasoningClamp(CustomLogger):
 
     # ---------------- F: errore strutturato ---------------------------------
 
-    def _overflow(self, data, model, est, tried):
+    def _overflow(self, data, model, est, tried, agentic=False, faithful=None,
+                  dropped=None):
         ctx = self._window_for(model)
         print(f"[reasoning_clamp] F {model}: prompt ~{est} tok > contesto "
               f"{ctx}; cascata esaurita ({'|'.join(tried)})", flush=True)
-        raise HTTPException(
-            status_code=413,
-            detail={
-                "error": "prompt_too_large",
-                "model": model,
-                "context_tokens": ctx,
-                "prompt_tokens_estimated": est,
-                "tried": tried,
-                "hint": ("il prompt supera il contesto del modello e la "
-                         "cascata di compattazione (B compattori a contesto "
-                         "grande -> C compressione BM25 -> T split+compress "
-                         "della coda -> T2 compressione dei messaggi dopo "
-                         "l'ultimo user -> E map/reduce, eseguiti con "
-                         f"{', '.join(self._compactor_chain(model))} -> "
-                         "T3 troncamento "
-                         "deterministico) non ha "
-                         "liberato spazio: riduci il contesto del client o "
-                         "usa un modello con contesto maggiore"),
-            },
-        )
+        detail = {
+            "error": "prompt_too_large",
+            "model": model,
+            "context_tokens": ctx,
+            "prompt_tokens_estimated": est,
+            "tried": tried,
+            "hint": ("il prompt supera il contesto del modello e la "
+                     "cascata di compattazione (B compattori a contesto "
+                     "grande -> C compressione BM25 -> T split+compress "
+                     "della coda -> T2 compressione dei messaggi dopo "
+                     "l'ultimo user -> E map/reduce, eseguiti con "
+                     f"{', '.join(self._compactor_chain(model))} -> "
+                     "T3 troncamento "
+                     "deterministico) non ha "
+                     "liberato spazio: riduci il contesto del client o "
+                     "usa un modello con contesto maggiore"),
+        }
+        if agentic:
+            # Ramo agentico: il client (AiderDesk e simili) compatta DA SOLO e
+            # questo corpo finisce nel tool result che il modello legge: il
+            # testo e' IN INGLESE e dice cosa fare, perche' la scelta giusta
+            # qui e' fallire in faccia, non riassumere il lavoro dell'operaio.
+            detail["agentic"] = True
+            detail["prompt_tokens_faithful"] = faithful
+            detail["dropped_blocks"] = dropped or 0
+            detail["hint"] = (
+                "The prompt does not fit this model's context. The proxy "
+                "removed the oldest history blocks (see the D lines in the "
+                "proxy log) and the request STILL does not fit, so the proxy "
+                "refused it instead of rewriting your recent tool results - "
+                "a summarised tool result is worse than a failure, because "
+                "you cannot tell it is not the real output. Compaction is the "
+                "client's job here: shrink the current turn (read files in "
+                "smaller chunks, cap command output, drop old attachments) "
+                "or pick a model with a larger context.")
+        raise HTTPException(status_code=413, detail=detail)
 
     # ---------------- cascata ----------------------------------------------
+
+    async def _cascade_agentic(self, data, model, ctx, est, faithful):
+        """Ramo agentico della cascata: D -> T3 -> 413. Mai un riassunto.
+
+        Perche' separato: su un loop di coding i tool result SONO il canale di
+        verifica dell'operaio. B/C/T/T2/E li sostituiscono con testo scritto da
+        un modello (su hybrid il riassuntore e' il modello della richiesta, un
+        locale da 12GB: storia di 669.939 char -> brief di 3405 char, identico
+        in 8 passaggi su 9), e dal punto di vista dell'operaio e' indistinguibile
+        da una cache rotta: il report del 2026-11-24 era "il mio tool-output
+        channel e' rotto / mi arriva un blob di contesto compattato". D e T3
+        invece RIMUOVONO e lo dicono con i numeri, cosi' il modello sa cosa non
+        ha e se lo rilegge con un tool.
+
+        I livelli esclusi finiscono in `tried` come `skip-agentic`: nel log e
+        nel body del 413 deve potersi leggere che non sono falliti, sono
+        volutamente fuori (vedi `_is_agentic_request`).
+        """
+        tried = [f"gate:faithful:{faithful}"]
+        skipped = ("B", "C", "T", "T2", "E")
+        tried += [f"{n}:skip-agentic" for n in skipped]
+        print(f"[reasoning_clamp] {model}: richiesta agentica, saltati "
+              f"{'/'.join(skipped)} (ognuno riscrive i tool result o la "
+              f"storia: su un loop di coding e' peggio del 413) -> D/T3",
+              flush=True)
+        dropped = 0
+        try:
+            # D: CPU-bound (tiktoken su centinaia di migliaia di char)
+            new, info = await asyncio.to_thread(self._drop_oldest_blocks,
+                                                data, model, faithful)
+        except Exception as e:
+            new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
+        tried.append(f"D:{info}")
+        if new is None:
+            print(f"[reasoning_clamp] D {model}: nessun guadagno ({info})",
+                  flush=True)
+        else:
+            data = new
+            try:
+                dropped = int(str(info).split(":", 1)[1])
+            except (IndexError, ValueError):
+                dropped = 0
+            faithful = self._estimate_faithful_tokens(data)
+            self._clamp_output(data, model, faithful)
+            if self._settled(faithful, ctx):
+                print(f"[reasoning_clamp] {model}: cascata risolta da D "
+                      f"(~{faithful} tok fedeli, contesto {ctx})", flush=True)
+                return data
+        # T3 con il pavimento agentico: un tool result sotto AGENT_T3_MIN_CHARS
+        # non si tocca (un file_read dimezzato e' il difetto segnalato).
+        try:
+            new, info = await self._truncate_tail_messages(
+                data, model, faithful, min_chars=AGENT_T3_MIN_CHARS,
+                faithful=True)
+        except Exception as e:
+            new, info = None, f"exc:{type(e).__name__}:{str(e)[:160]}"
+        tried.append(f"T3:{info}")
+        if new is None:
+            print(f"[reasoning_clamp] T3 {model}: nessun guadagno ({info})",
+                  flush=True)
+        else:
+            data = new
+            faithful = self._estimate_faithful_tokens(data)
+            self._clamp_output(data, model, faithful)
+            if self._settled(faithful, ctx):
+                print(f"[reasoning_clamp] {model}: cascata risolta da T3 "
+                      f"(~{faithful} tok fedeli, contesto {ctx})", flush=True)
+                return data
+        # F-EVIT anche qui: prompt (fedele) che ci sta -> max_tokens ridotto,
+        # la richiesta parte; il 413 uccide ogni retry del client.
+        if faithful <= ctx and self._force_output(data, model, faithful):
+            print(f"[reasoning_clamp] {model}: F evitato - prompt ~{faithful} "
+                  f"tok fedeli ci sta nel contesto {ctx}: max_tokens alla "
+                  f"stanza residua, richiesta parte ({'|'.join(tried)})",
+                  flush=True)
+            return data
+        return self._overflow(data, model, est, tried, agentic=True,
+                              faithful=faithful, dropped=dropped)
 
     async def _cascade(self, data):
         model = str(data.get("model") or "")
@@ -3293,9 +3724,33 @@ class ReasoningClamp(CustomLogger):
         est = self._estimate_prompt_tokens(data)
         if not self._saturated(est, ctx):
             return data
-        print(f"[reasoning_clamp] overflow {model}: ~{est} tok + "
-              f"{MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata "
-              f"B/C/T/T2/E/T3", flush=True)
+        # Soglia agentico: contano i token FEDELI, non il ratio a densita'.
+        # Il ratio sovrastima codice + schemi tool e su AiderDesk ha fatto
+        # partire la cascata su richieste che stavano dentro il contesto
+        # (misurato: ~299.638 stimati vs contesto 196608, AiderDesk compatta a
+        # 160k) -> storia dell'operaio buttata per un overflow falso. Il costo
+        # del tiktoken lo paga solo chi era gia' saturo, il percorso veloce e'
+        # invariato.
+        agentic = _is_agentic_request(data)
+        faithful = est
+        if agentic:
+            faithful = await asyncio.to_thread(self._estimate_faithful_tokens,
+                                               data)
+            if not self._saturated(faithful, ctx):
+                print(f"[reasoning_clamp] {model}: FALSO overflow - ~{est} tok "
+                      f"dal ratio conservativo ma ~{faithful} tok fedeli su "
+                      f"contesto {ctx}: cascata saltata, contenuto intatto",
+                      flush=True)
+                return data
+        n_msg = len([m for m in (data.get("messages") or [])
+                     if isinstance(m, dict)])
+        n_tools = len(data.get("tools") or [])
+        print(f"[reasoning_clamp] overflow {model}: ~{est} tok"
+              + (f" / ~{faithful} tok fedeli" if agentic else "")
+              + f" + {MIN_OUTPUT_TOKENS} tok > contesto {ctx} -> cascata "
+              + ("D/T3 (agentica)" if agentic else "B/C/T/T2/E/T3")
+              + f"; {n_msg} messaggi"
+              + (f", {n_tools} schemi tool" if n_tools else ""), flush=True)
         if model not in _DYN_CTX:
             # il contesto NON viene dal listing dinamico: o tabella statica
             # per-modello (vera, ok) o floor di gruppo. Gap osservabilita'
@@ -3308,6 +3763,10 @@ class ReasoningClamp(CustomLogger):
                       f"{ctx} dalla TABELLA STATICA (listing dinamico non "
                       f"ancora disponibile: sweep in corso o gateway "
                       f"irraggiungibile)", flush=True)
+        if agentic:
+            # Loop agentico: solo livelli deterministici che RIMUOVONO e lo
+            # dichiarano. Niente B/C/T/T2/E (vedi _cascade_agentic).
+            return await self._cascade_agentic(data, model, ctx, est, faithful)
         # La coda (dall'ultimo user in poi) resta verbatim in B/C/E: se
         # satura DA SOLA quei livelli non possono liberare spazio - solo T
         # (mezzo dell'ultimo messaggio user) e T2 (messaggi DOPO l'ultimo
@@ -3380,23 +3839,15 @@ class ReasoningClamp(CustomLogger):
                     return data
                 return self._overflow(data, model, est, tried)
         tried = []
-        agentic = _is_agentic_request(data)
         for name, fn in (("B", self._compact_with_provider),
                          ("C", self._compress_locally),
                          ("T", self._split_compress_tail),
                          ("T2", self._compress_tail_messages),
                          ("E", self._map_reduce),
                          ("T3", self._truncate_tail_messages)):
-            if name == "C" and agentic:
-                # C produce stub che rimandano a litellm_content_retrieve, tool
-                # che in questo stack non esiste (vedi _is_agentic_request):
-                # su un loop agentico e' peggio del 413, perche' il modello
-                # crede di poter recuperare il contenuto e non puo'.
-                tried.append("C:skip-agentic")
-                print(f"[reasoning_clamp] C {model}: saltato "
-                      f"(richiesta agentica: nessun tool di retrieval nel "
-                      f"client)", flush=True)
-                continue
+            # Ramo agentico MAI qui: esce sopra da _cascade_agentic (D/T3).
+            # C in particolare produce stub che rimandano a
+            # litellm_content_retrieve, tool che in questo stack non esiste.
             try:
                 if name == "C":
                     # compressione BM25: CPU-heavy, fuori dal loop degli eventi
@@ -3569,14 +4020,14 @@ class ReasoningClamp(CustomLogger):
         # testuale: la richiesta parte e il modello sa che c'era un'immagine.
         self._sanitize_unresolvable_images(data, model)
         # --- policy fallback per-modello (override per-request) ---
-        # Regola (richiesta utente 2026-10-25): small-model NON e' piu' un
-        # fallback di nessun modello. Resta un modello autonomo, invocabile
-        # direttamente; qui garantiamo che nessuna catena lo contenga.
-        # UNICA ECCEZIONE (richiesta utente 2026-11-24): la catena del GRUPPO
-        # hybrid-model, dove small-model e' gia' un membro del tier 2 e finisce
-        # secondo dopo local-model quando i quota a pagamento sono finiti
-        # (vedi HYBRID_LOCALS). Le richieste DIRETTE di small-model restano
-        # senza fallback, perche' e' il ramo qui sotto che le governa.
+        # Regola (richiesta utente 2026-11-24): le catene si fermano sui NOSTRI
+        # modelli; small-model NON e' piu' il fallback universale di tutti i
+        # modelli (regola del 2026-10-25, ancora valida per ogni ramo che non
+        # sia elencato qui). Oggi small-model e' il gradino LOCALE di
+        # syn:small:text/vision (SYN_SMALL_*_FALLBACKS) e del ramo vision
+        # della catena del GRUPPO hybrid-model (HYBRID_CHAIN_VISION, dopo
+        # syn:small:vision). Le richieste DIRETTE di small-model restano senza
+        # fallback, perche' e' il ramo qui sotto che le governa.
         if self._internal(data):
             # chiamata INTERNA della cascata (B/T/T2/E): stesso modello della
             # richiesta e NESSUN fallback - un hop su un altro modello
@@ -3596,22 +4047,20 @@ class ReasoningClamp(CustomLogger):
             # e' piu' un gradino della catena)
             data["fallbacks"] = []
         elif model == SYN_SMALL_TEXT:
-            # richiesta utente 2026-10-12: syn:small:TEXT parte da
-            # ollama/small-model (gemello Ollama sullo STESSO PC, server
-            # indipendente: regge quando llama-swap e' occupo o da 429), poi il
-            # cloud GRATIS openrouter/free. Dal 2026-10-14
-            # syn:small:vision ha la stessa identica catena (ramo seguente,
-            # alias sul medesimo costante). Ramo esatto PRIMA del ramo generico
-            # synthetic/*: la callback sovrascrive i fallback di OGNI richiesta
-            # synthetic/*.
+            # richiesta utente 2026-11-24: syn:small:TEXT parte da small-model
+            # (llama-swap sul PC, una richiesta alla volta: regge quando il
+            # cloud e' a quota o in 429), poi il cloud GRATIS openrouter/free.
+            # Dal 2026-10-14 syn:small:vision ha la stessa identica catena
+            # (ramo seguente, alias sul medesimo costante). Ramo esatto PRIMA
+            # del ramo generico synthetic/*: la callback sovrascrive i fallback
+            # di OGNI richiesta synthetic/*.
             data["fallbacks"] = list(SYN_SMALL_TEXT_FALLBACKS)
         elif model == SYN_SMALL_VISION:
             # richiesta utente 2026-10-14: syn:small:VISION ha la STESSA catena
             # di syn:small:text (alias su SYN_SMALL_TEXT_FALLBACKS) - prima
-            # ollama/small-model (gemello Ollama sullo STESSO PC, server
-            # indipendente), poi il cloud GRATIS openrouter/free. Il target
-            # locale e' text-only: una richiesta vision puo' 400, hop
-            # sprecato, la catena prosegue.
+            # small-model (llama-swap), poi il cloud GRATIS openrouter/free.
+            # small-model dichiara supports_vision: true, quindi il gradino
+            # locale serve anche l'input vision (nessun hop sprecato).
             # Ramo esatto PRIMA del ramo generico synthetic/*.
             data["fallbacks"] = list(SYN_SMALL_VISION_FALLBACKS)
         elif model == SYN_EMBED:
@@ -3643,10 +4092,11 @@ class ReasoningClamp(CustomLogger):
             # nelle catene qui sopra. Vedi LLAMA_SWAP_MEDIA_PREFIX.
             data["fallbacks"] = []
         elif model in (HYBRID_PUBLIC, HYBRID_GROUP):
-            # CATENA del gruppo: i NOSTRI locali PRIMA (local-model, poi
-            # small-model: richiesta utente 2026-11-24, "finiti i quota usa i
-            # modelli locali, prima local-model poi small-model"), poi le
-            # riserve free di ULTIMA RISORSA (vedi HYBRID_RESERVE_PREFIXES).
+            # CATENA del gruppo: i NOSTRI locali PRIMA (richiesta utente
+            # 2026-11-24: testo -> local-model, syn:small:text; vision ->
+            # syn:small:vision, small-model: vedi HYBRID_CHAIN_TEXT/VISION),
+            # poi le riserve free di ULTIMA RISORSA (HYBRID_RESERVE_POOLS:
+            # openrouter/free, ollama-cloud, groq, gemini, cloudflare).
             # Partono SOLO se il membro scelto dal gruppo ha gia' fallito: a
             # quota zero (402) il membro resta "sano" per litellm (nessun
             # cooldown su 402) e senza questa catena il cliente si vede
@@ -3807,30 +4257,35 @@ class ReasoningClamp(CustomLogger):
 
         Ordine voluto (richiesta utente 2026-11-24): finito il quota dei
         provider a pagamento, la richiesta deve finire sui nostri modelli
-        locali, prima local-model e poi small-model. Le riserve free vengono
-        DOPO perche' sono il ripiego quando i locali non possono servire la
-        richiesta: llama-swap ne serve UNA alla volta (un locale occupo e' un
-        429/503 in coda), il PC puo' essere spento, e un prompt che non entra
-        nel loro contesto reale li esclude a priori.
+        locali, nell'ordine di HYBRID_CHAIN_TEXT (local-model -> syn:small:text)
+        o di HYBRID_CHAIN_VISION (syn:small:vision -> small-model) secondo la
+        capacita' della richiesta. Le riserve free vengono DOPO perche' sono il
+        ripiego quando i locali non possono servire la richiesta: llama-swap ne
+        serve UNA alla volta (un locale occupo e' un 429/503 in coda), il PC
+        puo' essere spento, e un prompt che non entra nel loro contesto reale li
+        esclude a priori.
 
-        Un locale si scarta solo se: e' in quarantena; la richiesta ha immagini
-        e ne' la config ne' i listing dichiarano espressamente che le accetta
-        (il silenzio non e' una promessa, vedi _hybrid_reserves); oppure il suo
-        contesto reale non contiene prompt + margine. Ritorna una lista che puo' anche
+        Un nome si scarta solo se: e' in quarantena o a quota esaurita (402
+        recente, _quota_out_name); la richiesta ha immagini e ne' la config ne'
+        i listing dichiarano espressamente che le accetta (il silenzio non e'
+        una promessa, vedi _hybrid_reserves); oppure il suo contesto reale non
+        contiene prompt + margine. Ritorna una lista che puo' anche
         essere vuota: vuota vuol dire "nessun ripiego esiste" (prompt enorme e
         free tutti fuori contesto), e il router chiude con l'errore del membro
         scelto, come faceva prima di questa catena."""
         chain = []
+        order = HYBRID_CHAIN_VISION if wants_image else HYBRID_CHAIN_TEXT
         try:
             with _PROXY_MODELS_LOCK:
                 known = dict(_PROXY_MODELS_CACHE["models"])
             budget = needed_tokens + self._margin(needed_tokens)
-            for n in HYBRID_LOCALS:
-                if _quarantined(n):
+            for n in order:
+                if _quarantined(n) or _quota_out_name(n):
                     continue
-                # Vision: vale la promessa dei listing dei pattern (per i
-                # locali non esiste) OPPURE quella scritta in config
-                # (supports_vision: true su local-model e small-model).
+                # Vision: vale la promessa dei listing dei pattern (per i nomi
+                # statici non esiste) OPPURE quella scritta in config
+                # (supports_vision: true su syn:small:vision, local-model e
+                # small-model).
                 if wants_image and not (
                         _DYN_VISION.get(n) is True
                         or _config_supports_vision(n)):
@@ -3848,17 +4303,21 @@ class ReasoningClamp(CustomLogger):
         """Fino a HYBRID_RESERVE_MAX id CONCRETI di riserva free, per UNA
         richiesta a hybrid-model.
 
-        Le wildcard (groq/*, cloudflare/*, openrouter/*) non possono essere
-        membri di un routing_group, quindi la riserva si risolve qui, per
-        singola richiesta, sui listing gia' in cache. Si scarta:
-          - chi non e' sotto HYBRID_RESERVE_PREFIXES;
+        Le wildcard (openrouter/*, ollama-cloud/*, groq/*, gemini/*,
+        cloudflare/*) non possono essere membri di un routing_group, quindi la
+        riserva si risolve qui, per singola richiesta, sui listing gia' in
+        cache. Si scarta:
           - i NON-CHAT del listing (embed/whisper/guard/rerank) e i media;
           - i modelli openrouter a PAGAMENTO (solo ":free"/"openrouter/free");
-          - i quarantenati;
+          - i quarantenati e chi e' a quota esaurita (402 recente,
+            _quota_out_name: la chiave e' il modello CONCRETO "openai/<id>");
           - chi non contiene prompt + margine (contesto reale dal listing);
           - chi dichiara di NON accettare immagini, se la richiesta ne ha.
-        Ordine: prima chi accetta immagini (quando servono), poi contesto piu'
-        largo, poi tier di costo, poi openrouter (endpoint free piu' stabile).
+        Ordine: i POOL nell'ordine di HYBRID_RESERVE_POOLS (openrouter,
+        ollama-cloud, groq, gemini, cloudflare), e dentro il pool prima chi
+        accetta immagini (quando servono), poi contesto piu' largo, poi tier di
+        costo. Da ogni pool esce UN solo nome: cinque gradini = cinque provider
+        diversi, mai due tentativi sullo stesso provider.
         Non solleva mai: senza listing torna [] e il gruppo resta senza
         riserve (comportamento identico a prima)."""
         try:
@@ -3870,9 +4329,11 @@ class ReasoningClamp(CustomLogger):
                 if n not in known:
                     names.append(n)
             budget = needed_tokens + self._margin(needed_tokens)
-            out = []
+            per_pool = {p: [] for p in HYBRID_RESERVE_POOLS}
             for n in names:
-                if not any(n.startswith(p) for p in HYBRID_RESERVE_PREFIXES):
+                pool = next((p for p in HYBRID_RESERVE_POOLS
+                             if n.startswith(p)), None)
+                if pool is None:
                     continue
                 if any(b in n.lower() for b in NON_CHAT_WORKER_SUBSTRINGS):
                     continue
@@ -3881,7 +4342,7 @@ class ReasoningClamp(CustomLogger):
                 if n.startswith("openrouter/") and not (
                         n == "openrouter/free" or n.endswith(":free")):
                     continue
-                if _quarantined(n):
+                if _quarantined(n) or _quota_out_name(n):
                     continue
                 win = _DYN_CTX.get(n) or known.get(n, (None, None))[0]
                 if win is not None and win < budget:
@@ -3892,17 +4353,25 @@ class ReasoningClamp(CustomLogger):
                 # text-only su una richiesta con immagine e' un 400 certo.
                 if wants_image and _DYN_VISION.get(n) is not True:
                     continue
-                out.append(n)
-            # "openrouter/free" per primo: e' il meta-router gratuito che
-            # sceglie da solo il miglior modello free disponibile lato
-            # OpenRouter (e' la richiesta esplicita dell'utente), poi contesto.
-            out.sort(key=lambda n: (
-                0 if n == "openrouter/free" else 1,
-                -(_DYN_CTX.get(n) or known.get(n, (0, None))[0] or 0),
-                _model_tier(n),
-                0 if n.startswith("openrouter/") else 1,
-            ))
-            return out[:HYBRID_RESERVE_MAX]
+                per_pool[pool].append(n)
+            out = []
+            for pool in HYBRID_RESERVE_POOLS:
+                cands = per_pool[pool]
+                if not cands:
+                    continue
+                # "openrouter/free" per primo nel suo pool: e' il meta-router
+                # gratuito che sceglie da solo il miglior modello free
+                # disponibile lato OpenRouter (richiesta esplicita dell'utente).
+                cands.sort(key=lambda n: (
+                    0 if n == "openrouter/free" else 1,
+                    0 if (wants_image and _DYN_VISION.get(n) is True) else 1,
+                    -(_DYN_CTX.get(n) or known.get(n, (0, None))[0] or 0),
+                    _model_tier(n),
+                ))
+                out.append(cands[0])
+                if len(out) >= HYBRID_RESERVE_MAX:
+                    break
+            return out
         except Exception:
             return []
 
@@ -3916,10 +4385,13 @@ class ReasoningClamp(CustomLogger):
         la scelta. Ordine FISSO, NESSUNA rotazione (era _HYBRID_RR: cambiava
         modello a ogni turno e uccideva il prompt caching):
           tier 1 = syn:large:text, local-model              (qualita' prima)
-          tier 2 = syn:small:text, small-model, gemini-flash-latest
+          tier 2 = syn:small:text                (richiesta di TESTO)
+                   syn:small:vision, small-model (richiesta con IMMAGINE)
         Si restituisce il tier 1 se almeno un membro e' sano, altrimenti il
         tier 2 (il tier 2 NON e' uno spill per carico: e' il ripiego di
-        qualita' quando il tier 1 e' giu').
+        qualita' quando il tier 1 e' giu', e cambia con la capacita' della
+        richiesta - richiesta utente 2026-11-24). gemini-flash-latest non e'
+        piu' un membro: e' una riserva free dinamica (pool "gemini/").
         DENTRO il tier 1, a carico ZERO, si restituisce la lista: least-busy
         prende il PRIMO (syn:large:text) -> stessa conversazione, stesso
         modello, prompt caching preservato. Appena il primario ha carico
@@ -3979,7 +4451,11 @@ class ReasoningClamp(CustomLogger):
                 return [by_name[n] for n in order if n in by_name]
 
             tier1 = _ordered(HYBRID_TIER1)
-            tier2 = _ordered(HYBRID_TIER2)
+            # Il tier 2 dipende dalla CAPACITA' della richiesta (utente
+            # 2026-11-24): testo -> syn:small:text; immagine ->
+            # syn:small:vision, small-model.
+            tier2 = _ordered(HYBRID_TIER2_VISION if wants_image
+                             else HYBRID_TIER2_TEXT)
             chosen = tier1 or tier2 or eligible
             if len(tier1) > 1:
                 # split pesato SOLO a carico reale: a in-flight 0 la lista
@@ -4003,7 +4479,8 @@ class ReasoningClamp(CustomLogger):
                 print(f"[reasoning_clamp] {HYBRID_PUBLIC}: "
                       f"{len(tier1)}/{len(eligible)} membri tier1 sani -> "
                       + ("qualita' prima (syn:large/local)" if tier1
-                         else "tier1 ESAURITO, spill ai tier 2"),
+                         else "tier1 ESAURITO, spill al tier 2 "
+                              + ("vision" if wants_image else "testo")),
                       flush=True)
             return chosen
         except Exception:
