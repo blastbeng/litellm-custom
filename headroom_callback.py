@@ -72,8 +72,37 @@ un log da 400 righe, -62% su 300 record JSON), con tre protezioni sopra:
 Il resto della storia (log/diff/search piu' vecchi della finestra) resta lossy:
 se l'agente torna su un output di 4+ turni prima, quel contenuto non c'e' piu'.
 Se serve piu' margine: ``HR_PROTECT_LAST=10`` costa ~10 punti di risparmio in
-piu'. L'alternativa "tutto lossless" (``mode="agent"``) e' stata scartata:
-stesso transcript, -29% invece di -72%.
+piu'.
+
+QUARTO STRATO: REGIME PER RICHIESTA (2026-11-24)
+La finestra da sola non bastava. Riprodotto in container su un trascritto
+agentico di 12 turni (tool output = dump di log, 34.993 token): il regime
+upstream riduceva a 3.742 token (-89%) sostituendo 11 tool output su 12 con
+``[120 lines omitted ... hash=...]``, e i tre strati sopra coprivano solo gli
+ultimi 6 messaggi (~1,5 turni). Un agente che torna su un output di due turni
+prima trova un hash che nessun client puo' riscattare: e' cosi' che nasce
+"my tool-output channel is broken in this session" (l'agente riscrive l'output
+su file e lo rilegge: turni sprecati che costano piu' dei token risparmiati).
+
+Ora il regime e' scelto PER RICHIESTA (``_mode_for``):
+- **agentico** (body con ``tools``/``functions``, oppure storia con ruolo
+  ``tool``/``function``, ``tool_calls``, ``function_call``, o ``input[]`` con
+  ``function_call_output``) -> ``mode="agent"`` di headroom (lossless
+  verificato: nessun marcatore, nessuna rimozione). Misurato in questo stack:
+  log/codice/diff restano intatti, quindi il regime lossless costa ~0; headroom
+  comprimeva solo dump di log (-98%) e array JSON (-26%), cioe' proprio i
+  contenuti su cui l'agente costruisce gli edit.
+- **non agentico** (chat, log analysis, RAG, traduzione) -> regime lossy di
+  prima, con ``compress_user_messages=True``: li' il risparmio e' reale
+  (-93% su un log, -26% su JSON) e un marcatore non rompe nessun loop.
+- ``off`` -> nessuna compressione.
+
+Override, in ordine di precedenza: header ``x-headroom-mode:
+off|lossless|lossy`` (per singolo client), ``HR_MODE`` (forzatura globale),
+``HR_AGENT_MODE`` (default ``lossless``) per le richieste agentiche. Ogni
+richiesta lascia una riga ``[headroom] <mode> <model>: N -> M tok`` nel log:
+prima non c'era NESSUNA riga headroom, quindi non si poteva distinguere "non
+comprime" da "sta fallendo in silenzio".
 
 Il metodo ``async_pre_call_hook`` qui sotto e' un override ESPLICITO anche se
 identico all'upstream: litellm 1.109 (proxy/utils.py, ProxyLogging.pre_call_hook)
@@ -83,6 +112,7 @@ sottoclasse viene saltata in silenzio e il proxy non comprime NULLA
 (verificato: 6256 prompt token con e senza la compressione attesa).
 """
 
+import contextvars
 import os
 import re
 
@@ -90,6 +120,19 @@ from headroom.config import DEFAULT_EXCLUDE_TOOLS, DEFAULT_VERBATIM_EXCLUDE_TOOL
 from headroom.hooks import CompressionHooks
 from headroom.integrations.litellm_callback import HeadroomCallback
 from headroom.transforms import content_router
+
+# Regime scelto per la RICHIESTA in corso. Il callback e' un singleton
+# condiviso da tutte le richieste concorrenti: un attributo su ``self``
+# verrebbe sovrascritto da un'altra richiesta nel mezzo di un await, mentre
+# il ContextVar segue il task asyncio (stessa tecnica di contextvars nei
+# server ASGI). Il default None = "lossy" (comportamento upstream).
+_MODE = contextvars.ContextVar("headroom_mode", default=None)
+
+# "off"      nessuna compressione (passa tutto originale)
+# "lossless" headroom mode="agent": densificazione deterministica verificata,
+#            nessun marcatore, nessuna rimozione (vedi mode_for sotto)
+# "lossy"    pipeline upstream (log/JSON -> stub CCR, non recuperabili)
+_MODES = ("off", "lossless", "lossy")
 
 # Riga di log: timestamp ISO/epoch-ish in testa, oppure prefisso syslog
 # ("Nov 14 17:19:29"), oppure livello subito dopo un prefisso arbitrario.
@@ -130,6 +173,75 @@ def _protect_last():
         return max(0, int(raw))
     except ValueError:
         return _DEFAULT_PROTECT_LAST
+
+
+def _headers_of(data):
+    """Header HTTP della richiesta, minuscoli, dal posto in cui litellm li
+    mette: ``proxy_server_request``/``metadata``/``litellm_metadata`` (stesso
+    percorso usato da reasoning_clamp per ``Cache-Control``). Vuoto se il
+    chiamante non e' il proxy (es. uso della libreria)."""
+    if not isinstance(data, dict):
+        return {}
+    for src in ("proxy_server_request", "metadata", "litellm_metadata"):
+        box = data.get(src)
+        hdrs = box.get("headers") if isinstance(box, dict) else None
+        if isinstance(hdrs, dict) and hdrs:
+            return {str(k).lower(): v for k, v in hdrs.items()}
+    return {}
+
+
+def _is_agentic(data):
+    """True quando la richiesta e' un turno di un loop agentico (tool calling).
+
+    Due segnali, entrambi necessari:
+    - ``tools``/``functions`` non vuoti: il client ha dichiarato dei tool,
+      quindi il modello puo' emettere tool_calls e il prossimo turno avra'
+      bisogno del RISULTATO INTEGRO (un hash CCR non e' riscattabile);
+    - un messaggio ``role: tool``/``function`` o con ``tool_calls`` dentro la
+      storia: il loop e' gia' in corso (vale anche per il body Responses,
+      dove i risultati arrivano come ``input[].type ==
+      "function_call_output"``).
+
+    Una chat normale (log analysis, RAG, traduzione) non ha nessuno dei due:
+    li' la compressione lossy resta attiva e resta conveniente.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("tools") or data.get("functions"):
+        return True
+    for msg in data.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        if (msg.get("role") in ("tool", "function")
+                or msg.get("tool_calls") or msg.get("function_call")):
+            return True
+    for item in data.get("input") or []:
+        if isinstance(item, dict) and item.get("type") in (
+            "function_call", "function_call_output"):
+            return True
+    return False
+
+
+def _mode_for(data):
+    """Regime di compressione della richiesta: off | lossless | lossy.
+
+    Precedenza:
+    1. header esplicito ``x-headroom-mode`` (vale per un singolo client:
+       AiderDesk o un'app possono scegliere senza toccare il proxy);
+    2. ``HR_MODE`` (forzatura globale dell'operatore);
+    3. ``HR_AGENT_MODE`` (default ``lossless``) quando la richiesta e'
+       agentica, ``lossy`` altrimenti.
+    """
+    hdr = _headers_of(data).get("x-headroom-mode")
+    if isinstance(hdr, str) and hdr.strip().lower() in _MODES:
+        return hdr.strip().lower()
+    forced = os.environ.get("HR_MODE", "").strip().lower()
+    if forced in _MODES:
+        return forced
+    if _is_agentic(data):
+        agent = os.environ.get("HR_AGENT_MODE", "lossless").strip().lower()
+        return agent if agent in _MODES else "lossless"
+    return "lossy"
 
 
 def _extend_excluded_tools():
@@ -273,12 +385,19 @@ class ProtectRecentAndLogs(CompressionHooks):
 
 
 class HeadroomUserClamp(HeadroomCallback):
-    """HeadroomCallback + compressione dei messaggi utente.
+    """HeadroomCallback con regime di compressione PER RICHIESTA.
 
     Override di ``_local_compress`` (unico punto in cui il callback upstream
-    chiama headroom.compress()) per aggiungere ``compress_user_messages=True``.
-    Tutto il resto - gating su call_type, try/except fail-open, log - resta
-    quello di headroom: se compress() solleva, la richiesta passa originale.
+    chiama headroom.compress()) per:
+    - scegliere il regime (``_mode_for``: lossless per i loop agentici,
+      lossy per tutto il resto, ``off`` su richiesta esplicita);
+    - aggiungere ``compress_user_messages=True`` nel solo regime lossy;
+    - lasciare una riga di log per richiesta, cosi' il regime scelto e' visibile
+      (prima non c'era NESSUNA riga headroom nei log: impossibile capire se
+      stesse comprimendo o fallendo in silenzio).
+
+    Tutto il resto - gating su call_type, try/except fail-open - resta quello
+    di headroom: se compress() solleva, la richiesta passa originale.
     """
 
     async def async_pre_call_hook(
@@ -292,19 +411,53 @@ class HeadroomUserClamp(HeadroomCallback):
     ):
         # Override richiesto da litellm (vedi docstring del modulo): senza
         # questo metodo la classe non entra nel giro degli hook.
-        return await super().async_pre_call_hook(
-            user_api_key_dict, cache, data, call_type, *args, **kwargs
-        )
+        mode = _mode_for(data) if isinstance(data, dict) else None
+        token = _MODE.set(mode)
+        try:
+            return await super().async_pre_call_hook(
+                user_api_key_dict, cache, data, call_type, *args, **kwargs
+            )
+        finally:
+            # il ContextVar non deve sopravvivere alla richiesta: il task
+            # asyncio puo' essere riusato per il turno successivo
+            _MODE.reset(token)
 
     def _local_compress(self, messages, model):
         from headroom.compress import compress
 
+        mode = _MODE.get() or "lossy"
+        if mode == "off":
+            # Nessuna compressione: si restituisce la lista originale e
+            # tokens_saved=0, cosi' l'upstream non sostituisce nulla.
+            return {
+                "messages": messages,
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "compression_ratio": 0.0,
+            }
+
+        # lossless = mode="agent" di headroom: densificazione deterministica
+        # con verify_lossless forzato, nessun marcatore CCR e nessuna rimozione.
+        # Misurato in questo stack (2026-11-24, trascritto agentico di 12 turni):
+        #   lossy    34.993 -> 3.742 tok (11 tool output su 12 ridotti a
+        #            "[120 lines omitted ... hash=...]", non riscattabile);
+        #   lossless 34.993 -> 34.993 tok, nessun messaggio riscritto.
+        # Il costo del regime lossless e' quindi ~0 su log/codice/diff: qui
+        # headroom comprime SOLO dump di log (-98%) e array JSON (-26%), che
+        # sono esattamente i contenuti su cui un agente costruisce gli edit.
+        lossless = mode == "lossless"
+        kwargs = {"mode": "agent"} if lossless else {}
         result = compress(
             messages=messages,
             model=model or "claude-sonnet-4-5-20250929",
             model_limit=self._model_limit,
             hooks=self._hooks,
-            compress_user_messages=True,
+            # Nel regime lossy i messaggi utente strutturati (JSON/CSV) si
+            # comprimono: e' li' che sta il risparmio per log analysis e RAG.
+            # Nel regime lossless l'opzione e' irrilevante (niente rimozioni) e
+            # resta False per esplicitezza.
+            compress_user_messages=not lossless,
             # Nessun compressore ML: senza transformers/onnxruntime installati
             # ogni tentativo finiva in "Compression failed, returning original
             # messages: No module named 'transformers'" (warning + percorso di
@@ -312,7 +465,11 @@ class HeadroomUserClamp(HeadroomCallback):
             # che qui girano solo le trasformazioni deterministiche (tabellari,
             # log, JSON), senza AI locale.
             kompress_model="disabled",
+            **kwargs,
         )
+        print(f"[headroom] {mode} {model or '?'}: "
+              f"{result.tokens_before} -> {result.tokens_after} tok "
+              f"(saved {result.tokens_saved})", flush=True)
         return {
             "messages": result.messages,
             "tokens_before": result.tokens_before,

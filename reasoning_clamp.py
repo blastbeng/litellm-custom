@@ -125,6 +125,17 @@ una cascata a livelli, e dopo ogni livello riusa la stima per il clamp:
      iniettato e la cache degli originali NON viene trattenuta: in questo
      stack non c'e' un agentic loop che lo serva, quindi lo stub e'
      PERSO (compressione lossy). E' il motivo per cui C viene DOPO B.
+     REGOLA 1 (2026-11-24): C e' SALTATO per le richieste agentiche
+     (_is_agentic_request): dire a un agente "usa litellm_content_retrieve"
+     quando quel tool non esiste e' peggio del 413 - l'agente prova la
+     chiamata, non c'e', e riporta di avere il canale dei tool rotto.
+     REGOLA 2: C si APPLICA SOLO SE DA SOLO rientra nel contesto
+     (_settled, misurato con lo stimatore del proxy). Se non basta il
+     guadagno e' finto: T2 si mette a riassumere testo gia' stubbato e E
+     riassumme di nuovo tutto. Misurato su hybrid-model: B fail -> C -16% ->
+     T fail -> T2 -> E, risolto solo da E (551k char gia' mutilati).
+     REGOLA 3: la frase dello stub che invitava al tool di retrieval viene
+     riscritta in un "rimosso definitivamente" (_honest_stubs).
   T  SPLIT+COMPRESS DELLA CODA (richiesta utente 2026-10-06: "quando il
      contesto supera, splittalolo e comprimilo con un LLM"): quando la
      massa sta nell'ULTIMO messaggio user (il prompt compilato
@@ -2039,6 +2050,74 @@ def _request_has_image(data):
         return False
 
 
+def _is_agentic_request(data):
+    """True se la richiesta e' un turno di un loop agentico (tool calling).
+
+    Serve a NON usare il livello C (compressione BM25 di litellm) su queste
+    richieste: C sostituisce i messaggi a bassa rilevanza con
+
+        [Compressed: <key> - N lines, <type>. Use litellm_content_retrieve
+         tool to get full content.]
+
+    ma in questo stack il tool ``litellm_content_retrieve`` NON viene iniettato
+    e la cache degli originali NON e' servita da nessun endpoint (vedi README).
+    Un agente che legge quello stub prova a chiamare un tool che non esiste e
+    conclude di avere "il canale dei tool rotto" (sintomo riportato
+    2026-11-24). Per il resto della cascata (B/T/T2/T3/E) il testo prodotto e'
+    usabile, quindi si salta SOLO C.
+
+    Stessi segnali di headroom_callback._is_agentic: ``tools``/``functions``
+    dichiarati, oppure storia con ruolo ``tool``/``function``, ``tool_calls``,
+    ``function_call``, oppure body Responses con ``function_call_output``.
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get("tools") or data.get("functions"):
+        return True
+    for msg in data.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        if (msg.get("role") in ("tool", "function")
+                or msg.get("tool_calls") or msg.get("function_call")):
+            return True
+    for item in data.get("input") or []:
+        if isinstance(item, dict) and item.get("type") in (
+                "function_call", "function_call_output"):
+            return True
+    return False
+
+
+# Stub prodotto da litellm.compression.message_stubbing.stub_message().
+_FAKE_RETRIEVAL_HINT = (
+    "Use litellm_content_retrieve tool to get full content."
+)
+_HONEST_RETRIEVAL_HINT = (
+    "[contenuto rimosso in modo definitivo: nessun tool di retrieval in "
+    "questo stack]"
+)
+
+
+def _honest_stubs(messages):
+    """Riscrive l'invito a ``litellm_content_retrieve`` negli stub di C.
+
+    Lo stub di litellm dice al modello di chiamare un tool per riavere il
+    contenuto: qui quel tool non esiste e gli originali non sono conservati
+    (README, livello C). Lasciare la frase significa far credere al modello
+    che il tool output sia recuperabile - e un agente che ci prova conclude
+    che il canale dei tool e' rotto. Si riscrive la SOLA frase: righe e tipo
+    restano come traccia di cosa e' stato rimosso.
+    """
+    out = []
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str) and _FAKE_RETRIEVAL_HINT in content:
+            msg = dict(msg)
+            msg["content"] = content.replace(
+                _FAKE_RETRIEVAL_HINT, _HONEST_RETRIEVAL_HINT)
+        out.append(msg)
+    return out
+
+
 def _hybrid_inflight(deps):
     """Carico in-flight dei deployment di hybrid-model: {id: n}.
 
@@ -2523,11 +2602,30 @@ class ReasoningClamp(CustomLogger):
         if not after or after >= est:
             # nessun guadagno reale: non ha senso spedire stubs inutili
             return None, "no-gain"
-        data["messages"] = res["messages"]
+        # APPLICARE SOLO SE BASTA ("settled"). C e' LOSSY e non recuperabile:
+        # se lascia il prompt ancora sopra il target, il guadagno e' finto -
+        # i livelli successivi lavorano su un trascritto gia' mutilato (T2
+        # riassume contenuto stubbato, E riassume il riassunto). Misurato
+        # 2026-11-24 su hybrid-model, 4 richieste su 4: B fail -> C -16% ->
+        # T fail -> T2 -> E, e solo E risolveva, riassumendo 551k char gia'
+        # passati da C+T2. Qui si misura con lo STIMATORE DEL PROXY (litellm
+        # conta su un'altra scala: C dichiarava 174197 tok mentre la stima
+        # reale era ~261k) e, se non basta, si scarta C e si prosegue con la
+        # cascata sul trascritto ORIGINALE.
+        trial = dict(data)
+        trial["messages"] = _honest_stubs(res["messages"])
+        after_est = self._estimate_prompt_tokens(trial)
+        if not self._settled(after_est, ctx):
+            print(f"[reasoning_clamp] C {model}: scartato (non basta: "
+                  f"~{after_est} tok stimati, target "
+                  f"{int(ctx * (1.0 - COMPACTION_HEADROOM_PCT))}, "
+                  f"contesto {ctx}); si prosegue sull'originale", flush=True)
+            return None, f"no-settle:{after_est}"
+        data["messages"] = trial["messages"]
         print(f"[reasoning_clamp] C {model}: compressione deterministica "
               f"{res.get('original_tokens')} -> {after} tok "
-              f"(ratio {res.get('compression_ratio')}, target {target})",
-              flush=True)
+              f"(ratio {res.get('compression_ratio')}, target {target}, "
+              f"stima ~{after_est})", flush=True)
         return data, f"compress:{after}"
 
     # ------------- operari di riassunto (modello della richiesta) ------------
@@ -3282,12 +3380,23 @@ class ReasoningClamp(CustomLogger):
                     return data
                 return self._overflow(data, model, est, tried)
         tried = []
+        agentic = _is_agentic_request(data)
         for name, fn in (("B", self._compact_with_provider),
                          ("C", self._compress_locally),
                          ("T", self._split_compress_tail),
                          ("T2", self._compress_tail_messages),
                          ("E", self._map_reduce),
                          ("T3", self._truncate_tail_messages)):
+            if name == "C" and agentic:
+                # C produce stub che rimandano a litellm_content_retrieve, tool
+                # che in questo stack non esiste (vedi _is_agentic_request):
+                # su un loop agentico e' peggio del 413, perche' il modello
+                # crede di poter recuperare il contenuto e non puo'.
+                tried.append("C:skip-agentic")
+                print(f"[reasoning_clamp] C {model}: saltato "
+                      f"(richiesta agentica: nessun tool di retrieval nel "
+                      f"client)", flush=True)
+                continue
             try:
                 if name == "C":
                     # compressione BM25: CPU-heavy, fuori dal loop degli eventi

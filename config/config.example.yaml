@@ -614,6 +614,14 @@ litellm_settings:
   # HR_PROTECT_LAST messaggi (default 6) verbatim; tool di lettura
   # (*file_read*, *grep*, *glob*, ...) esclusi dal path lossy (HR_EXCLUDE_TOOLS
   # per cambiare la lista); dump di log incollati dall'utente protetti.
+  # QUARTO STRATO (2026-11-24): regime PER RICHIESTA. Richieste agentiche
+  # (tools/functions nel body o storia con role tool / tool_calls) ->
+  # mode="agent" di headroom (lossless verificato, nessun marcatore CCR);
+  # chat/log analysis/RAG -> regime lossy di prima. Override: header
+  # "x-headroom-mode: off|lossless|lossy", poi HR_MODE, poi HR_AGENT_MODE
+  # (default lossless). Ogni richiesta logga "[headroom] <mode> <model>: N -> M".
+  # In reasoning_clamp il livello C (BM25, stub non recuperabili) e' saltato
+  # sulle richieste agentiche e applicato solo se rientra da solo nel contesto.
   # Vedi Dockerfile.litellm per l'installazione di headroom-ai.
   # litellm 1.109 rifiuta il path alla CLASSE: headroom_callback.py espone
   # l'istanza hr_compress (stessa forma di reasoning_clamp.rclamp).
