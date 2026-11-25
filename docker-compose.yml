@@ -92,9 +92,11 @@ services:
         condition: service_started
       gemini-gw:
         condition: service_started
-      ollama-gw:
-        condition: service_started
       cloudflare-gw:
+        condition: service_started
+      # Seconda gate (Orange Pi 142): il container deve esistere prima di
+      # litellm, altrimenti le wildcard cheap/* non risolvono l'host.
+      llama-gate-cheap:
         condition: service_started
     restart: no
     healthcheck:
@@ -452,31 +454,34 @@ services:
       retries: 3
       start_period: 30s
 
-  # Stessa gate di llama-gate (stesso gate.py, env-driven) ma verso Ollama
-  # (endpoint OpenAI-compatible su blastpc:11434, stessa macchina):
-  # PC spento -> 503 in ~2s e litellm prosegue la catena di fallback;
-  # PC acceso -> tubo trasparente con timeout lungo.
-  ollama-gate:
-    container_name: ollama-gate
+  # Seconda gate TCP (stesso gate.py, env-driven) verso il "cheap stack" sul
+  # Orange Pi Zero 3W 192.168.1.142: llm-router su :10000 (orchestratore
+  # OpenAI-compatible che a sua volta pilota llama-swap su :10001).
+  # Perche' il 10000 e non il 10001: e' l'unico endpoint che espone anche la
+  # lista COMPLETA dei modelli di llama-swap (llm-router inoltra /v1/models
+  # di llama-swap + il modello sintetico "auto"), quindi UNA wildcard
+  # cheap/* in config.yaml copre tutti i modelli nativi e l'orchestratore.
+  # Host sempre acceso (24/7) ma su rete domestica: stessa semantica della
+  # gate gemella -> host irraggiungibile = 503 in ~2s, host acceso = tubo
+  # trasparente (HTTP e SSE) con il timeout lungo di litellm.
+  # GATE_TLS=0: llm-router parla HTTP in chiaro (stdlib http.server), il
+  # probe TLS di "auto" sarebbe un handshake fallito a ogni richiesta.
+  # GATE_LABEL: il 503 nomina QUESTO host (con due gate "blastpc" mentirebbe).
+  llama-gate-cheap:
+    container_name: llama-gate-cheap
     mem_limit: 256m
     image: python:3.13-slim
-    command: ["python","/app/gate.py"]
+    command: ["python", "/app/gate.py"]
     environment:
-      GATE_UP_HOST: blastpc
-      GATE_UP_PORT: "11434"
-      # Ollama serve la sua API (OpenAI-compatible compresa) SEMPRE in HTTP
-      # in chiaro sulla 11434: GATE_TLS=0 salta il tentativo di handshake TLS
-      # (che fallirebbe) e la connessione TCP di fallback su OGNI richiesta.
-      # Mettere "auto" (o "1") solo se in futuro Ollama parlasse TLS.
+      GATE_UP_HOST: "192.168.1.142"
+      GATE_UP_PORT: "10000"
       GATE_TLS: "0"
-    extra_hosts:
-      - "blastpc:192.168.1.29"
+      GATE_LABEL: "orange-pi-142 (cheap-llm-stack)"
     volumes:
       - ./llama-gate/gate.py:/app/gate.py:ro
     restart: no
-    # Healthcheck TCP sulla porta di ascolto della gate (vedi llama-gate):
-    # misura LA GATE, non il PC - col PC spento la gate e' sana per
-    # definizione (503 in ~2s), quindi il check resta verde.
+    # Healthcheck TCP sulla porta di ascolto (vedi llama-gate): misura LA
+    # GATE, non l'host remoto - host spento -> gate sana che risponde 503.
     healthcheck:
       test:
         [
@@ -489,58 +494,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-
-  # Gateway listing per Ollama locale (provider-gw/gw.py): nessuna riscrittura
-  # path (l'endpoint OpenAI-compatible vive gia' su /v1, come deepseek4free).
-  # ID_PREFIX=ollama/: la logica di listing di litellm corromperebbe gli id
-  # nativi il cui primo segmento coincide con un provider noto (es.
-  # "deepseek-r1:14b" -> "deepseek/..."); col prefisso la wildcard ollama/*
-  # li cattura e li instrada 1:1 (il capture rimuove il prefisso). NIENTE
-  # MODELS_CACHE: i modelli devono apparire SOLO quando il PC e' online
-  # (listing dinamico reale; PC spento -> la gate risponde 200 con lista
-  # vuota, cosi' litellm non logga un WARNING per ogni /v1/models).
-  ollama-gw:
-    container_name: ollama-gw
-    mem_limit: 384m
-    image: python:3.13-slim
-    command: ["sh","-c","pip install --no-cache-dir httpx >/dev/null && python /app/gw.py"]
-    environment:
-      # upstream = ollama-gate (tubo TCP trasparente verso blastpc:11434);
-      # nessun GW_PROXY: traffico LOCALE, non passa da llmtrim
-      UPSTREAM: http://ollama-gate
-      ID_PREFIX: ollama/
-      # Ollama elenca i modelli senza tag esplicito come "x:latest": strip
-      # del suffisso -> nome pubblico "ollama/x" (non "ollama/x:latest")
-      STRIP_LATEST: "1"
-      # Ollama NON espone context_length nel listing OpenAI-compatible: lo si
-      # legge dall'endpoint nativo /api/tags e lo si inietta in /v1/models,
-      # cosi' reasoning_clamp (_DYN_CTX) usa il contesto REALE per-modello
-      # (stessa logica dinamica degli altri provider).
-      CONTEXT_FROM: /api/tags
-      # gw.py usa GW_CA solo se il file esiste (upstream plain-HTTP: verify
-      # non serve, ma un GW_CA mancante non fa piu' crashare il gateway).
-      # store di sistema dell'immagine: llmtrim non c'e' piu'.
-      GW_CA: /etc/ssl/certs/ca-certificates.crt
-    volumes:
-      - ./provider-gw/gw.py:/app/gw.py:ro
-    depends_on:
-      - ollama-gate
-    restart: no
-    # Healthcheck TCP (vedi openrouter-gw): il gateway vive di vita propria,
-    # l'upstream ollama no - un check HTTP sul listing dipenderebbe da
-    # gate + PC. start_period: "pip install httpx" prima di gw.py.
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import socket; s=socket.create_connection(('127.0.0.1',80),5); s.close()"
-        ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
 
 volumes:
   # Dati di litellm-db (spend logs, chiavi, utenti). Named volume: sopravvive

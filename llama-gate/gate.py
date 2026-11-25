@@ -1,4 +1,11 @@
-"""Gate TCP per llama-swap su blastpc (192.168.1.29:11435).
+"""Gate TCP verso un upstream HTTP (llama-swap / llm-router).
+
+Nata per llama-swap su blastpc (192.168.1.29:11435); lo stesso script serve
+ogni upstream grazie alle env (GATE_UP_HOST/GATE_UP_PORT/GATE_TLS/GATE_LABEL):
+- llama-swap blastpc        -> llama-gate       (11435)
+- llm-router Orange Pi 142  -> llama-gate-cheap (10000)
+Una gate e' un tubo 1:1 con UN upstream: due host = due container dello
+stesso script (non esiste un gate multi-upstream).
 
 Perche' esiste: litellm puo' impostare un SOLO timeout per tutta la richiesta
 (httpx non distingue connect/read tramite litellm_params). Serve però:
@@ -30,6 +37,7 @@ ne' HTTP produce comunque il 503 veloce.
 
 Solo stdlib: nessuna dipendenza da installare.
 """
+import json
 import os
 import socket
 import ssl
@@ -40,6 +48,9 @@ UP_HOST = os.environ.get("GATE_UP_HOST", "192.168.1.29")
 UP_PORT = int(os.environ.get("GATE_UP_PORT", "11435"))
 HEALTH_TIMEOUT = float(os.environ.get("GATE_HEALTH_TIMEOUT", "2"))
 LISTEN_PORT = int(os.environ.get("GATE_PORT", "80"))
+# Nome dell'host nel messaggio del 503 (diagnostica: il client deve capire
+# QUALE upstream e' spento, con due gate in casa "blastpc" sarebbe bugiardo).
+LABEL = os.environ.get("GATE_LABEL", "blastpc")
 
 # LISTING /v1/models a PC SPENTO: un 503 fa loggare a litellm un WARNING per
 # OGNI espansione wildcard ("Error getting valid models: ... blastpc
@@ -106,11 +117,15 @@ _SSL_CTX.verify_mode = ssl.CERT_NONE
 # stamparlo ogni richiesta renderebbe il log inutilmente rumoroso).
 _plain_announced = False
 
+# Body costruito (non piu' hardcoded): LABEL cambia per gate e la lunghezza
+# deve restare coerente con Content-Length.
+_BODY_503 = (json.dumps({"error": {
+    "message": (f"{LABEL} offline (gate: connect timeout) - "
+                "host spento/non raggiungibile")}}) + "\n").encode()
 _503 = (b"HTTP/1.1 503 Service Unavailable\r\n"
         b"Content-Type: application/json\r\n"
-        b"Content-Length: 94\r\n"
-        b"Connection: close\r\n\r\n"
-        b'{"error":{"message":"blastpc offline (gate: connect timeout) - pc spento/non raggiungibile"}}\n')
+        b"Content-Length: " + str(len(_BODY_503)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n" + _BODY_503)
 
 
 def _pipe(src: socket.socket, dst: socket.socket):

@@ -18,7 +18,7 @@ xhigh/max vengono ridotti al massimo valore supportato dal provider.
   high/max); senza lista pubblica viene RIMOSSO e vale il default
   Cloudflare (verificato 2026-11-18: qwen3.8-27b rifiuta "high",
   gpt-oss-120b rifiuta "xhigh", glm-4.7-flash rifiuta none/max/xhigh).
-- Gli altri modelli (synthetic/*, openrouter/*, ollama/*, ollama-cloud/*,
+- Gli altri modelli (synthetic/*, openrouter/*, ollama-cloud/*, cheap/*,
   locale) non vengono toccati: il loro default xhigh sta gia' in config.yaml.
 
 POLICY FALLBACK per-modello (richiesta utente 2026-10-02, wildcard-safe):
@@ -67,9 +67,12 @@ self.fallbacks)):
   gradino della catena - richiesta utente 2026-10-25)
 - small-model       -> [] (modello autonomo, mai fallback - richiesta
   utente 2026-10-25)
-- embedding-model   -> [] (nessun auto-fallback: e' l'unico modello
-  embedding del fallback chain, un target CHAT su una richiesta embedding
-  risponderebbe 400)
+- embedding-model   -> ["embedding-model-cheap"] (richiesta utente 2026-11-25:
+  stesso modello Qwen3-Embedding-0.6B servito dal 142, cosi' anche le
+  richieste embedding DIRETTE al 29 continuano quando il PC e' spento).
+  Resta comunque un solo tipo di target: embedding, mai un modello CHAT che
+  risponderebbe 400. La semantic cache Redis NON passa di qui (chiamata
+  interna senza kwargs) e usa router_settings.fallbacks, stessa coppia)
 - llama-swap/* (img-*, vid-*, tts-*, music-*) -> [] (richiesta utente 2026-10-16:
   i MEDIA di llama-swap - image gen, video gen, TTS, musica - NON hanno
   fallback. Un target CHAT risponderebbe 400 su una richiesta
@@ -79,8 +82,12 @@ self.fallbacks)):
   llama-swap aggiungera' in futuro senza toccare la config - mentre i
   modelli CHAT di llama-swap hanno nomi senza prefisso e restano nelle
   catene qui sopra. Vedi LLAMA_SWAP_MEDIA_PREFIX)
+- cheap/* (Orange Pi 142) -> []: sono endpoint AGGIUNTIVI, non un gradino
+  delle catene (richiesta utente 2026-11-25, escluso l'hop in hybrid-model:
+  contesto 4096/12288 e host lento non devono allungare le attese dei
+  ripieghi cloud).
 - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  ollama/*, ollama-cloud/* e QUALSIASI prefisso futuro)
+  ollama-cloud/* e QUALSIASI prefisso futuro)
   -> []: nessun fallback (richiesta utente 2026-10-25). La catch-all
   "*": ["small-model"] e' stata RIMOSSA da config.yaml; questo override
   per-request rende comunque esplicito il vuoto su ogni modello.
@@ -381,7 +388,7 @@ SYN_SMALL_VISION_FALLBACKS = list(SYN_SMALL_TEXT_FALLBACKS)
 # modello EMBEDDING su synthetic.new, servito dall'endpoint /v1/embeddings
 # ("api.synthetic.new/openai/v1/embeddings", non compare nel listing chat
 # di synthetic). Quando non disponibile cade su llama-swap: "embedding-model"
-# (Qwen3-Embedding-0.6b su CPU, contesto 8192 dal 2026-11-24). Catena a UN
+# (Qwen3-Embedding-0.6b su CPU, contesto 4096 dal 2026-11-25). Catena a UN
 # solo target:
 # gli altri modelli llama-swap sono CHAT e su una richiesta embedding
 # risponderebbero 400 - nessun gradino dopo.
@@ -433,7 +440,17 @@ CONTEXT_BY_PREFIX = (
     # tabella statica ora e' vera per-modello e non dipende dal daemon.
     ("local-model", 196608),
     ("small-model", 196608),
-    ("embedding-model", 8192),  # llama-swap: Qwen3-Embedding-0.6b (CPU)
+    # 142 (cheap stack): STESSO modello sul 142, ma llama-server gira con
+    # "--ctx-size 4096 --parallel 1" -> 4096 token reali per richiesta.
+    # Va PRIMA del prefisso "embedding-model": _context_for fa due passate
+    # (esatto, poi startswith) e "embedding-model" catturerebbe anche
+    # "embedding-model-cheap" con il suo 4096.
+    ("embedding-model-cheap", 4096),
+    # llama-swap: Qwen3-Embedding-0.6b (CPU). 4096 = contesto REALE per
+    # richiesta dal 2026-11-25 (llama-server --ctx-size 4096, e dallo stesso
+    # giorno anche -np 2 tolto: UNO slot da 4096; prima 8192 su 2 slot, cioe'
+    # sempre 4096 a una singola richiesta).
+    ("embedding-model", 4096),
     # --- synthetic, contesti REALI per-modello. Match ESATTO via
     # _context_for (due passate: l'uguaglianza vince su startswith, altrimenti
     # "GLM-5.3" catturerebbe anche "-Flash" a prescindere dall'ordine).
@@ -452,7 +469,11 @@ CONTEXT_BY_PREFIX = (
     ("synthetic/hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4", 262144),
     ("synthetic/hf:nomic-ai/nomic-embed-text-v1.5", 8192),
     ("synthetic/", 131072),  # floor per id synthetic NON in tabella
-    ("ollama/", 131072),
+    # Cheap stack del 142: floor = MINIMO vero del gruppo (router e vision
+    # dichiarano 4096; reasoner e "auto" 12288, embedding 4096). I valori
+    # REALI per-modello arrivano dal listing (_DYN_CTX: contesto letto da
+    # llm-router, che lo inoltra da llama-swap) e vincono su questo floor.
+    ("cheap/", 4096),
     ("ollama-cloud/", 262144),
     ("openrouter/", 262144),
     # NOTA ordine: gli entry specifici PRIMA del prefisso generico "groq/"
@@ -1033,7 +1054,7 @@ def _worker_too_expensive(model):
 # interna serve un NOME CONCRETO ("groq/openai/gpt-oss-120b"), altrimenti
 # l'upstream riceve model="*" e risponde 400/404. Il listing di ogni
 # gateway (openrouter-gw, groq-gw prefigissano gia' gli id;
-# synthetic/ollama sono upstream diretti -> prefisso aggiunto qui) e'
+# synthetic/cheap sono upstream diretti -> prefisso aggiunto qui) e'
 # la stessa fonte usata dall'import automatico dei modelli in config.
 WILDCARD_LIST_TIMEOUT_S = 8
 WILDCARD_CACHE_TTL_S = 600
@@ -4061,10 +4082,13 @@ class ReasoningClamp(CustomLogger):
             # modello autonomo, mai fallback (richiesta utente 2026-10-25)
             data["fallbacks"] = []
         elif model == "embedding-model":
-            # niente auto-fallback: l'unico modello che potrebbe servire una
-            # richiesta embedding e' lui stesso, gli altri target (CHAT)
-            # risponderebbero 400
-            data["fallbacks"] = []
+            # richiesta utente 2026-11-25: ripiego sul 142 (STESSO modello
+            # Qwen3-Embedding-0.6B, 1024-dim, stesso spazio vettoriale)
+            # quando il PC e' spento. Resta un target EMBEDDING: mai un
+            # modello CHAT, che risponderebbe 400. Vale per le richieste
+            # DIRETTE; la semantic cache Redis non passa di qui (chiamata
+            # interna senza kwargs) e usa router_settings.fallbacks.
+            data["fallbacks"] = ["embedding-model-cheap"]
         elif model == "local-model":
             # nessun fallback (richiesta utente 2026-10-25: small-model non
             # e' piu' un gradino della catena)
@@ -4132,7 +4156,7 @@ class ReasoningClamp(CustomLogger):
                 self._estimate_prompt_tokens(data), _request_has_image(data))
         else:
             # TUTTI gli altri (groq/*, gemini/*, openrouter/*,
-            # openrouter/free, ollama/*, ollama-cloud/* e qualunque prefisso
+            # openrouter/free, ollama-cloud/*, cheap/* e qualunque prefisso
             # futuro): NESSUN fallback (richiesta utente
             # 2026-10-25: la catch-all "*": ["small-model"] e' stata rimossa).
             data["fallbacks"] = []

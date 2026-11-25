@@ -2,7 +2,8 @@
 
 A personal LLM router built on **LiteLLM Proxy** with lightweight Python
 gateways: a single OpenAI-compatible endpoint (`:4000`) that aggregates local
-models (llama-swap and Ollama on a dedicated PC), cloud providers
+models (llama-swap on a dedicated PC, plus an always-on cheap stack on an
+Orange Pi: llama-swap + `llm-router`), cloud providers
 (synthetic.new, OpenRouter, Groq, Gemini, Ollama Cloud, Cloudflare Workers AI), with **dynamic**
 wildcard model listing, fallback policy and `reasoning_effort` handling.
 
@@ -17,8 +18,9 @@ wildcard model listing, fallback policy and `reasoning_effort` handling.
                      │      │   │   │                                   api.synthetic.new,│
                      │      │   │   ├────────────► llama-gate ──► blastpc:11435          │
                      │      │   │   │      (TCP gate, http|https auto, PC off → 503)      │
-                     │      │   │   └────────────► ollama-gw ──► ollama-gate ──► 11434    │
-                     │      │   │        (TCP gate, plain HTTP, PC off → 503)             │
+                     │      │   │   └────────────► llama-gate-cheap ──► 192.168.1.142    │
+                     │      │   │        (TCP gate, plain HTTP, :10000 llm-router →      │
+                     │      │   │         :10001 llama-swap, host down → 503)              │
                      │      │   │                                                      │
                      │      │   ├────► openrouter-gw ─┐                               │
                      │      │   ├────► groq-gw ───────┤ (diretto: nessun proxy)        │
@@ -41,8 +43,7 @@ del contesto ora la fa **headroom** dentro litellm (vedi sotto).
 |---|---|---|
 | `litellm` | `config/config.yaml` | LiteLLM proxy/router (port 4000) |
 | `llama-gate` | `llama-gate/gate.py` | TCP gate to llama-swap — `GATE_TLS=auto`: tries TLS, falls back to plain HTTP on `WRONG_VERSION_NUMBER` (llama-swap runs **plain HTTP** since 2026-10-02, previously `https` self-signed with gate-side TLS termination; litellm always stays plain HTTP; PC off → 503 in ~2s) |
-| `ollama-gate` | `llama-gate/gate.py` (same, env-driven) | TCP gate to Ollama's OpenAI-compatible API (`blastpc:11434`) — `GATE_TLS=0`, Ollama serves **plain HTTP** on that port, so the TLS probe is skipped; PC off → 503 in ~2s |
-| `ollama-gw` | `provider-gw/gw.py` (generic) | Ollama local listing with `ID_PREFIX=ollama/` + `STRIP_LATEST=1`, no cache (models visible only while the PC is online; PC off → the gate 503s) |
+| `llama-gate-cheap` | `llama-gate/gate.py` (same, env-driven) | TCP gate to the **cheap stack** on the Orange Pi Zero 3W (`192.168.1.142:10000`, `llm-router`) — `GATE_TLS=0` (stdlib `http.server`, plain HTTP, the TLS probe is skipped), `GATE_LABEL` so the 503 names the right host; host down → 503 in ~2s. Why `:10000` and not `:10001`: `llm-router` answers `/v1/models` with llama-swap's **whole** list plus the synthetic `auto`, so one `cheap/*` wildcard covers every native model *and* the orchestrator, and any non-magic id is forwarded verbatim (`auto`/`router`/`orchestrator` stay magic; the 0.6B is `cheap/router-0.6b`) |
 | `openrouter-gw` | `openrouter-gw/gw.py` | OpenRouter listing: path `/v1/*`→`/api/v1/*` + id prefix `openrouter/` |
 | `groq-gw`, `gemini-gw` | `provider-gw/gw.py` (generic) | listing with `ID_PREFIX`, `PATH_PRE`, last-good cache |
 | `cloudflare-gw` | `cloudflare-gw/gw.py` (dedicated) | Workers AI listing from the REST search endpoint, rewritten as OpenAI `/v1/models`: id prefix `cloudflare/`, property mapping (`context_length`, `pricing`, `reasoning_parameters`), free-plan / deprecated / `-lora` filters, last-good cache |
@@ -66,7 +67,7 @@ Each provider is exposed with **a single wildcard** entry in `model_list`:
   id `openai/gpt-oss-120b` (the capture strips the prefix).
 - With `litellm_settings.check_provider_endpoint: true`, `/v1/models` and
   `/model/info` expose the endpoint's **real** model list: if a provider's
-  models change, litellm stays up to date (essential for `ollama/*` and
+  models change, litellm stays up to date (essential for `cheap/*` and
   `openrouter/*`, whose lists follow the upstream).
 
 ### Why the gateways exist
@@ -78,7 +79,7 @@ LiteLLM (v1.104.0) has four behaviors the gateways work around:
    Gemini: `/v1beta/openai`, OpenRouter: `/api`).
 2. **Rename of ids whose first segment matches a known provider**
    (`openai/...`, `deepseek/...`, ...) in the listing → the gateway prefixes
-   ids with `ID_PREFIX` (e.g. `groq/`, `ollama/`): the rename no
+   ids with `ID_PREFIX` (e.g. `groq/`, `cloudflare/`): the rename no
    longer fires and the capture restores the native id at runtime
    (`openrouter/` is mandatory: OpenRouter ids contain slashes and the
    `:free` suffix).
@@ -92,7 +93,7 @@ LiteLLM (v1.104.0) has four behaviors the gateways work around:
    (`UPSTREAM_KEY_FILE` + `UPSTREAM_KEY_NAME`, re-read every 60s) and
    **replaces** litellm's placeholder `Authorization: Bearer dummy`.
    Opt-in and currently unused: every live gateway keeps passing the
-   client's header through (groq, gemini, ollama, openrouter).
+   client's header through (groq, gemini, openrouter, cloudflare).
 
 ### Last-good cache (provider-gw, `MODELS_CACHE=1`)
 
@@ -244,12 +245,18 @@ standalone model that can be called directly with **no** fallback. Since
 the vision branch of `hybrid-model` (`HYBRID_CHAIN_VISION`). When a chain is
 exhausted, the upstream error reaches the client unchanged.
 
-The local Ollama model that used to be the first step of the `syn:small:*`
-chains was **removed from the whole stack on 2026-11-24** (user request: "we
-use just small-model from llama-swap") — callback, `config.yaml`,
-`config.example.yaml` and this README no longer mention it.
-**`ollama-cloud/*` (ollama.com) is a separate cloud provider** and is
-untouched.
+Local Ollama was **removed from the whole stack**: its model from the
+`syn:small:*` chains on 2026-11-24 (user request: "we use just small-model from
+llama-swap"), then the last remnants — the `ollama/*` wildcard and the
+`ollama-gate` / `ollama-gw` services — on **2026-11-25**. There is no local
+Ollama endpoint left anywhere in this stack.
+**`ollama-cloud/*` (ollama.com) is a separate cloud provider**, never routed
+through a local gateway, and is untouched.
+
+The cheap stack on the Orange Pi (`cheap/*`, `embedding-model-cheap`) is **not**
+part of any chat chain: it is an extra set of endpoints (user request
+2026-11-25 explicitly rejected a `hybrid-model` hop: 4096/12288 contexts and a
+slow CPU must not delay the cloud fallbacks).
 
 - **`synthetic/*`** → **no fallback** (user request 2026-10-28: `local-model`
   removed from every `synthetic/*` chain, right after `small-model` on
@@ -274,7 +281,7 @@ untouched.
 - **`synthetic/hf:nomic-ai/nomic-embed-text-v1.5`** (embedding served by
   synthetic.new on `/v1/embeddings`, user request 2026-10-04) →
   **`embedding-model`** (llama-swap: Qwen3-Embedding-0.6b on CPU, context
-  8192, 1024-dim vectors, same `llama-gate` as the other local models). Single target: the
+  4096, 1024-dim vectors, same `llama-gate` as the other local models). Single target: the
   other llama-swap models are chat models and would 400 on an embeddings
   request, so there is no further step.
 - **`local-model`** itself (requested directly) → **no fallback** (user
@@ -282,9 +289,15 @@ untouched.
 - **`small-model`** (requested directly) → **no fallback of its own**: it is a
   *step* of the chains above, not a chain owner, so a call addressed to it
   never hops.
-- **`embedding-model`** (requested directly) → no fallback: it is the only
-  embedding-capable model in the chain, any other target would 400 on an
-  embeddings request.
+- **`embedding-model`** (requested directly) → **`embedding-model-cheap`**
+  (user request 2026-11-25): the *same* model (Qwen3-Embedding-0.6B,
+  1024-dim) served by the Orange Pi, so embeddings keep working while the PC
+  is off. Still an embedding-only target — a chat model would 400. This is
+  also wired statically in `router_settings.fallbacks` because the Redis
+  semantic cache embeds from an **internal** `aembedding()` call with no
+  per-request kwargs: see *Semantic cache* below.
+- **`cheap/*`** (Orange Pi models) → **no fallback**: extra endpoints, not a
+  step of any chain.
 - **`llama-swap/*` media models** (`img-*`, `vid-*`, `tts-*`, `music-*`) →
   **no fallback at all** (user request 2026-10-16). An image, a video, a
   speech sample or a music track cannot be produced by a chat model, so any
@@ -296,7 +309,7 @@ untouched.
   **worker pool** (`_worker_pool`), where their local-hardware tier would
   otherwise rank them first as compression workers.
 - **Everything else** (`groq/*`, `gemini/*`, `cloudflare/*`, `openrouter/*`,
-  `openrouter/free`, `ollama/*`, `ollama-cloud/*`, and any future prefix)
+  `openrouter/free`, `ollama-cloud/*`, `cheap/*`, and any future prefix)
   → **no fallback**.
 
 ⚠️ Fallback keys in litellm do **not** support wildcards
@@ -525,16 +538,19 @@ than the engine really had. **synthetic is
 131072, …) — litellm's wildcard expansion propagates ids only, never context
 fields, so a wildcard cannot expose per-model contexts; a NEW synthetic model
 needs a config entry. Wildcards whose upstream does **not** expose
-`context_length` in its listing (`ollama/*`) keep a static floor from
+`context_length` in its listing keep a static floor from
 `CONTEXT_BY_PREFIX`; for the others their real per-model contexts
 (10000–1000000) reach the clamp and the worker
 pool dynamically from the provider listings via `_DYN_CTX`/`_window_for` in
 `reasoning_clamp.py` but cannot be exposed per-model on `/v1/models`; still
 131072 for `groq/openai/gpt-oss-120b` / `-20b`,
 whose real Groq context is 131072 even though the `groq/*` wildcard declares
-262144 as the ceiling for its largest model; 8192 for `embedding-model`;
-131072 for `ollama/*` (Ollama does **not** expose `context_length` in its
-listing, so the wildcard value stays static); 262144 for `openrouter/*`,
+262144 as the ceiling for its largest model; 4096 for `embedding-model` (both
+hosts run `--ctx-size 4096` on a **single slot** since 2026-11-25 — the 29
+dropped `-np 2` that day, so the per-request ceiling is unchanged from the old
+8192/2-slot layout, and the Pi was already `--parallel 1`); 4096 for `cheap/*` as the group floor — `llm-router` **does**
+expose `context_length` per model, so `cheap/reasoner` and `cheap/auto` get
+their real 12288 from the listing; 262144 for `openrouter/*`,
 `groq/*`, `gemini/*`, `ollama-cloud/*`). Specific
 entries are matched before generic prefixes.
 
@@ -813,20 +829,43 @@ Details / constraints:
   isolation from other data is by key prefix. The `ttl` is mandatory too — that
   Redis runs with `--maxmemory-policy volatile-lru`, which evicts **only** keys
   that have a TTL.
-- **Embedding**: only `embedding-model` (Qwen3-Embedding-0.6b, 1024-dim, local
-  via llama-gate), with **no fallback** — a different embedding model lives in
-  a different vector space and would yield false hits. If `embedding-model` is
-  down the cache simply misses (never a wrong answer).
+- **Embedding**: `embedding-model` (Qwen3-Embedding-0.6b, 1024-dim, local via
+  `llama-gate`) with **one** fallback, `embedding-model-cheap` on the Orange Pi
+  (same model, same 1024-dim space — user request 2026-11-25). A *different*
+  embedding model would live in a different vector space and yield false hits,
+  which is why the fallback is the same model and nothing else. The pair is
+  wired in `router_settings.fallbacks` **and not** in the callback: the cache
+  embeds from an internal `aembedding()` call with no per-request kwargs, so
+  only the static router list applies there. The whole attempt, fallback hop
+  included, must fit `SEMANTIC_CACHE_EMBEDDING_TIMEOUT_SECONDS` **(5 s,
+  default, env-only in litellm 1.111)** — which is why the `embedding-model`
+  deployment carries **`num_retries: 0`**. Without it the router retried the
+  dead primary 3× with backoff/cooldown even though `llama-gate` answers 503 in
+  ~0.4 s, and the fallback landed at **~17 s** (measured: one request made 13
+  TCP connects to the black-holed `192.168.1.29:11435`), i.e. outside the
+  budget = silent cache miss. With 0 retries the chain is **~1.3 s** and the
+  semantic path works end-to-end with the PC off (measured: `HTTP 200` with
+  1024-dim vectors, and a second identical `Cache-Control: cache` call hitting
+  at `x-litellm-semantic-similarity: 1.0` in 1.8 s). `litellm_settings.num_retries: 0`
+  is **not** applied to the router in litellm 1.111 (`/router/settings` reports
+  3), so the value belongs on the deployment. If both hosts fail — or the prompt
+  is long — the cache just misses (fail-open: the request is still served,
+  never a wrong answer).
 - **Truncation**: the text handed to the embedder is cut to
   `semantic_cache_embedding_max_input_tokens: 2560` — **litellm tokens
-  (cl100k)**, not model tokens. Two measured reasons (2026-11-24): llama-swap
-  advertises 8192 for `embedding-model` but runs llama-server with `-np 2`, so a
-  single request only sees `n_ctx/2` = 4096 tokens (4001 tokens pass, 4302 get
-  `exceeds the available context size (4096 tokens)`); and litellm counts with
+  (cl100k)**, not model tokens. Two measured reasons: `embedding-model` sees
+  only **4096** tokens of context per request (`--ctx-size 4096` on both hosts
+  since 2026-11-25; the 29 used to run `8192` with `-np 2`, which left 4096 to
+  a single request — 4001 tokens passed, 4302 got
+  `exceeds the available context size (4096 tokens)`. `-np 2` was dropped on
+  2026-11-25, so the 29 now runs a single slot like the Pi: the per-request
+  ceiling stays **4096**, so no litellm value moves, only concurrent embed
+  requests now queue instead of running 2-up — the 5 s budget absorbs that as a
+  miss, never as a failed request); and litellm counts with
   tiktoken's cl100k while llama-server uses the Qwen3 tokenizer, which on the
   same text costs 1.00× on prose, 1.13× on Python, 1.38× on UUIDs, 1.55× on
   hex. 2560 × 1.55 ≈ 3968 + BOS stays under 4096. With no explicit value
-  litellm would use `model_info.max_input_tokens` (8192) and silently 400 on
+  litellm would use `model_info.max_input_tokens` (4096) and silently 400 on
   every long prompt. Longer prompts are matched on their prefix; lowering the
   window upstream changes the vector of those long prompts, so entries written
   with the older cut are never matched again and expire with the TTL — no index

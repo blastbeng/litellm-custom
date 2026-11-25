@@ -124,32 +124,56 @@ model_list:
   # vedi reasoning_clamp): il modello embedding e' servito dall'endpoint
   # /v1/embeddings di synthetic.new (non compare nel listing chat) e quando
   # non disponibile la richiesta cade qui (llama-swap: Qwen3-Embedding-0.6b
-  # su CPU, contesto 8192 dichiarato da llama-server). Stessa gate di
-  # local-model/small-model: PC spento = 503 in ~2s.
+  # su CPU, 4096 token per richiesta: --ctx-size 4096 e, dal 2026-11-25, anche
+  # -np 2 tolto -> UNO slot, come sul 142). Stessa gate di
+  # local-model/small-model: PC spento = 503 in ~2s (connect timeout), host che
+  # rifiuta la porta = 503 in ~0.4s.
   - model_name: embedding-model
     litellm_params:
       model: openai/embedding-model
       api_base: http://llama-gate/v1
       api_key: dummy
       timeout: 1800
+      # Retri per deployment: 0 (richiesta 2026-11-25; mirror di config.yaml).
+      # Senza, il Router riprova il modello primario 3x+ prima di scattare il
+      # fallback -> il fallback embedding-model-cheap (142) tardava ~17s,
+      # fuori dal budget semantico di 5s. Con 0 il fallback e' immediato.
+      num_retries: 0
     model_info:
       id: local-embedding-backend
-      # contesto dichiarato da llama-swap per l'embedding model (8192 dal
-      # 2026-11-24, prima 32768); vettori 1024-dim. Questo valore non e' solo
-      # documentazione: la semantic cache redis lo usa come TETTO di
-      # troncamento dell'input da embeddare (litellm
+      # contesto REALE per richiesta: 4096 (dal 2026-11-25 llama-swap lancia
+      # questo embedding con --ctx-size 4096 e SENZA -np 2: UNO slot, quindi
+      # 4096 interi alla richiesta in corso; prima era 8192 con -np 2, ossia
+      # 4096 per slot -> il tetto per richiesta non cambia). Vettori 1024-dim.
+      # Questo valore non e' solo documentazione: la semantic cache redis lo
+      # usa come TETTO di troncamento dell'input da embeddare (litellm
       # resolve_embedding_max_input_tokens legge model_info.max_input_tokens).
-      # Se il contesto cambia su llama-swap va cambiato anche qui, altrimenti
-      # la cache manda all'embedder piu' token di n_ctx -> 400 fail-open
-      # (nessun hit, nessuna scrittura, richiesta comunque servita).
-      # ATTENZIONE (misurato 2026-11-24): llama-swap DICHIARA 8192 ma lancia
-      # llama-server con -np 2 (due slot paralleli), quindi UNA richiesta vede
-      # n_ctx/2 = 4096 token: 4001 token passano, 4302 rispondono "request
-      # (4302 tokens) exceeds the available context size (4096 tokens)". Qui
-      # resta 8192 perche' e' il valore dichiarato dal modello (e tornerebbe
-      # vero con -np 1); a dimensionare l'input e' il cap della semantic cache,
-      # tenuto sotto i 4096 REALI per richiesta.
-      max_input_tokens: 8192
+      # Se il contesto cambia su llama-swap va cambiato anche qui (e in
+      # reasoning_clamp, CONTEXT_BY_PREFIX "embedding-model").
+      # Il cap della cache (semantic_cache_embedding_max_input_tokens: 2560,
+      # token cl100k) resta sotto i 4096 reali: il troncamento e' sicuro.
+      max_input_tokens: 4096
+
+  # --- Embedding di FALLBACK (Orange Pi 142, cheap stack) ---
+  # Stesso modello e stessa config dell'embedding del 29 (Qwen3-Embedding-0.6B,
+  # vettori 1024-dim): e' il ripiego quando il PC e' spento (richiesta utente
+  # 2026-11-25). Lo usa la semantic cache Redis di litellm, che embedda ogni
+  # richiesta per cercare un hit: quel percorso chiama aembedding() sul Router
+  # SENZA fallback per-request, quindi il ripiego DEVE stare in
+  # router_settings.fallbacks ("embedding-model" -> "embedding-model-cheap").
+  # Contesto 4096, identico al 29 (anche li' --ctx-size 4096 dal 2026-11-25;
+  # sul 142 con --parallel 1). Il cap della semantic cache
+  # (semantic_cache_embedding_max_input_tokens: 2560) resta sotto entrambi.
+  # Due hop (llama-gate-cheap -> llm-router:10000 -> llama-swap:10001).
+  - model_name: embedding-model-cheap
+    litellm_params:
+      model: openai/embedding-model
+      api_base: http://llama-gate-cheap/v1
+      api_key: dummy
+      timeout: 1800
+    model_info:
+      id: cheap-embedding-backend
+      max_input_tokens: 4096
 
   # --- Modelli MEDIA di llama-swap (PC 192.168.1.29): img/vid/tts/music ---
   # (richiesta utente 2026-10-16) llama-swap espone TUTTI i suoi modelli su
@@ -233,31 +257,36 @@ model_list:
       # (audiocpp_server: musica/canzoni via /v1/audio/speech)
       mode: audio_speech
 
-  # --- Modelli Ollama locale (PC Windows, blastpc:11434): in automatico ---
-  # Richiede i servizi ollama-gate (TCP gate) e ollama-gw (listing) in
-  # docker-compose.yml. Endpoint OpenAI-compatible nativo di Ollama
-  # (/v1/models + /v1/chat/completions): listing DINAMICO via
-  # check_provider_endpoint -> tutti i modelli ollama/* sono visibili su
-  # litellm e instradati 1:1 (il capture rimuove "ollama/").
-  # model_info unico per la wildcard (si applica a TUTTI i modelli ollama/*).
-  # NIENTE MODELS_CACHE su ollama-gw: i modelli appaiono SOLO col PC online.
-  # Nessun fallback per ollama/* (richiesta utente 2026-10-25).
-  - model_name: ollama/*
+  # --- Modelli del "cheap stack" (Orange Pi Zero 3W, 192.168.1.142) ------
+  # L'Ollama LOCALE del PC e' stato RIMOSSO del tutto il 2026-11-25 (servizi
+  # ollama-gate/ollama-gw eliminati, wildcard ollama/* eliminata): l'unico
+  # Ollama che resta e' "ollama-cloud/*" (ollama.com, provider cloud).
+  # Un solo endpoint (llm-router su :10000, vedi llama-gate-cheap in
+  # docker-compose.yml) che inoltra a llama-swap (:10001) e che su
+  # GET /v1/models restituisce TUTTI i modelli di llama-swap PIU' il modello
+  # sintetico "auto" -> con check_provider_endpoint: true il listing e'
+  # DINAMICO (aggiungere/togliere un modello sul 142 non tocca questa config).
+  # Nome pubblico "cheap/<id nativo>": cheap/reasoner, cheap/vision,
+  # cheap/embedding-model, cheap/auto; llm-router inoltra 1:1 ogni id non
+  # magic (auto/router/orchestrator), il 0.6B resta come cheap/router-0.6b.
+  # L'embedding ha anche l'entry esplicita embedding-model-cheap (nome
+  # stabile per il fallback della semantic cache): cheap/embedding-model e'
+  # un alias in piu', escluso da riserve e worker dai filtri non-chat.
+  # NESSUN FALLBACK (richiesta utente 2026-11-25): endpoint aggiuntivi, NON
+  # un gradino della catena di hybrid-model.
+  # Contesto REALE per-modello dal listing (_DYN_CTX); floor statico della
+  # wildcard in reasoning_clamp (CONTEXT_BY_PREFIX "cheap/" = 4096).
+  - model_name: cheap/*
     litellm_params:
       model: openai/*
-      api_base: http://ollama-gw/v1
+      api_base: http://llama-gate-cheap/v1
       api_key: dummy
-      # PC spento: la ollama-gate 503a in ~2s; PC acceso: l'inferenza locale
-      # puo' essere lenta -> stesso tetto dei modelli llama-swap.
+      # Host 24/7 su rete domestica: host irraggiungibile -> la gate 503a
+      # in ~2s; host acceso -> inferenza piccola ma lenta, stesso tetto.
       timeout: 1800
     model_info:
-      # contesto dei modelli Ollama attuali (wildcard unica: si applica a
-      # TUTTI i modelli ollama/*) - aggiornare se i contesti cambiano. Ollama
-      # NON espone il context_length nel listing, quindi il valore resta
-      # statico qui (reasoning_clamp: CONTEXT_BY_PREFIX "ollama/").
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      max_tokens: 32768
+      # Nessun supports_vision: model_info vale per TUTTA la wildcard e
+      # dichiarare vision sui modelli di testo sarebbe falso.
 
   # --- Modelli synthetic.new: ENTRY ESPLICITE (2026-10-06) ---
   # Direttiva utente: litellm deve SEMPRE esporre il contesto corretto per
@@ -580,9 +609,9 @@ model_list:
 
   # --- Modelli Ollama Cloud (ollama.com): importati in automatico ---
   # Nome pubblico "ollama-cloud/<model>": il prefisso "-cloud" marca che sono
-  # i modelli di ollama.com (cloud), NON locali - l'Ollama LOCALE (blastpc)
-  # vive nella wildcard "ollama/*" qui sopra, prefisso distinto perche' il
-  # "ollama/" nudo e' riservato ai modelli locali.
+  # i modelli di ollama.com (cloud), NON locali. L'Ollama locale (Windows/
+  # blastpc) non esiste piu' in questo stack dal 2026-11-25: nessun endpoint,
+  # nessuna wildcard, nessun gate.
   - model_name: ollama-cloud/*
     litellm_params:
       model: openai/*
@@ -693,8 +722,9 @@ litellm_settings:
     redis_semantic_cache_embedding_model: embedding-model
     # Troncamento dell'input da embeddare, in TOKEN DEL TOKENIZER DI LITELLM
     # (cl100k), NON in token del modello. Senza questo valore litellm userebbe
-    # model_info.max_input_tokens = 8192, che per UNA richiesta e' troppo:
-    # llama-swap gira con -np 2 e ogni slot vede 4096 token (misurato
+    # model_info.max_input_tokens = 4096, che per UNA richiesta e' il tetto NUDO
+    # dello slot unico: llama-swap lancia l'embedding con --ctx-size 4096 e, dal
+    # 2026-11-25, senza -np 2 (prima: 8192 su 2 slot = 4096 per slot; misurato
     # 2026-11-24: 4001 passano, 4302 -> 400). In piu' cl100k e il tokenizer
     # Qwen3 contano diverso sullo stesso testo (misurato: prosa 1.00x, codice
     # .py 1.13x, UUID 1.38x, hex 1.55x), e llama-server aggiunge il BOS.
@@ -736,25 +766,46 @@ litellm_settings:
   #   modello embedding di llama-swap; vedi reasoning_clamp)
   # - local-model -> NESSUN fallback (richiesta utente 2026-10-25)
   # - small-model -> NESSUN fallback (modello autonomo, mai fallback)
-  # - embedding-model -> NESSUN fallback (unico modello embedding della
-  #   catena: un target CHAT su una richiesta embedding risponderebbe 400)
+  # - embedding-model -> embedding-model-cheap (richiesta utente 2026-11-25:
+  #   stesso modello Qwen3-Embedding-0.6B sul 142, cosi' la cache semantica
+  #   continua a embeddare col PC spento. E' l'UNICA catena embedding: un
+  #   target CHAT su una richiesta embedding risponderebbe 400. Questa
+  #   catena non passa da reasoning_clamp: vive in router_settings.fallbacks)
   # - llama-swap/* (img-*, vid-*, tts-*, music-*) -> NESSUN fallback
   #   (richiesta utente 2026-10-16: i MEDIA di llama-swap non hanno un
   #   "equivalente" su cui ripiegare e un target CHAT risponderebbe 400 su
   #   /v1/images/generations e /v1/audio/speech: l'errore dell'upstream va
   #   al client cosi' com'e'. Il prefisso copre tutte e quattro le wildcard
   #   media; i modelli CHAT di llama-swap non hanno prefisso)
+  # - cheap/* -> NESSUN fallback (richiesta utente 2026-11-25: endpoint
+  #   aggiuntivi sul 142, NON un gradino delle catene)
   # - TUTTI gli altri (groq/*, gemini/*, openrouter/*, openrouter/free,
-  #   ollama/*, ollama-cloud/*, cloudflare/*) -> NESSUN fallback
+  #   ollama-cloud/*, cloudflare/*) -> NESSUN fallback
   # Le chiavi dei fallback in litellm NON supportano wildcard
   # (get_fallback_model_group: solo esatto / stripped-provider / "*"), quindi
   # la policy per-modello e' implementata nella callback reasoning_clamp via
   # litellm_params.fallbacks per-request, che OVERRIDE questa lista
   # (router.py: kwargs.get("fallbacks", self.fallbacks)). La catch-all
   # "*": ["small-model"] e' stata RIMOSSA (richiesta utente 2026-10-25): non
-  # resta alcuna lista statica di fallback.
+  # resta alcuna lista catch-all.
+  # UNICA eccezione statica (router_settings.fallbacks, qui sotto):
+  # l'embedding della semantic cache. La cache Redis embedda ogni richiesta
+  # con una chiamata INTERNA al Router, senza kwargs per-request: l'unico
+  # posto dove il ripiego puo' vivere e' router_settings.fallbacks. Chiave
+  # esatta, non una catch-all: nessuna catena chat viene toccata.
 
 router_settings:
+  # Ripiego dell'embedding della SEMANTIC CACHE (richiesta utente 2026-11-25):
+  # 192.168.1.29/llama-swap/embedding-model -> 142/llama-swap/embedding-model.
+  # Serve col PC spento: senza, ogni richiesta farebbe cache miss silenzioso
+  # (fail-open: risposta regolare, ma senza hit e senza scritture). Stesso
+  # modello e stessa dimensionalita' (1024-dim) -> vettori confrontabili
+  # nello STESSO indice. Budget: SEMANTIC_CACHE_EMBEDDING_TIMEOUT_SECONDS = 5s
+  # (default in litellm 1.111) copre l'intero tentativo, hop incluso: la gate
+  # del 29 503a in ~2s, al 142 restano ~3s (misurato 0.5s su prompt corto,
+  # cap della cache 2560 token). Prompt lunghi -> fail-open, nessun errore.
+  fallbacks:
+    - embedding-model: ["embedding-model-cheap"]
   routing_groups:
     # --- hybrid-model: qualita' prima, split per carico ------------------
     # 5 deployment CONCRETI. Un routing_group NON accetta wildcard: il
