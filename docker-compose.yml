@@ -63,9 +63,17 @@ services:
     # stream in corso -> TransferEncodingError lato OpenWebUI), quindi 2g di
     # RAM + 1g di swap. Base osservata ~600MB; il vecchio 1g/1g moriva a
     # ~995MB e il 1.5g/2.5g + oom_score_adj 200 lo rendeva il primo candidato
-    # all'OOM anche sull'host. oom_score_adj resta 0 (default).
+    # all'OOM anche sull'host.
     mem_limit: 2g
     memswap_limit: 3g
+    # 2026-11-26 16:48: earlyoom (non il kernel: OOMKilled=false, cgroup
+    # oom_kill=0, picco reale 1G RAM + 693M swap su 2G) ha SIGTERMato litellm
+    # (RSS 523MB, oom_score 714) a meta' richiesta e dopo 5s di graceful
+    # shutdown incompleto l'ha SIGKILLata -> exit 137 -> compose
+    # --abort-on-container-exit ha tirato giu' DB e tutti i *-gw (2 min di
+    # down). -800 porta oom_score a ~140: litellm non e' piu' la prima
+    # vittima ne' di earlyoom ne' del kernel OOM killer.
+    oom_score_adj: -800
     volumes:
       - ./config/config.yaml:/app/config.yaml
       - ./reasoning_clamp.py:/app/reasoning_clamp.py:ro
