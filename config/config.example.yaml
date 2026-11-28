@@ -268,7 +268,7 @@ model_list:
   # DINAMICO (aggiungere/togliere un modello sul 142 non tocca questa config).
   # Nome pubblico "cheap/<id nativo>": cheap/reasoner, cheap/vision,
   # cheap/embedding-model, cheap/auto; llm-router inoltra 1:1 ogni id non
-  # magic (auto/router/orchestrator), il 0.6B resta come cheap/router-0.6b.
+  # magic (auto/router/orchestrator), es. cheap/bolt o cheap/router (fast tier).
   # L'embedding ha anche l'entry esplicita embedding-model-cheap (nome
   # stabile per il fallback della semantic cache): cheap/embedding-model e'
   # un alias in piu', escluso da riserve e worker dai filtri non-chat.
